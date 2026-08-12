@@ -1,0 +1,7 @@
+# Non-secret PostgreSQL connection parameters. Safe to commit.
+# Secrets (user, password) live in ~/.config/lawsuit-parser/secrets.toml.
+
+[postgres]
+host = "127.0.0.1"
+port = 5432
+database = "postgres"
