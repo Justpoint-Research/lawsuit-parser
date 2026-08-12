@@ -1,5 +1,5 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
-        sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth
+        sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser
 
 # The default shell for make
 SHELL := /bin/bash
@@ -32,6 +32,7 @@ help:
 	@echo "  make clean             - Remove build artifacts and cache files"
 	@echo "  make notebook          - Start Jupyter notebook server"
 	@echo "  make case-browser      - Start Case Browser Streamlit app"
+	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
 	@echo ""
 	@echo "Database commands:"
 	@echo "  make sql-proxy-setup   - Download Cloud SQL proxy binary"
@@ -99,6 +100,18 @@ case-browser: ensure-venv
 	@echo "Make sure the Cloud SQL Proxy is running: make run-proxy"
 	@echo "Opening app at http://localhost:8501"
 	uv run streamlit run apps/case_browser.py
+
+test-pdf-parser: ensure-venv
+	@echo "Testing PDF parser on sample document..."
+	@if [ -f "data/cases/case_104/documents/document__PLUS__PLUS_IWEE20u6dQBAdaY1AO8w==.pdf" ]; then \
+		$(PYTHON) scripts/parse_single_pdf.py \
+			"data/cases/case_104/documents/document__PLUS__PLUS_IWEE20u6dQBAdaY1AO8w==.pdf" \
+			--print-content; \
+	else \
+		echo "Error: Sample PDF not found in data/cases/case_104/"; \
+		echo "Please ensure you have exported case 104 first."; \
+		exit 1; \
+	fi
 
 # ---------------------------------------------------------------------------
 # Database / Cloud SQL Proxy
