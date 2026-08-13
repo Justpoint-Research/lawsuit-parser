@@ -41,6 +41,7 @@ def parse_pdf_document(
     extract_tables: bool = True,
     extract_images: bool = False,
     save_docling_document: bool = True,
+    save_markdown: bool = True,
 ) -> ParsedDocument:
     """
     Parse a PDF document and extract structured content.
@@ -56,16 +57,19 @@ def parse_pdf_document(
     The full Docling document (layout, bounding boxes, all item types) is
     saved as `<pdf_path>.docling.json` alongside the PDF, so anything not
     surfaced on `ParsedDocument` (footers, footnotes, section headers, etc.)
-    remains available for further processing.
+    remains available for further processing. A `<pdf_path>.md` rendering
+    is also saved alongside the PDF for easy human preview.
 
     Args:
         pdf_path: Path to the PDF file
         use_gpu: Whether to use GPU acceleration (default: True)
         extract_tables: Whether to extract tables (default: True)
         extract_images: Whether to embed images in the saved Docling
-            document (default: False)
+            document and Markdown preview (default: False)
         save_docling_document: Whether to save the full Docling document
             next to the PDF (default: True)
+        save_markdown: Whether to save a Markdown rendering next to the
+            PDF, for easy preview (default: True)
 
     Returns:
         ParsedDocument containing structured extracted content
@@ -97,13 +101,16 @@ def parse_pdf_document(
         # Extract structured content
         doc = result.document
 
+        image_mode = ImageRefMode.EMBEDDED if extract_images else ImageRefMode.PLACEHOLDER
+
         # Save the full Docling document (layout, bounding boxes, every
         # item type) next to the PDF for further processing.
         if save_docling_document:
-            doc.save_as_json(
-                pdf_path.with_suffix(".docling.json"),
-                image_mode=ImageRefMode.EMBEDDED if extract_images else ImageRefMode.PLACEHOLDER,
-            )
+            doc.save_as_json(pdf_path.with_suffix(".docling.json"), image_mode=image_mode)
+
+        # Save a Markdown rendering next to the PDF for easy preview.
+        if save_markdown:
+            doc.save_as_markdown(pdf_path.with_suffix(".md"), image_mode=image_mode)
 
         # Initialize parsed document
         parsed = ParsedDocument(
