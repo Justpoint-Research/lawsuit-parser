@@ -8,6 +8,8 @@ from typing import Any
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling_core.types.doc import DocItemLabel
+from docling_core.types.doc.base import ImageRefMode
 
 
 @dataclass
@@ -15,6 +17,7 @@ class ParsedDocument:
     """Structured representation of a parsed PDF document."""
 
     title: str | None = None
+    header: str | None = None
     paragraphs: list[str] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -22,8 +25,10 @@ class ParsedDocument:
     page_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        return asdict(self)
+        """Convert to dictionary, excluding the raw text (not part of the JSON output)."""
+        data = asdict(self)
+        data.pop("raw_text", None)
+        return data
 
     def to_json(self, indent: int = 2) -> str:
         """Convert to JSON string."""
@@ -35,6 +40,7 @@ def parse_pdf_document(
     use_gpu: bool = True,
     extract_tables: bool = True,
     extract_images: bool = False,
+    save_docling_document: bool = True,
 ) -> ParsedDocument:
     """
     Parse a PDF document and extract structured content.
@@ -47,11 +53,19 @@ def parse_pdf_document(
     - Layout understanding
     - GPU acceleration
 
+    The full Docling document (layout, bounding boxes, all item types) is
+    saved as `<pdf_path>.docling.json` alongside the PDF, so anything not
+    surfaced on `ParsedDocument` (footers, footnotes, section headers, etc.)
+    remains available for further processing.
+
     Args:
         pdf_path: Path to the PDF file
         use_gpu: Whether to use GPU acceleration (default: True)
         extract_tables: Whether to extract tables (default: True)
-        extract_images: Whether to extract images (default: False)
+        extract_images: Whether to embed images in the saved Docling
+            document (default: False)
+        save_docling_document: Whether to save the full Docling document
+            next to the PDF (default: True)
 
     Returns:
         ParsedDocument containing structured extracted content
@@ -83,6 +97,14 @@ def parse_pdf_document(
         # Extract structured content
         doc = result.document
 
+        # Save the full Docling document (layout, bounding boxes, every
+        # item type) next to the PDF for further processing.
+        if save_docling_document:
+            doc.save_as_json(
+                pdf_path.with_suffix(".docling.json"),
+                image_mode=ImageRefMode.EMBEDDED if extract_images else ImageRefMode.PLACEHOLDER,
+            )
+
         # Initialize parsed document
         parsed = ParsedDocument(
             page_count=len(doc.pages) if hasattr(doc, 'pages') else 0,
@@ -92,11 +114,14 @@ def parse_pdf_document(
             }
         )
 
-        # Extract title (usually the first heading)
+        # Extract title (usually the first heading), falling back to the
+        # document name if no title item is found
         if hasattr(doc, 'name') and doc.name:
             parsed.title = doc.name
 
         # Extract all text content
+        first_title = None
+        first_header = None
         paragraphs = []
         tables = []
         all_text = []
@@ -104,6 +129,7 @@ def parse_pdf_document(
         # Iterate through document items
         for item, level in doc.iterate_items():
             item_type = type(item).__name__
+            label = getattr(item, 'label', None)
 
             # Extract text from different item types
             if hasattr(item, 'text') and item.text:
@@ -111,15 +137,14 @@ def parse_pdf_document(
                 if text:
                     all_text.append(text)
 
-                    # Check if this is a heading (title)
-                    if 'heading' in item_type.lower() or 'title' in item_type.lower():
-                        if parsed.title is None and level == 0:
-                            parsed.title = text
-                        elif level == 0:
-                            # First level-0 heading is the title
-                            parsed.title = text
-                    else:
-                        # Regular paragraph
+                    if label == DocItemLabel.TITLE:
+                        if first_title is None:
+                            first_title = text
+                    elif label == DocItemLabel.PAGE_HEADER:
+                        if first_header is None:
+                            first_header = text
+                    elif label == DocItemLabel.TEXT:
+                        # Regular page body paragraph
                         paragraphs.append(text)
 
             # Extract tables if enabled
@@ -127,6 +152,9 @@ def parse_pdf_document(
                 if hasattr(item, 'to_dict'):
                     tables.append(item.to_dict())
 
+        if first_title:
+            parsed.title = first_title
+        parsed.header = first_header
         parsed.paragraphs = paragraphs
         parsed.tables = tables
         parsed.raw_text = "\n\n".join(all_text)
