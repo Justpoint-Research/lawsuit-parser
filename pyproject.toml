@@ -24,6 +24,13 @@ dependencies = [
     "docling>=2.0.0",
     "docling-core>=2.0.0",
     "tqdm>=4.66.0",
+    "pydantic>=2.0",
+    "gliner>=0.2.0",
+    "openai>=1.0.0",
+    "rapidfuzz>=3.0.0",
+    "tomli-w>=1.0.0",
+    "maverick-coref>=1.0.7",
+    "tomli>=2.4.1",
 ]
 
 [project.optional-dependencies]
