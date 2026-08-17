@@ -7,7 +7,11 @@ from typing import Any
 
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions,
+    LayoutOptions,
+    DOCLING_LAYOUT_EGRET_MEDIUM,
+)
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
@@ -91,15 +95,30 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Initialize converter with default options
-    # The default 'auto' device setting will automatically use GPU if available
-    # Note: Custom format_options cause version incompatibility issues with Docling 2.x
-    converter = DocumentConverter()
+    # Configure layout model to use EGRET instead of HERON (RT-DETR-v2)
+    # EGRET models work with transformers 4.x and support GPU acceleration
+    layout_options = LayoutOptions(
+        model_config=DOCLING_LAYOUT_EGRET_MEDIUM,
+    )
+
+    # Configure PDF pipeline with EGRET layout model
+    pipeline_options = PdfPipelineOptions(
+        layout_options=layout_options,
+        do_table_structure=extract_tables,
+        do_ocr=True,
+    )
+
+    # Initialize converter with EGRET model configuration
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: pipeline_options,
+        }
+    )
 
     # Debug: log GPU usage setting
     import logging
     logger = logging.getLogger(__name__)
-    logger.info(f"Parsing {pdf_path.name} with use_gpu={use_gpu} (using default 'auto' device detection)")
+    logger.info(f"Parsing {pdf_path.name} with EGRET_MEDIUM layout model, use_gpu={use_gpu} (auto GPU detection)")
 
     try:
         # Convert the document
