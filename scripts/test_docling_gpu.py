@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, PdfBackend
+from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 
 def test_gpu_usage():
@@ -31,7 +31,6 @@ def test_gpu_usage():
     )
 
     pipeline_options = PdfPipelineOptions(
-        backend=PdfBackend.DLPARSE_V2,
         accelerator_options=accelerator_options,
     )
 
