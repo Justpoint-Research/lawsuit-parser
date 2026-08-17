@@ -68,7 +68,13 @@ ensure-venv: ensure-uv
 
 install: ensure-venv
 	@echo "Installing dependencies..."
-	uv pip install -e ".[test]"
+	@if command -v nvidia-smi >/dev/null 2>&1; then \
+		echo "GPU detected - installing PyTorch with CUDA 12.4 support..."; \
+		uv pip install -e ".[test]" --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple; \
+	else \
+		echo "No GPU detected - installing CPU-only dependencies..."; \
+		uv pip install -e ".[test]"; \
+	fi
 	@echo "Installation complete."
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,8 @@ dependencies = [
     "tomli-w>=1.0.0",
     "maverick-coref>=1.0.7",
     "tomli>=2.4.1",
+    # Pin torch to CUDA 12.4 compatible version for GPU support
+    "torch>=2.0.0,<2.6.0",
 ]
 
 [project.optional-dependencies]
