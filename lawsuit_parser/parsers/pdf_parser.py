@@ -7,7 +7,7 @@ from typing import Any
 
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, PdfBackend
 from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
@@ -99,7 +99,9 @@ def parse_pdf_document(
     )
 
     # Configure PDF pipeline options
+    # Use DLPARSE_V2 backend which supports GPU acceleration
     pipeline_options = PdfPipelineOptions(
+        backend=PdfBackend.DLPARSE_V2,
         accelerator_options=accelerator_options,
         do_table_structure=extract_tables,
         do_ocr=True,
