@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from docling.document_converter import DocumentConverter
+from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import (
+    LayoutOptions,
+    LayoutObjectDetectionOptions,
+    DOCLING_LAYOUT_HERON,
+)
+from docling.models.stages.layout.layout_object_detection_model import ObjectDetectionEngineType
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
 
@@ -89,15 +96,28 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Initialize converter with default options
-    # Docling 1.x uses EGRET models by default which work with transformers 4.x
-    # GPU will be auto-detected and used if available
-    converter = DocumentConverter()
+    # Configure layout model to use ONNX runtime instead of transformers
+    # This bypasses the torch import bug in transformers 5.x
+    # ONNX runtime can still use GPU via CUDA execution provider
+    pipeline_options = StandardPdfPipeline.get_default_options()
+
+    # Override to use ONNX runtime engine for layout detection
+    pipeline_options.layout_options = LayoutObjectDetectionOptions(
+        engine_type=ObjectDetectionEngineType.ONNXRUNTIME,
+        model_spec=DOCLING_LAYOUT_HERON,
+    )
+
+    # Initialize converter with ONNX-based layout detection
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: pipeline_options,
+        }
+    )
 
     # Debug: log GPU usage setting
     import logging
     logger = logging.getLogger(__name__)
-    logger.info(f"Parsing {pdf_path.name} with use_gpu={use_gpu} (Docling 1.x with EGRET models, auto GPU detection)")
+    logger.info(f"Parsing {pdf_path.name} with ONNX runtime layout model (GPU-enabled), use_gpu={use_gpu}")
 
     try:
         # Convert the document
