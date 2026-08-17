@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from docling.document_converter import DocumentConverter
+from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions,
+    ThreadedPdfPipelineOptions,
     LayoutOptions,
     DOCLING_LAYOUT_EGRET_MEDIUM,
 )
@@ -95,20 +96,20 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Configure layout model to use EGRET instead of HERON (RT-DETR-v2)
+    # Get default PDF pipeline options and customize to use EGRET layout model
     # EGRET models work with transformers 4.x and support GPU acceleration
-    layout_options = LayoutOptions(
-        model_config=DOCLING_LAYOUT_EGRET_MEDIUM,
+    pipeline_options = StandardPdfPipeline.get_default_options()
+
+    # Replace the layout model config with EGRET_MEDIUM instead of HERON (RT-DETR-v2)
+    pipeline_options.layout_options = LayoutOptions(
+        model_spec=DOCLING_LAYOUT_EGRET_MEDIUM,
     )
 
-    # Configure PDF pipeline with EGRET layout model
-    pipeline_options = PdfPipelineOptions(
-        layout_options=layout_options,
-        do_table_structure=extract_tables,
-        do_ocr=True,
-    )
+    # Set table structure and OCR options
+    pipeline_options.do_table_structure = extract_tables
+    pipeline_options.do_ocr = True
 
-    # Initialize converter with EGRET model configuration
+    # Initialize converter with customized pipeline options
     converter = DocumentConverter(
         format_options={
             InputFormat.PDF: pipeline_options,
