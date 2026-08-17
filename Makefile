@@ -1,5 +1,6 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
-        sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser
+        sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
+        install-vllm download-nuextract run-vllm check-vllm check-gpu
 
 # The default shell for make
 SHELL := /bin/bash
@@ -40,6 +41,13 @@ help:
 	@echo "  make run-proxy         - Start Cloud SQL Auth Proxy (connects to both databases)"
 	@echo "                           - hidden-danger: localhost:5432"
 	@echo "                           - scrapping: localhost:5433"
+	@echo ""
+	@echo "Extraction Pipeline commands:"
+	@echo "  make install-vllm      - Install vLLM in the virtual environment"
+	@echo "  make download-nuextract- Download NuExtract3 model from HuggingFace"
+	@echo "  make run-vllm          - Start vLLM server with NuExtract3 (port 8000)"
+	@echo "  make check-vllm        - Check if vLLM server is running"
+	@echo "  make check-gpu         - Check if GPU/CUDA is available for parsing"
 
 # ---------------------------------------------------------------------------
 # Environment setup
@@ -172,3 +180,43 @@ clean:
 	find . -type f -name "*.pyc" -delete
 	find . -type f -name "*.pyo" -delete
 	@echo "Clean complete."
+
+# ---------------------------------------------------------------------------
+# Extraction Pipeline / vLLM
+# ---------------------------------------------------------------------------
+
+install-vllm: ensure-venv
+	@echo "Installing vLLM..."
+	uv pip install vllm
+	@echo "vLLM installed successfully."
+
+download-nuextract: ensure-venv
+	@echo "Downloading NuExtract3 model from HuggingFace..."
+	@echo "This may take several minutes depending on your connection..."
+	$(PYTHON) -c "from huggingface_hub import snapshot_download; snapshot_download('numind/NuExtract3', resume_download=True)"
+	@echo "NuExtract3 model downloaded successfully."
+
+run-vllm: ensure-venv
+	@echo "Starting vLLM server with NuExtract3..."
+	@echo "Server will be available at http://localhost:8000"
+	@echo "Press Ctrl+C to stop the server"
+	@echo ""
+	uv run vllm serve numind/NuExtract3 \
+		--trust-remote-code \
+		--chat-template-content-format openai \
+		--max-model-len 32768 \
+		--port 8000
+
+check-vllm:
+	@echo "Checking vLLM server status..."
+	@if curl -s http://localhost:8000/health >/dev/null 2>&1; then \
+		echo "✓ vLLM server is running on port 8000"; \
+	else \
+		echo "✗ vLLM server is not running"; \
+		echo "  Start it with: make run-vllm"; \
+		exit 1; \
+	fi
+
+check-gpu: ensure-venv
+	@echo "Checking GPU/CUDA availability for PDF parsing..."
+	@$(PYTHON) scripts/check_gpu.py

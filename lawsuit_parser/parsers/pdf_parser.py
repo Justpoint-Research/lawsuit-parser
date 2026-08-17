@@ -8,6 +8,7 @@ from typing import Any
 from docling.document_converter import DocumentConverter
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
 
@@ -90,9 +91,26 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Initialize converter
-    # Note: Docling automatically enables OCR and table extraction by default
-    converter = DocumentConverter()
+    # Configure accelerator options for GPU/CPU usage
+    device = AcceleratorDevice.CUDA if use_gpu else AcceleratorDevice.CPU
+    accelerator_options = AcceleratorOptions(
+        num_threads=4,
+        device=device,
+    )
+
+    # Configure PDF pipeline options
+    pipeline_options = PdfPipelineOptions(
+        accelerator_options=accelerator_options,
+        do_table_structure=extract_tables,
+        do_ocr=True,
+    )
+
+    # Initialize converter with pipeline options
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: pipeline_options,
+        }
+    )
 
     try:
         # Convert the document
