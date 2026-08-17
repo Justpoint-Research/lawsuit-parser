@@ -9,11 +9,10 @@ from docling.document_converter import DocumentConverter
 from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
-    LayoutOptions,
     LayoutObjectDetectionOptions,
-    DOCLING_LAYOUT_HERON,
 )
-from docling.models.stages.layout.layout_object_detection_model import ObjectDetectionEngineType
+from docling.datamodel.stage_model_specs import ObjectDetectionModelSpec, EngineModelConfig
+from docling.models.inference_engines.object_detection.base import ObjectDetectionEngineType
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
 
@@ -101,10 +100,22 @@ def parse_pdf_document(
     # ONNX runtime can still use GPU via CUDA execution provider
     pipeline_options = StandardPdfPipeline.get_default_options()
 
-    # Override to use ONNX runtime engine for layout detection
+    # Create HERON model spec with ONNX runtime engine override
+    onnx_model_spec = ObjectDetectionModelSpec(
+        name="layout_heron",
+        repo_id="docling-project/docling-layout-heron-onnx",
+        revision="main",
+        engine_overrides={
+            ObjectDetectionEngineType.ONNXRUNTIME: EngineModelConfig(
+                repo_id="docling-project/docling-layout-heron-onnx",
+                extra_config={"model_filename": "model.onnx"},
+            )
+        },
+    )
+
+    # Override layout options to use ONNX model
     pipeline_options.layout_options = LayoutObjectDetectionOptions(
-        engine_type=ObjectDetectionEngineType.ONNXRUNTIME,
-        model_spec=DOCLING_LAYOUT_HERON,
+        model_spec=onnx_model_spec,
     )
 
     # Initialize converter with ONNX-based layout detection
