@@ -6,14 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from docling.document_converter import DocumentConverter
-from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    ThreadedPdfPipelineOptions,
-    LayoutOptions,
-    DOCLING_LAYOUT_EGRET_MEDIUM,
-)
-from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
 
@@ -96,30 +89,15 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Get default PDF pipeline options and customize to use EGRET layout model
-    # EGRET models work with transformers 4.x and support GPU acceleration
-    pipeline_options = StandardPdfPipeline.get_default_options()
-
-    # Replace the layout model config with EGRET_MEDIUM instead of HERON (RT-DETR-v2)
-    pipeline_options.layout_options = LayoutOptions(
-        model_spec=DOCLING_LAYOUT_EGRET_MEDIUM,
-    )
-
-    # Set table structure and OCR options
-    pipeline_options.do_table_structure = extract_tables
-    pipeline_options.do_ocr = True
-
-    # Initialize converter with customized pipeline options
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: pipeline_options,
-        }
-    )
+    # Initialize converter with default options
+    # Docling 1.x uses EGRET models by default which work with transformers 4.x
+    # GPU will be auto-detected and used if available
+    converter = DocumentConverter()
 
     # Debug: log GPU usage setting
     import logging
     logger = logging.getLogger(__name__)
-    logger.info(f"Parsing {pdf_path.name} with EGRET_MEDIUM layout model, use_gpu={use_gpu} (auto GPU detection)")
+    logger.info(f"Parsing {pdf_path.name} with use_gpu={use_gpu} (Docling 1.x with EGRET models, auto GPU detection)")
 
     try:
         # Convert the document
