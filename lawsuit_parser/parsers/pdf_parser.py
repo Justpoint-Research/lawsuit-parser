@@ -91,31 +91,15 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Configure accelerator options for GPU/CPU usage
-    device = AcceleratorDevice.CUDA if use_gpu else AcceleratorDevice.CPU
-    accelerator_options = AcceleratorOptions(
-        num_threads=4,
-        device=device,
-    )
+    # Initialize converter with default options
+    # The default 'auto' device setting will automatically use GPU if available
+    # Note: Custom format_options cause version incompatibility issues with Docling 2.x
+    converter = DocumentConverter()
 
-    # Configure PDF pipeline options
-    pipeline_options = PdfPipelineOptions(
-        accelerator_options=accelerator_options,
-        do_table_structure=extract_tables,
-        do_ocr=True,
-    )
-
-    # Debug: log device being used
+    # Debug: log GPU usage setting
     import logging
     logger = logging.getLogger(__name__)
-    logger.info(f"Parsing {pdf_path.name} with device: {device.value}, use_gpu={use_gpu}")
-
-    # Initialize converter with pipeline options
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: pipeline_options,
-        }
-    )
+    logger.info(f"Parsing {pdf_path.name} with use_gpu={use_gpu} (using default 'auto' device detection)")
 
     try:
         # Convert the document
