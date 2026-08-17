@@ -105,6 +105,11 @@ def parse_pdf_document(
         do_ocr=True,
     )
 
+    # Debug: log device being used
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Parsing {pdf_path.name} with device: {device.value}, use_gpu={use_gpu}")
+
     # Initialize converter with pipeline options
     converter = DocumentConverter(
         format_options={
