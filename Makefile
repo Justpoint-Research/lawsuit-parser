@@ -33,6 +33,7 @@ help:
 	@echo "  make clean             - Remove build artifacts and cache files"
 	@echo "  make notebook          - Start Jupyter notebook server"
 	@echo "  make case-browser      - Start Case Browser Streamlit app"
+	@echo "  make event-browser     - Start Event Browser Streamlit app (extracted events, actor filtering)"
 	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
 	@echo ""
 	@echo "Database commands:"
@@ -115,6 +116,11 @@ case-browser: ensure-venv
 	@echo "Opening app at http://localhost:8501"
 	uv run streamlit run apps/case_browser.py
 
+event-browser: ensure-venv
+	@echo "Starting Event Browser app..."
+	@echo "Opening app at http://localhost:8501"
+	uv run streamlit run apps/event_browser.py
+
 test-pdf-parser: ensure-venv
 	@echo "Testing PDF parser on sample document..."
 	@if [ -f "data/cases/case_104/documents/document__PLUS__PLUS_IWEE20u6dQBAdaY1AO8w==.pdf" ]; then \
@@ -189,11 +195,20 @@ clean:
 
 # ---------------------------------------------------------------------------
 # Extraction Pipeline / vLLM
+#
+# vLLM gets its own venv (VLLM_VENV), separate from the project's .venv.
+# The project pins torch<2.6 (CUDA 12.4) for docling GPU support, but current
+# vLLM releases require a much newer torch/CUDA 13 stack - the two can't
+# coexist in one environment. Since NuExtractClient only talks to vLLM over
+# HTTP (localhost:8000/v1), isolating it this way is safe.
 # ---------------------------------------------------------------------------
 
-install-vllm: ensure-venv
-	@echo "Installing vLLM..."
-	uv pip install vllm
+VLLM_VENV := .venv-vllm
+
+install-vllm: ensure-uv download-nuextract
+	@echo "Installing vLLM into isolated venv ($(VLLM_VENV))..."
+	@if [ ! -d $(VLLM_VENV) ]; then uv venv $(VLLM_VENV); fi
+	uv pip install --python $(VLLM_VENV)/bin/python vllm
 	@echo "vLLM installed successfully."
 
 download-nuextract: ensure-venv
@@ -202,15 +217,34 @@ download-nuextract: ensure-venv
 	$(PYTHON) -c "from huggingface_hub import snapshot_download; snapshot_download('numind/NuExtract3', resume_download=True)"
 	@echo "NuExtract3 model downloaded successfully."
 
-run-vllm: ensure-venv
+run-vllm:
 	@echo "Starting vLLM server with NuExtract3..."
 	@echo "Server will be available at http://localhost:8000"
 	@echo "Press Ctrl+C to stop the server"
 	@echo ""
-	uv run vllm serve numind/NuExtract3 \
+	# gpu-memory-utilization is capped well below vLLM's 0.92 default: the
+	# desktop session (gnome-shell, remote desktop) already holds ~1GB of the
+	# 24GB card, and extract.py's stages 2-3 (Maverick, GLiNER) load their own
+	# models into GPU memory in the same process while this server is up, so
+	# vLLM can't be left to grab most of the card. NuExtract3 needs ~11.3GB
+	# just to load (8.6GB weights + activations/CUDA graph) plus >=1.06GB KV
+	# cache to serve the configured max-model-len at all; 0.6 (~14.1GB) covers
+	# that with a bit of margin and leaves ~9GB free for the rest of the
+	# pipeline. Raise this if extraction stalls on KV cache pressure and
+	# nothing else needs the GPU at the same time; lower max-model-len instead
+	# if you need more headroom. flashinfer sampler is disabled because it
+	# JIT-compiles a kernel via nvcc, which isn't on PATH in this venv.
+	# max-num-seqs is capped well below vLLM's default of 256: NuExtract3 is a
+	# hybrid attention/Mamba model, and each concurrent sequence needs its own
+	# Mamba cache block - 256 of them don't fit the reduced memory budget
+	# above. extract.py calls this server one request at a time, so a small
+	# cap costs nothing here.
+	VLLM_USE_FLASHINFER_SAMPLER=0 $(VLLM_VENV)/bin/vllm serve numind/NuExtract3 \
 		--trust-remote-code \
 		--chat-template-content-format openai \
 		--max-model-len 32768 \
+		--gpu-memory-utilization 0.6 \
+		--max-num-seqs 8 \
 		--port 8000
 
 check-vllm:

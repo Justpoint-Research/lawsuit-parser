@@ -2,6 +2,7 @@
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -204,6 +205,7 @@ def parse_all_pdfs(
     use_gpu: bool = True,
     progress_file: Any = None,
     postprocessors: list[PostprocessingStep] | None = None,
+    max_workers: int = 8,
 ) -> dict[str, Any]:
     """
     Parse all PDFs in the data directory.
@@ -219,6 +221,14 @@ def parse_all_pdfs(
             elsewhere and the progress bar still needs to reach a console.
         postprocessors: Postprocessing steps to run after text extraction,
             in order (default: `default_postprocessors()`)
+        max_workers: Number of PDFs to parse concurrently. All workers share
+            a single cached Docling converter (see `_build_converter`), so
+            this overlaps one file's CPU-bound work (page rasterization,
+            text extraction, disk I/O) with another's GPU inference, rather
+            than spinning up separate converters/CUDA contexts per worker.
+            Set to 1 for sequential parsing. Defaults to 8; benchmarking on
+            a single GPU showed 4 workers captures most of the throughput
+            gain from overlap, with 8 adding a smaller further improvement.
 
     Returns:
         Dictionary with summary statistics, including a "failures" list of
@@ -235,36 +245,48 @@ def parse_all_pdfs(
     stats = {"total": len(pdfs), "success": 0, "failed": 0, "skipped": 0}
     failures = []
 
+    def record(pdf_path: Path, success: bool, message: str) -> None:
+        if "Skipped" in message:
+            stats["skipped"] += 1
+        elif success:
+            stats["success"] += 1
+        else:
+            stats["failed"] += 1
+            failures.append((str(pdf_path), message))
+
     with tqdm(total=len(pdfs), desc="Parsing PDFs", unit="file", file=progress_file) as pbar:
-        for pdf_path in pdfs:
-            # Determine output path
-            output_path = get_output_path(pdf_path, output_dir)
-
-            # Parse the PDF
-            success, message = parse_and_save_pdf(
-                pdf_path,
-                output_path,
-                skip_existing=skip_existing,
-                use_gpu=use_gpu,
-                postprocessors=postprocessors,
-            )
-
-            # Update statistics
-            if "Skipped" in message:
-                stats["skipped"] += 1
-            elif success:
-                stats["success"] += 1
-            else:
-                stats["failed"] += 1
-                failures.append((str(pdf_path), message))
-
-            # Update progress bar
-            pbar.set_postfix({
-                "success": stats["success"],
-                "failed": stats["failed"],
-                "skipped": stats["skipped"]
-            })
-            pbar.update(1)
+        if max_workers <= 1:
+            for pdf_path in pdfs:
+                output_path = get_output_path(pdf_path, output_dir)
+                success, message = parse_and_save_pdf(
+                    pdf_path,
+                    output_path,
+                    skip_existing=skip_existing,
+                    use_gpu=use_gpu,
+                    postprocessors=postprocessors,
+                )
+                record(pdf_path, success, message)
+                pbar.set_postfix(success=stats["success"], failed=stats["failed"], skipped=stats["skipped"])
+                pbar.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_pdf = {
+                    executor.submit(
+                        parse_and_save_pdf,
+                        pdf_path,
+                        get_output_path(pdf_path, output_dir),
+                        skip_existing=skip_existing,
+                        use_gpu=use_gpu,
+                        postprocessors=postprocessors,
+                    ): pdf_path
+                    for pdf_path in pdfs
+                }
+                for future in as_completed(future_to_pdf):
+                    pdf_path = future_to_pdf[future]
+                    success, message = future.result()
+                    record(pdf_path, success, message)
+                    pbar.set_postfix(success=stats["success"], failed=stats["failed"], skipped=stats["skipped"])
+                    pbar.update(1)
 
     # Log summary
     logger.info("\n" + "="*60)

@@ -2,16 +2,20 @@
 
 import json
 from dataclasses import dataclass, field, asdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from docling.document_converter import DocumentConverter
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     LayoutObjectDetectionOptions,
 )
 from docling.datamodel.stage_model_specs import ObjectDetectionModelSpec, EngineModelConfig
+from docling.datamodel.object_detection_engine_options import (
+    OnnxRuntimeObjectDetectionEngineOptions,
+)
 from docling.models.inference_engines.object_detection.base import ObjectDetectionEngineType
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.base import ImageRefMode
@@ -38,6 +42,58 @@ class ParsedDocument:
     def to_json(self, indent: int = 2) -> str:
         """Convert to JSON string."""
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+
+@lru_cache(maxsize=2)
+def _build_converter(use_gpu: bool) -> DocumentConverter:
+    """
+    Build (and cache) the Docling converter for a given GPU setting.
+
+    Building a `DocumentConverter` re-initializes the ONNX layout and OCR
+    models (session creation, HuggingFace revision lookup, CUDA context
+    setup), which costs seconds. Reusing one converter across a whole batch
+    run instead of rebuilding it per file avoids paying that cost per
+    document and avoids the GPU memory growth that comes from repeatedly
+    creating and discarding ONNX Runtime CUDA sessions.
+    """
+    # Configure layout model to use ONNX runtime instead of transformers
+    # This bypasses the torch import bug in transformers 5.x
+    # ONNX runtime can still use GPU via CUDA execution provider
+    pipeline_options = StandardPdfPipeline.get_default_options()
+
+    # Create HERON model spec with ONNX runtime engine override
+    onnx_model_spec = ObjectDetectionModelSpec(
+        name="layout_heron",
+        repo_id="docling-project/docling-layout-heron-onnx",
+        revision="main",
+        engine_overrides={
+            ObjectDetectionEngineType.ONNXRUNTIME: EngineModelConfig(
+                repo_id="docling-project/docling-layout-heron-onnx",
+                extra_config={"model_filename": "model.onnx"},
+            )
+        },
+    )
+
+    # Override layout options to use ONNX model, running on the ONNX
+    # Runtime engine (the default engine is Transformers, which cannot
+    # load this ONNX-only model repository)
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
+    pipeline_options.layout_options = LayoutObjectDetectionOptions(
+        model_spec=onnx_model_spec,
+        engine_options=OnnxRuntimeObjectDetectionEngineOptions(providers=providers),
+    )
+
+    # Let RapidOCR (and any other torch/onnxruntime-backed stage) pick up
+    # the GPU too - by default it only activates CUDA when the resolved
+    # device string contains "cuda", so "auto" isn't enough to guarantee it.
+    pipeline_options.accelerator_options.device = "cuda" if use_gpu else "cpu"
+
+    # Initialize converter with ONNX-based layout detection
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+        }
+    )
 
 
 def parse_pdf_document(
@@ -95,35 +151,7 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    # Configure layout model to use ONNX runtime instead of transformers
-    # This bypasses the torch import bug in transformers 5.x
-    # ONNX runtime can still use GPU via CUDA execution provider
-    pipeline_options = StandardPdfPipeline.get_default_options()
-
-    # Create HERON model spec with ONNX runtime engine override
-    onnx_model_spec = ObjectDetectionModelSpec(
-        name="layout_heron",
-        repo_id="docling-project/docling-layout-heron-onnx",
-        revision="main",
-        engine_overrides={
-            ObjectDetectionEngineType.ONNXRUNTIME: EngineModelConfig(
-                repo_id="docling-project/docling-layout-heron-onnx",
-                extra_config={"model_filename": "model.onnx"},
-            )
-        },
-    )
-
-    # Override layout options to use ONNX model
-    pipeline_options.layout_options = LayoutObjectDetectionOptions(
-        model_spec=onnx_model_spec,
-    )
-
-    # Initialize converter with ONNX-based layout detection
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: pipeline_options,
-        }
-    )
+    converter = _build_converter(use_gpu)
 
     # Debug: log GPU usage setting
     import logging

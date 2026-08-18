@@ -23,7 +23,7 @@ from lawsuit_parser.extraction.schemas import SegmentsArtifact, MetadataArtifact
 from lawsuit_parser.extraction.segments import build_segments
 from lawsuit_parser.extraction.metadata import extract_metadata
 from lawsuit_parser.extraction.registry import build_registry
-from lawsuit_parser.extraction.spans import sweep_spans
+from lawsuit_parser.extraction.spans import sweep_spans, build_dynamic_labels
 from lawsuit_parser.extraction.protoevents import build_proto_events
 from lawsuit_parser.extraction.models import (
     NuExtractClient,
@@ -351,6 +351,15 @@ def main():
             logger.info("Stage 3: Sweeping spans with GLiNER...")
             segments = store.read_stage("00_segments", SegmentsArtifact)
 
+            case_caption = store.read_case_caption()
+            dynamic_labels = build_dynamic_labels(config["gliner"]["labels"], case_caption)
+            extra_label_passes = [dynamic_labels] if dynamic_labels else None
+            if dynamic_labels:
+                logger.info(
+                    f"Stage 3: running extra GLiNER pass with case-specific labels: "
+                    f"{dynamic_labels}"
+                )
+
             with GlinerRunner(
                 config["gliner"]["model"], config["gliner"]["threshold"]
             ) as gliner:
@@ -362,6 +371,7 @@ def main():
                     config["gliner"]["labels"],
                     config["gliner"]["threshold"],
                     config["gliner"]["batch_size"],
+                    extra_label_passes=extra_label_passes,
                 )
 
             store.write_stage("03_spans", artifact)

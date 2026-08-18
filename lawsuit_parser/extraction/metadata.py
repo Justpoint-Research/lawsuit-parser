@@ -44,6 +44,16 @@ ROLE_MAPPING = {
 }
 
 
+def _get_str(d: dict, key: str) -> str:
+    """Read a string field from a NuExtract result, tolerating explicit nulls.
+
+    NuExtract returns JSON `null` (not an empty string) for fields it couldn't
+    find in the text, so a plain `d.get(key, "")` still yields None.
+    """
+    value = d.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
 def normalize_role(role_str: str | None) -> Literal[
     "plaintiff", "defendant", "intervenor", "third_party",
     "amicus", "counsel", "court", "other"
@@ -209,7 +219,7 @@ def extract_metadata(
         source_spans = {}
 
         # Court
-        court_str = result.get("court", "").strip()
+        court_str = _get_str(result, "court")
         court_span = None
         if court_str:
             court_span = find_span_in_text(input_text, court_str, doc_id, 0)
@@ -220,7 +230,7 @@ def extract_metadata(
                 court_str = None
 
         # Case number
-        case_number_str = result.get("case_number", "").strip()
+        case_number_str = _get_str(result, "case_number")
         case_number_span = None
         if case_number_str:
             case_number_span = find_span_in_text(input_text, case_number_str, doc_id, 0)
@@ -231,7 +241,7 @@ def extract_metadata(
                 case_number_str = None
 
         # Document title
-        doc_title_str = result.get("document_title", "").strip()
+        doc_title_str = _get_str(result, "document_title")
         doc_title_span = None
         if doc_title_str:
             doc_title_span = find_span_in_text(input_text, doc_title_str, doc_id, 0)
@@ -242,7 +252,7 @@ def extract_metadata(
                 doc_title_str = None
 
         # Document number
-        doc_number_str = result.get("document_number", "").strip()
+        doc_number_str = _get_str(result, "document_number")
         doc_number_span = None
         if doc_number_str:
             doc_number_span = find_span_in_text(input_text, doc_number_str, doc_id, 0)
@@ -253,7 +263,7 @@ def extract_metadata(
                 doc_number_str = None
 
         # Filing date
-        filing_date_str = result.get("filing_date", "").strip()
+        filing_date_str = _get_str(result, "filing_date")
         filing_date_span = None
         if filing_date_str:
             filing_date_span = find_span_in_text(input_text, filing_date_str, doc_id, 0)
@@ -264,7 +274,7 @@ def extract_metadata(
                 filing_date_str = None
 
         # Signature date
-        signature_date_str = result.get("signature_date", "").strip()
+        signature_date_str = _get_str(result, "signature_date")
         signature_date_span = None
         if signature_date_str:
             signature_date_span = find_span_in_text(
@@ -277,7 +287,7 @@ def extract_metadata(
                 signature_date_str = None
 
         # Filed by
-        filed_by_str = result.get("filed_by", "").strip()
+        filed_by_str = _get_str(result, "filed_by")
         filed_by_span = None
         if filed_by_str:
             filed_by_span = find_span_in_text(input_text, filed_by_str, doc_id, 0)
@@ -292,9 +302,9 @@ def extract_metadata(
         parties_list = result.get("parties", [])
         if isinstance(parties_list, list):
             for party_dict in parties_list:
-                name = party_dict.get("name", "").strip()
-                role = party_dict.get("role", "").strip()
-                short_name = party_dict.get("short_name", "").strip()
+                name = _get_str(party_dict, "name")
+                role = _get_str(party_dict, "role")
+                short_name = _get_str(party_dict, "short_name")
 
                 if name:
                     normalized_role = normalize_role(role)

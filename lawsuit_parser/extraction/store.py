@@ -130,6 +130,26 @@ class ArtifactStore:
         text_path = self.documents_dir / f"{doc_id}.txt"
         return text_path.exists()
 
+    def read_case_caption(self) -> str | None:
+        """Read the short docket caption (e.g. "X v. Y") from the case's
+        DB-exported JSON (written by scripts/export_case.py and friends).
+
+        This is case-level metadata from the scraping database, not a stage
+        artifact - it's the one place the extraction pipeline can reach
+        DB-known plaintiff/defendant identity before running any model.
+
+        Returns:
+            The caption string, or None if the case JSON or caption is missing.
+        """
+        case_json_path = self.case_dir / f"{self.case_id}.json"
+        if not case_json_path.exists():
+            return None
+
+        with open(case_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return data.get("case_info", {}).get("caption")
+
     def write_run_metadata(
         self,
         stage: str,

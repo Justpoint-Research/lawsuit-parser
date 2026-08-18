@@ -12,6 +12,10 @@ A Streamlit web application for browsing legal cases from the NY Supreme Court s
 
 A lightweight Streamlit app for browsing exported cases from local `data/cases` directory. **No database or GCS authentication required!**
 
+### 📅 Event Browser (`event_browser.py`)
+
+A Streamlit app for browsing extracted event-candidate segments (the output of `scripts/extract.py` stages 0-4), with tag-style filtering by actor.
+
 ---
 
 ## Database Case Browser
@@ -110,6 +114,35 @@ The app will open at `http://localhost:8501`
 - 📊 **Shareable** - Export and share specific cases easily
 
 **See:** [Local Case Browser Documentation](../docs/local_case_browser.md) for more details.
+
+---
+
+## Event Browser
+
+The interactive counterpart to `scripts/extract.py`'s output and `scripts/browse_events.py` - same input (the `data/cases/<case_id>/stages/*.json` artifacts from extraction stages 0-4), but as a filterable app instead of a terminal dump.
+
+**Features:**
+- Case-level summary: caption, court, plaintiff(s)/defendant(s), document count, time span, entity-span breakdown
+- Event table (timestamp / actors / summary / document / page / source excerpt) for every stage-4 priority segment
+- **Tag-style actor filter** - pick one or more actors from a multiselect and the event list narrows to segments mentioning them (ANY by default, with an optional ALL/AND toggle when 2+ actors are selected)
+- Per-event expander with the full source text
+
+**Setup:**
+
+Requires a case that's already been run through the extraction pipeline:
+```bash
+uv run scripts/extract.py --case-id case_2132 --stages 0-4
+```
+
+Then:
+```bash
+make event-browser
+
+# Or run directly
+streamlit run apps/event_browser.py
+```
+
+**Note:** the event table renders as plain monospace text (`st.code`), not `st.dataframe`/`st.table`. In some environments those Arrow-backed widgets segfault the Streamlit server process on rerun (a `pyarrow`/`libarrow.so` issue, confirmed against a live server here) - the plain-text table sidesteps that entirely and still gives the same tabular layout as `scripts/browse_events.py`.
 
 ---
 

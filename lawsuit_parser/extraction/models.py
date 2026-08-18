@@ -20,6 +20,22 @@ class ExtractionError(Exception):
     pass
 
 
+def _free_cuda_memory() -> None:
+    """Release cached GPU memory after a model is dropped.
+
+    Extraction stages load one heavy model at a time in the same process
+    (Maverick, then GLiNER); without this, PyTorch's caching allocator keeps
+    holding a previous stage's memory and a later stage can OOM even though
+    the earlier model is no longer referenced.
+    """
+    import gc
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 # ---- NuExtract Client ----
 
 class NuExtractClient:
@@ -81,8 +97,10 @@ class NuExtractClient:
         Note: We use NuExtract3's native template mechanism via chat_template_kwargs.
         This is passed through extra_body since it's a vLLM extension.
         """
-        # Build the chat_template_kwargs
-        chat_kwargs = {"template": template}
+        # Build the chat_template_kwargs. NuExtract3's chat template splices
+        # `template` directly into the prompt string (`'...' + template + '...'`),
+        # so it must already be a JSON string, not a dict.
+        chat_kwargs = {"template": json.dumps(template)}
         if examples:
             chat_kwargs["examples"] = examples
 
@@ -177,8 +195,9 @@ class GlinerRunner:
             raise ImportError("gliner package not installed. Run: uv add gliner")
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Unload the model."""
+        """Unload the model and free its GPU memory."""
         self.model = None
+        _free_cuda_memory()
         return False
 
     def predict_batch(
@@ -202,8 +221,9 @@ class GlinerRunner:
 
         threshold = threshold if threshold is not None else self.threshold
 
-        # GLiNER returns list of dicts per text
-        predictions = self.model.predict_entities(
+        # predict_entities takes a single string; batch_predict_entities is
+        # the actual batch API and returns a list of dicts per input text.
+        predictions = self.model.batch_predict_entities(
             texts,
             labels,
             threshold=threshold,
@@ -227,6 +247,39 @@ class GlinerRunner:
         return results
 
 
+def _fixed_maverick_preprocess(self, sample, speakers=None):
+    """Drop-in replacement for Maverick.preprocess's plain-text path.
+
+    Same tokenization and sentence splitting as the original; only the
+    char-offset bookkeeping changes, from an accumulated `len(sentence) + 1`
+    guess to locating each sentence's real position with `text.find()`.
+    """
+    from maverick.common.util import download_load_spacy, flatten
+    from nltk import sent_tokenize
+
+    nlp = download_load_spacy()
+    char_offsets = []
+    sentences = []
+    search_from = 0
+    sentence_strs = sent_tokenize(sample)
+    for sent, sentence in zip(nlp.pipe(sentence_strs), sentence_strs):
+        start = sample.find(sentence, search_from)
+        if start == -1:
+            start = search_from
+        char_offsets.append([(start + tok.idx, start + tok.idx + len(tok.text) - 1) for tok in sent])
+        sentences.append([tok.text for tok in sent])
+        search_from = start + len(sentence)
+    char_offsets = flatten(char_offsets)
+    tokens = flatten(sentences)
+    eos_len = [len(value) for value in sentences]
+    eos = [sum(eos_len[0 : (i[0] + 1)]) for i in enumerate(eos_len)]
+    if speakers is None:
+        speakers = ["-"] * len(tokens)
+    else:
+        speakers = flatten(speakers)
+    return tokens, eos, speakers, char_offsets
+
+
 # ---- Maverick Coreference Runner ----
 
 class CorefRunner:
@@ -247,9 +300,42 @@ class CorefRunner:
     def __enter__(self) -> "CorefRunner":
         """Load the model."""
         try:
-            from maverick_coref import MaverickCoref
+            import torch
+            from maverick import Maverick
             logger.info(f"Loading Maverick model: {self.model_name}")
-            self.model = MaverickCoref(self.model_name)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # Maverick's checkpoint pickles its Lightning hyperparameters
+            # (OmegaConf DictConfig, etc.), which torch>=2.6's new
+            # weights_only=True default rejects one global at a time.
+            # Restore the pre-2.6 weights_only=False default for this one
+            # load of the pinned, trusted sapienzanlp HF checkpoint.
+            original_load = torch.load
+
+            def _unsafe_load(*args, **kwargs):
+                kwargs["weights_only"] = False
+                return original_load(*args, **kwargs)
+
+            torch.load = _unsafe_load
+            try:
+                self.model = Maverick(hf_name_or_path=self.model_name, device=device)
+            finally:
+                torch.load = original_load
+            # The DeBERTa encoder loads via AutoModel.from_pretrained with no
+            # explicit dtype, which transformers can auto-select as fp16 from
+            # the checkpoint's config while Maverick's own head layers (loaded
+            # from the Lightning .ckpt) stay fp32, so matmuls between them
+            # fail with a dtype mismatch. Force the whole model to one dtype.
+            self.model.model = self.model.model.float()
+            # Maverick's own preprocess() reconstructs each sentence's char
+            # offset by accumulating len(sentence) + 1, assuming exactly one
+            # separator character between sentences. Legal documents have
+            # blank lines and multi-space section breaks, so that drifts from
+            # the true offset and mention spans end up truncated (~4% of
+            # mentions observed on real filings). Patch in a version that
+            # locates each sentence's true position with text.find() instead;
+            # tokenization and the model itself are unchanged.
+            import types
+            self.model.preprocess = types.MethodType(_fixed_maverick_preprocess, self.model)
             return self
         except ImportError:
             raise ImportError(
@@ -257,8 +343,9 @@ class CorefRunner:
             )
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Unload the model."""
+        """Unload the model and free its GPU memory."""
         self.model = None
+        _free_cuda_memory()
         return False
 
     def predict(self, text: str) -> list[list[tuple[int, int]]]:
@@ -274,8 +361,12 @@ class CorefRunner:
         if self.model is None:
             raise RuntimeError("Model not loaded. Use as context manager.")
 
-        # Maverick returns mention chains with character offsets
-        chains = self.model.predict(text)
+        # Maverick's clusters_char_offsets gives (start, end) per mention where
+        # `end` is the last character's own index (inclusive). Convert to the
+        # exclusive end this codebase uses everywhere else (`text[start:end]`).
+        result = self.model.predict(text)
+        clusters = result.get("clusters_char_offsets") or []
+        chains = [[(start, end + 1) for start, end in chain] for chain in clusters]
 
         return chains
 

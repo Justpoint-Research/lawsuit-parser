@@ -108,7 +108,13 @@ def quiet_console(log_path: Path):
     is_flag=True,
     help='Disable GPU acceleration'
 )
-def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existing: bool, no_gpu: bool):
+@click.option(
+    '--workers',
+    type=int,
+    default=8,
+    help='Number of PDFs to parse concurrently (default: 8)'
+)
+def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existing: bool, no_gpu: bool, workers: int):
     """Parse all PDF documents and extract structured content.
 
     Examples:
@@ -132,6 +138,10 @@ def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existi
       # Disable GPU acceleration
 
       python scripts/parse_all_pdfs.py --no-gpu
+
+      # Parse sequentially (concurrency is on by default, --workers 8)
+
+      python scripts/parse_all_pdfs.py --workers 1
     """
     # Convert to Path objects
     data_dir_path = Path(data_dir)
@@ -147,6 +157,7 @@ def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existi
             skip_existing=skip_existing,
             use_gpu=not no_gpu,
             progress_file=console,
+            max_workers=workers,
         )
 
     # Back on the real console: report the outcome.

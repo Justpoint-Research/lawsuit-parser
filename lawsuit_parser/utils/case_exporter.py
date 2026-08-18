@@ -119,6 +119,9 @@ class CaseExporter:
         # Convert documents to list of dicts
         documents = [dict(row._mapping) for row in docs_rows]
 
+        if not documents:
+            raise ValueError(f"Case with id={case_id} has no documents, skipping export")
+
         # Create denormalized structure
         denormalized_case = self._create_denormalized_json(case_data, documents)
 

@@ -60,8 +60,12 @@ def get_random_case_ids(engine, count: int = 100) -> list[int]:
     """
     query = text("""
         SELECT id
-        FROM public.court_cases
-        WHERE case_id IS NOT NULL  -- Filter out cases without case_id
+        FROM public.court_cases cc
+        WHERE cc.case_id IS NOT NULL  -- Filter out cases without case_id
+          AND EXISTS (
+              SELECT 1 FROM public.court_documents cd
+              WHERE cd.case_id = cc.case_id
+          )  -- Filter out cases without documents
         ORDER BY RANDOM()
         LIMIT :count
     """)
