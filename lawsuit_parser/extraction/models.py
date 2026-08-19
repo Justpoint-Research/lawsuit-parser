@@ -187,9 +187,22 @@ class GlinerRunner:
     def __enter__(self) -> "GlinerRunner":
         """Load the model."""
         try:
+            import torch
             from gliner import GLiNER
-            logger.info(f"Loading GLiNER model: {self.model_name}")
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Loading GLiNER model: {self.model_name} on device: {device}")
+
             self.model = GLiNER.from_pretrained(self.model_name)
+            self.model = self.model.to(device)
+            self.model.eval()  # Set to evaluation mode
+
+            if device == "cuda":
+                logger.info(f"GLiNER loaded on GPU: {torch.cuda.get_device_name(0)}")
+                # Verify the internal encoder is on GPU
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
+                    logger.info(f"GLiNER encoder device: {self.model.model.device}")
+
             return self
         except ImportError:
             raise ImportError("gliner package not installed. Run: uv add gliner")
