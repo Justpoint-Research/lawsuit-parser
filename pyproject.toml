@@ -37,11 +37,13 @@ dependencies = [
     "torch>=2.6.0,<2.7.0",
     # Allow latest transformers with rt_detr_v2 support and torch import fix
     "transformers>=5.0.0",
-    # GPU-enabled onnxruntime for docling's ONNX layout/OCR engines. Shares
-    # the `onnxruntime` import path with the CPU-only `onnxruntime` package,
-    # which gliner unconditionally depends on; the override below prevents
-    # that plain CPU package from being installed and clobbering this one.
-    "onnxruntime-gpu[cuda,cudnn]>=1.20.0,<1.24",
+    # GPU-enabled onnxruntime for docling's ONNX layout/OCR engines on Linux.
+    # Shares the `onnxruntime` import path with the CPU-only `onnxruntime`
+    # package, which gliner unconditionally depends on; the override below
+    # prevents that plain CPU package from being installed and clobbering this.
+    "onnxruntime-gpu[cuda,cudnn]>=1.20.0,<1.24; sys_platform == 'linux'",
+    # CPU-only onnxruntime for macOS (for browsing artifacts without GPU)
+    "onnxruntime>=1.20.0,<1.24; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
@@ -53,10 +55,10 @@ test = [
 
 [tool.uv]
 override-dependencies = [
-    # Never satisfy plain `onnxruntime` (CPU-only) requirements from
+    # On Linux, never satisfy plain `onnxruntime` (CPU-only) requirements from
     # transitive deps (gliner) - `onnxruntime-gpu` provides the same
     # `onnxruntime` import path with CUDA support.
-    "onnxruntime; python_version < '0'",
+    "onnxruntime; python_version < '0' and sys_platform == 'linux'",
 ]
 
 [tool.pytest.ini_options]
