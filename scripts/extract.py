@@ -88,11 +88,18 @@ def load_docling_documents(case_id: str, data_root: Path) -> list:
     from docling_core.types.doc import DoclingDocument
 
     case_dir = data_root / case_id
-    docling_files = sorted(case_dir.glob("*.docling.json"))
+
+    # Try documents/ subdirectory first (parse_all_pdfs.py output structure)
+    documents_dir = case_dir / "documents"
+    if documents_dir.exists():
+        docling_files = sorted(documents_dir.glob("*.docling.json"))
+    else:
+        # Fall back to flat structure (legacy)
+        docling_files = sorted(case_dir.glob("*.docling.json"))
 
     if not docling_files:
         raise FileNotFoundError(
-            f"No .docling.json files found in {case_dir}. "
+            f"No .docling.json files found in {case_dir} or {documents_dir}. "
             f"Run the parser first to generate Docling documents."
         )
 

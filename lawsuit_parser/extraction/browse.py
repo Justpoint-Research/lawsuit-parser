@@ -109,14 +109,30 @@ def has_required_stages(case_id: str, data_root: Path) -> bool:
     return all((stages_dir / f"{stage}.json").exists() for stage in required)
 
 
+def has_documents(case_id: str, data_root: Path) -> bool:
+    """Whether a case has any docling.json documents."""
+    case_dir = Path(data_root) / case_id
+
+    # Check documents/ subdirectory (parse_all_pdfs.py output structure)
+    documents_dir = case_dir / "documents"
+    if documents_dir.exists():
+        docling_files = list(documents_dir.glob("*.docling.json"))
+        if docling_files:
+            return True
+
+    # Check flat structure (legacy)
+    docling_files = list(case_dir.glob("*.docling.json"))
+    return len(docling_files) > 0
+
+
 def list_browsable_cases(data_root: Path) -> list[str]:
-    """Case ids under data_root that have every stage artifact browsing needs."""
+    """Case ids under data_root that have every stage artifact browsing needs and at least one document."""
     data_root = Path(data_root)
     if not data_root.exists():
         return []
     return sorted(
         p.name for p in data_root.iterdir()
-        if p.is_dir() and has_required_stages(p.name, data_root)
+        if p.is_dir() and has_documents(p.name, data_root) and has_required_stages(p.name, data_root)
     )
 
 
