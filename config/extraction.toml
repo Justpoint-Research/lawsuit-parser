@@ -23,10 +23,6 @@ labels = [
   "case citation",
 ]
 
-[maverick]
-model = "sapienzanlp/maverick-mes-ontonotes"
-enabled = true
-
 [relex]
 enabled = false
 relations = ["has_date", "actor", "affected", "at_location", "instrument"]

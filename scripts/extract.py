@@ -28,7 +28,6 @@ from lawsuit_parser.extraction.protoevents import build_proto_events
 from lawsuit_parser.extraction.models import (
     NuExtractClient,
     GlinerRunner,
-    CorefRunner,
     DisabledRelexRunner,
 )
 
@@ -323,25 +322,20 @@ def main():
                 timeout_s=config["nuextract"]["timeout_s"],
             )
 
-            with CorefRunner(config["maverick"]["model"]) as coref:
-                artifact = build_registry(
-                    args.case_id,
-                    segments,
-                    metadata,
-                    client,
-                    coref,
-                    store,
-                    config["registry"]["fuzzy_match_threshold"],
-                )
+            artifact = build_registry(
+                args.case_id,
+                segments,
+                metadata,
+                client,
+                store,
+                config["registry"]["fuzzy_match_threshold"],
+            )
 
             store.write_stage("02_registry", artifact)
             store.write_run_metadata(
                 "02_registry",
                 config_hash,
-                {
-                    "nuextract": config["nuextract"]["model"],
-                    "maverick": config["maverick"]["model"],
-                },
+                {"nuextract": config["nuextract"]["model"]},
                 {},
             )
             logger.info(

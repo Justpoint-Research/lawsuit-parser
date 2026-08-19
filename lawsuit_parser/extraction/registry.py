@@ -1,4 +1,4 @@
-"""Stage 2: Party registry + coreference + mention index.
+"""Stage 2: Party registry + mention index.
 
 The highest-leverage stage. A perfectly dated timeline with scrambled parties is worthless.
 
@@ -6,9 +6,7 @@ Order of operations:
 1. Seed from captions
 2. Harvest aliases from "Parties" section
 3. Normalize and merge
-4. Coreference
-5. Link chains to registry
-6. Role anaphora override (let this win)
+4. Role anaphora (map role terms to parties)
 """
 
 import logging
@@ -17,7 +15,7 @@ from typing import Literal
 
 from rapidfuzz import fuzz
 
-from .models import NuExtractClient, CorefRunner, ExtractionError
+from .models import NuExtractClient, ExtractionError
 from .schemas import (
     Party,
     PartyMention,
@@ -137,11 +135,10 @@ def build_registry(
     segments: SegmentsArtifact,
     metadata: MetadataArtifact,
     client: NuExtractClient,
-    coref: CorefRunner,
     store: ArtifactStore,
     fuzzy_threshold: int = 88,
 ) -> RegistryArtifact:
-    """Build party registry with coreference and mention index.
+    """Build party registry with mention index.
 
     This is Stage 2.
 
@@ -150,7 +147,6 @@ def build_registry(
         segments: Segmentation artifact from stage 0
         metadata: Metadata artifact from stage 1
         client: NuExtract3 client
-        coref: Coreference runner
         store: Artifact store
         fuzzy_threshold: Fuzzy match threshold (0-100)
 
@@ -301,102 +297,7 @@ def build_registry(
         if norm_b in party_registry:
             del party_registry[norm_b]
 
-    # Step 4: Coreference
-    # Run Maverick per document
-    for doc_id in [s.doc_id for s in segments.documents]:
-        canonical_text = store.read_canonical_text(doc_id)
-
-        try:
-            chains = coref.predict(canonical_text)
-        except Exception as e:
-            logger.error(f"Coreference failed for {doc_id}: {e}")
-            continue
-
-        # Step 5: Link chains to registry
-        for chain in chains:
-            if not chain:
-                continue
-
-            # Pick representative: longest mention containing a proper noun
-            # For simplicity, just use longest mention
-            representative = max(chain, key=lambda m: m[1] - m[0])
-            start, end = representative
-            mention_text = canonical_text[start:end]
-
-            # Try to link
-            linked_party_id = None
-            source = None
-            confidence = 1.0
-
-            # Try exact normalized match
-            normalized = normalize_name(mention_text)
-            if normalized in party_registry:
-                linked_party_id = party_registry[normalized].party_id
-                source = "exact_match"
-
-            # Try alias match
-            if not linked_party_id:
-                for party in party_registry.values():
-                    for alias in party.aliases:
-                        if normalize_name(alias) == normalized:
-                            linked_party_id = party.party_id
-                            source = "alias_definition"
-                            break
-                    if linked_party_id:
-                        break
-
-            # Try fuzzy match
-            if not linked_party_id:
-                best_score = 0
-                best_party = None
-                for party in party_registry.values():
-                    norm_party = normalize_name(party.canonical_name)
-                    score = fuzz.ratio(normalized, norm_party)
-                    if score > best_score and score >= fuzzy_threshold:
-                        best_score = score
-                        best_party = party
-
-                if best_party:
-                    linked_party_id = best_party.party_id
-                    source = "fuzzy_match"
-                    confidence = best_score / 100.0
-
-            # Create mentions for all items in chain
-            if linked_party_id:
-                for mention_start, mention_end in chain:
-                    mention_span = Span(
-                        doc_id=doc_id,
-                        char_start=mention_start,
-                        char_end=mention_end,
-                        text=canonical_text[mention_start:mention_end],
-                    )
-
-                    party_mention = PartyMention(
-                        span=mention_span,
-                        party_id=linked_party_id,
-                        source=source if source else "coref",
-                        confidence=confidence,
-                    )
-
-                    mentions.append(party_mention)
-                    counters["mentions_by_source"][source if source else "coref"] = (
-                        counters["mentions_by_source"].get(
-                            source if source else "coref", 0
-                        )
-                        + 1
-                    )
-            else:
-                # Unresolved - add representative to unresolved list
-                unresolved_span = Span(
-                    doc_id=doc_id,
-                    char_start=start,
-                    char_end=end,
-                    text=mention_text,
-                )
-                unresolved.append(unresolved_span)
-                counters["unresolved_spans"] += 1
-
-    # Step 6: Role anaphora override
+    # Step 4: Role anaphora
     # This runs last and overwrites coref assignments
     for doc_meta in metadata.documents:
         doc_id = doc_meta.doc_id
