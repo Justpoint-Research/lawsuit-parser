@@ -224,6 +224,9 @@ secrets.toml
 /data
 !data/.gitkeep
 
+# Logs directory
+/logs
+
 # Cloud SQL Proxy
 cloud-sql-proxy
 
