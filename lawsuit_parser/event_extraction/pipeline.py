@@ -14,19 +14,29 @@ class EventExtractionPipeline:
     Manages stage registration, dependency validation, and execution.
     """
 
-    def __init__(self, config_path: Path | None = None, data_root: Path | None = None):
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        data_root: Path | None = None,
+        output_root: Path | None = None,
+    ):
         """Initialize the pipeline.
 
         Args:
             config_path: Path to configuration file (optional)
-            data_root: Root directory for case data (optional, overrides config)
+            data_root: Root directory for source case data (optional, overrides config)
+            output_root: Root directory for pipeline-generated artifacts (optional,
+                overrides config). Kept separate from data_root so a run's outputs
+                can be wiped and regenerated without touching source data.
         """
         # Load configuration
         self.config = load_config(config_path)
 
-        # Override data_root if provided
+        # Override roots if provided
         if data_root:
             self.config.paths.data_root = str(data_root)
+        if output_root:
+            self.config.paths.output_root = str(output_root)
 
         # Initialize stages
         self.stages: dict[int, BaseStage] = {}
@@ -35,9 +45,10 @@ class EventExtractionPipeline:
     def _register_stages(self) -> None:
         """Register all available stages."""
         data_root = Path(self.config.paths.data_root)
+        output_root = Path(self.config.paths.output_root)
 
         for stage_class in STAGES:
-            stage = stage_class(data_root)
+            stage = stage_class(data_root, output_root)
             self.stages[stage.stage_number] = stage
 
         print(f"Registered {len(self.stages)} stages:")
@@ -125,6 +136,7 @@ class EventExtractionPipeline:
         print(f"Event Extraction Pipeline")
         print(f"Case: {case_id}")
         print(f"Data root: {self.config.paths.data_root}")
+        print(f"Output root: {self.config.paths.output_root}")
         print(f"{'='*60}\n")
 
         for stage_num in sorted(self.stages.keys()):
@@ -163,6 +175,7 @@ class EventExtractionPipeline:
         print(f"Case: {case_id}")
         print(f"Stages: {stages}")
         print(f"Data root: {self.config.paths.data_root}")
+        print(f"Output root: {self.config.paths.output_root}")
         print(f"{'='*60}\n")
 
         for stage_num in sorted(stages):

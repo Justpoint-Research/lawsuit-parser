@@ -42,21 +42,33 @@ class BaseStage(ABC):
     stage_number: int
     stage_name: str
 
-    def __init__(self, data_root: Path):
-        """Initialize stage with data root directory.
+    def __init__(self, data_root: Path, output_root: Path | None = None):
+        """Initialize stage with data root and output root directories.
 
         Args:
-            data_root: Root directory for case data (e.g., data/cases)
+            data_root: Root directory for source case data (e.g., data/cases) -
+                documents, confirmations, and Docling outputs are read from here
+            output_root: Root directory for pipeline-generated artifacts (e.g.,
+                data/extraction). Kept separate from data_root so a run's
+                events/stages outputs can be wiped and regenerated without
+                touching source data. Defaults to data_root if not given.
         """
         self.data_root = Path(data_root)
+        self.output_root = Path(output_root) if output_root is not None else self.data_root
 
     def get_case_dir(self, case_id: str) -> Path:
-        """Get the case directory path."""
+        """Get the source case directory path (documents, confirmations, docling)."""
         return self.data_root / case_id
+
+    def get_output_case_dir(self, case_id: str) -> Path:
+        """Get the case directory under output_root for generated artifacts."""
+        output_case_dir = self.output_root / case_id
+        output_case_dir.mkdir(parents=True, exist_ok=True)
+        return output_case_dir
 
     def get_events_dir(self, case_id: str) -> Path:
         """Get the events directory for a case."""
-        events_dir = self.get_case_dir(case_id) / "events"
+        events_dir = self.get_output_case_dir(case_id) / "events"
         events_dir.mkdir(parents=True, exist_ok=True)
         return events_dir
 
@@ -64,9 +76,18 @@ class BaseStage(ABC):
         """Get the documents directory for a case."""
         return self.get_case_dir(case_id) / "documents"
 
+    def get_confirmations_dir(self, case_id: str) -> Path:
+        """Get the confirmations directory for a case.
+
+        Confirmations are the e-filing acknowledgement notices - same file
+        names as their counterparts in documents/, different content (who
+        filed what, with whom, and when) - see lawsuit_parser.parsers.batch.
+        """
+        return self.get_case_dir(case_id) / "confirmations"
+
     def get_stages_dir(self, case_id: str) -> Path:
         """Get the stages directory for existing pipeline artifacts."""
-        return self.get_case_dir(case_id) / "stages"
+        return self.get_output_case_dir(case_id) / "stages"
 
     def save_artifact(self, case_id: str, filename: str, data: BaseModel) -> Path:
         """Save a Pydantic model as JSON artifact.

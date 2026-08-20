@@ -66,13 +66,15 @@ Configuration is managed via `config/event_extraction.toml`:
 
 ```toml
 [paths]
-data_root = "data/cases"
+data_root = "data/cases"      # source case data: documents/, confirmations/, docling/
+output_root = "data/extraction"  # pipeline-generated artifacts, wipeable independently
 events_dir = "events"
 
 [stage_1]
 extract_from_database = true
 extract_from_pdfs = true
 extract_from_docling = true
+extract_from_confirmations = true  # filer/judge/timestamp from confirmations/ notices
 date_patterns = [
     "\\d{1,2}/\\d{1,2}/\\d{4}",
     "\\d{4}-\\d{2}-\\d{2}",
@@ -133,20 +135,29 @@ pipeline.print_status("case_67")
 
 ## Data Directory Structure
 
-The pipeline expects and creates the following structure:
+Source case data and pipeline outputs live under separate roots
+(`data_root` and `output_root`), so an iteration's generated artifacts can
+be deleted and regenerated without touching source data:
 
 ```
-data/cases/<case_id>/
-├── *.pdf                      # Original PDF files
-├── *.docling.json            # Docling parsed documents
-├── *.json                    # Simplified parsed documents
-├── documents/                # Canonical text (from existing pipeline)
-│   ├── doc_000.txt
-│   └── ...
-└── events/                   # Event extraction outputs
-    ├── files_scan.json       # Stage 1: Metadata scan
-    ├── gliner_config.json    # Stage 1: GLiNER configuration
-    └── entities.json         # Stage 2: Detected entities
+data/cases/<case_id>/                       # data_root - source data
+├── documents/                              # the actual filed documents
+│   ├── document_<id>.pdf
+│   └── document_<id>.json                  # Docling-simplified parse
+├── confirmations/                          # e-filing acknowledgement notices
+│   ├── document_<id>.pdf                   # same id/name as its documents/ counterpart
+│   └── document_<id>.json                  # metadata source only - filer, judge,
+│                                            # timestamp; Stage 2 never runs on these
+└── docling/
+    ├── documents/document_<id>.docling.json
+    └── confirmations/document_<id>.docling.json
+
+data/extraction/<case_id>/                  # output_root - generated, safe to wipe
+├── events/
+│   ├── files_scan.json                     # Stage 1: Metadata scan
+│   ├── gliner_config.json                  # Stage 1: GLiNER configuration
+│   └── entities.json                       # Stage 2: Detected entities
+└── stages/
 ```
 
 ## Output Format
@@ -226,7 +237,7 @@ data/cases/<case_id>/
       "char_start": 1234,
       "char_end": 1242,
       "linked_actor": "Jane Doe",
-      "context": "...filed by **Jane Doe** against..."
+      "context": "This action was filed by **Jane Doe** against ACME Inc. on January 15, 2024. The complaint alleges breach of contract. ACME disputes the claim in its entirety. A hearing has been scheduled for March 2024."
     }
   ],
   "entity_counts": {

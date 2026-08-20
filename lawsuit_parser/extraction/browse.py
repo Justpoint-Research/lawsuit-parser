@@ -113,16 +113,19 @@ def has_documents(case_id: str, data_root: Path) -> bool:
     """Whether a case has any docling.json documents."""
     case_dir = Path(data_root) / case_id
 
-    # Check documents/ subdirectory (parse_all_pdfs.py output structure)
+    # Current structure: docling outputs mirrored under docling/documents/
+    # (parse_all_pdfs.py output structure, see lawsuit_parser.parsers.batch.get_docling_dir)
+    docling_documents_dir = case_dir / "docling" / "documents"
+    if docling_documents_dir.exists() and list(docling_documents_dir.glob("*.docling.json")):
+        return True
+
+    # Older parse_all_pdfs.py output structure: docling.json alongside the PDF
     documents_dir = case_dir / "documents"
-    if documents_dir.exists():
-        docling_files = list(documents_dir.glob("*.docling.json"))
-        if docling_files:
-            return True
+    if documents_dir.exists() and list(documents_dir.glob("*.docling.json")):
+        return True
 
     # Check flat structure (legacy)
-    docling_files = list(case_dir.glob("*.docling.json"))
-    return len(docling_files) > 0
+    return bool(list(case_dir.glob("*.docling.json")))
 
 
 def list_browsable_cases(data_root: Path) -> list[str]:

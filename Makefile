@@ -1,6 +1,7 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
-        install-vllm download-nuextract run-vllm check-vllm check-gpu
+        install-vllm download-nuextract run-vllm check-vllm check-gpu \
+        download-sample-cases
 
 # The default shell for make
 SHELL := /bin/bash
@@ -35,6 +36,7 @@ help:
 	@echo "  make case-browser      - Start Case Browser Streamlit app"
 	@echo "  make event-browser     - Start Event Browser Streamlit app (extracted events, actor filtering)"
 	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
+	@echo "  make download_sample_cases - Export sample cases (95, 227, 309, 377, 2303) to data/cases"
 	@echo ""
 	@echo "Database commands:"
 	@echo "  make sql-proxy-setup   - Download Cloud SQL proxy binary"
@@ -133,6 +135,20 @@ test-pdf-parser: ensure-venv
 		echo "Please ensure you have exported case 104 first."; \
 		exit 1; \
 	fi
+
+# ---------------------------------------------------------------------------
+# Sample data
+# ---------------------------------------------------------------------------
+
+SAMPLE_CASE_IDS := 95 227 309 377 2303
+
+download-sample-cases: ensure-venv
+	@echo "Downloading sample cases: $(SAMPLE_CASE_IDS)"
+	@echo "Make sure the Cloud SQL Proxy is running: make run-proxy"
+	@for case_id in $(SAMPLE_CASE_IDS); do \
+		$(PYTHON) scripts/export_case.py $$case_id --output-dir data/cases || exit 1; \
+	done
+	@echo "Sample cases downloaded to data/cases"
 
 # ---------------------------------------------------------------------------
 # Database / Cloud SQL Proxy
@@ -266,4 +282,4 @@ extract-events: ensure-venv
 	@echo "Running event extraction on all cases..."
 	@echo "Library output will be logged to logs/"
 	@echo ""
-	$(PYTHON) scripts/run_event_extraction.py
+	$(PYTHON) scripts/run_event_extraction.py --force

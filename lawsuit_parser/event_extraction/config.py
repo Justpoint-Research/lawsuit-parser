@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field
 class PathsConfig(BaseModel):
     """Path configuration."""
 
-    data_root: str = Field(default="data/cases")
+    data_root: str = Field(default="data/cases", description="Source case data: documents, confirmations, docling")
+    output_root: str = Field(
+        default="data/extraction",
+        description="Where pipeline-generated artifacts (events/, stages/) are written, kept "
+                     "separate from data_root so iteration output can be wiped without touching source data",
+    )
     events_dir: str = Field(default="events")
 
 
@@ -20,6 +25,32 @@ class Stage1Config(BaseModel):
     extract_from_database: bool = Field(default=True)
     extract_from_pdfs: bool = Field(default=True)
     extract_from_docling: bool = Field(default=True)
+    extract_from_confirmations: bool = Field(
+        default=True,
+        description="Extract filer/judge/timestamp metadata from matching confirmations/ notices",
+    )
+    validate_actors_with_llm: bool = Field(
+        default=True,
+        description="Sanity-check the regex-discovered actor roster with an LLM before "
+                     "writing actors.json - corrects roles, drops obvious junk, and phrases "
+                     "GLiNER labels. Falls back to the unvalidated roster if the backend "
+                     "server isn't reachable.",
+    )
+    llm_backend: str = Field(
+        default="ollama",
+        description="'ollama' (local Ollama server) or 'nuextract' (this repo's existing "
+                     "vLLM-served NuExtract client). Switching backend also requires setting "
+                     "llm_model/llm_base_url to match - see config/event_extraction.toml.",
+    )
+    llm_model: str = Field(default="gemma4:e4b", description="Model tag/name for the selected llm_backend")
+    llm_base_url: str = Field(default="http://localhost:11434", description="Server URL for the selected llm_backend")
+    extract_products: bool = Field(
+        default=True,
+        description="Identify the medical substance/drug/medical device/cosmetic product the "
+                     "plaintiff accuses of causing harm and the defendant(s) it's attributed to, "
+                     "via the same llm_backend used for actor validation. Written to products.json "
+                     "and merged into gliner_config.json's dynamic labels alongside actors.",
+    )
     date_patterns: list[str] = Field(
         default_factory=lambda: [
             r"\d{1,2}/\d{1,2}/\d{4}",
@@ -36,6 +67,21 @@ class Stage2Config(BaseModel):
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     batch_size: int = Field(default=8, gt=0)
     use_gpu: bool = Field(default=True)
+    context_sentences_before: int = Field(
+        default=2, ge=0, description="Minimum full sentences of context before each detected entity"
+    )
+    context_sentences_after: int = Field(
+        default=2, ge=0, description="Minimum full sentences of context after each detected entity"
+    )
+    enable_gazetteer: bool = Field(
+        default=True,
+        description="After GLiNER, regex-search each named actor's canonical name/aliases and add "
+                     "any exact-match spans GLiNER's threshold missed (deterministic recall backstop, "
+                     "not a replacement - GLiNER still finds generic/unnamed labels grep can't touch)",
+    )
+    gazetteer_min_term_length: int = Field(
+        default=3, ge=1, description="Skip actor names/aliases shorter than this many characters"
+    )
     static_labels: list[str] = Field(
         default_factory=lambda: [
             "temporal expression",
@@ -44,6 +90,7 @@ class Stage2Config(BaseModel):
             "geographic location",
             "monetary amount",
             "document reference",
+            "medical substance, drug, medical device, or cosmetic product",
         ]
     )
 

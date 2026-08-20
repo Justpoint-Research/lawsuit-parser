@@ -103,6 +103,7 @@ def parse_pdf_document(
     extract_images: bool = False,
     save_docling_document: bool = True,
     save_markdown: bool = True,
+    docling_dir: str | Path | None = None,
 ) -> ParsedDocument:
     """
     Parse a PDF document and extract structured content.
@@ -116,10 +117,11 @@ def parse_pdf_document(
     - GPU acceleration
 
     The full Docling document (layout, bounding boxes, all item types) is
-    saved as `<pdf_path>.docling.json` alongside the PDF, so anything not
-    surfaced on `ParsedDocument` (footers, footnotes, section headers, etc.)
-    remains available for further processing. A `<pdf_path>.md` rendering
-    is also saved alongside the PDF for easy human preview.
+    saved as `<pdf_stem>.docling.json`, so anything not surfaced on
+    `ParsedDocument` (footers, footnotes, section headers, etc.) remains
+    available for further processing. A `<pdf_stem>.md` rendering is also
+    saved for easy human preview. Both go in `docling_dir` if given,
+    otherwise alongside the PDF.
 
     Args:
         pdf_path: Path to the PDF file
@@ -128,9 +130,10 @@ def parse_pdf_document(
         extract_images: Whether to embed images in the saved Docling
             document and Markdown preview (default: False)
         save_docling_document: Whether to save the full Docling document
-            next to the PDF (default: True)
-        save_markdown: Whether to save a Markdown rendering next to the
-            PDF, for easy preview (default: True)
+            (default: True)
+        save_markdown: Whether to save a Markdown rendering (default: True)
+        docling_dir: Directory to save the Docling document and Markdown
+            rendering into. Defaults to the PDF's own directory.
 
     Returns:
         ParsedDocument containing structured extracted content
@@ -151,6 +154,15 @@ def parse_pdf_document(
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
+    if docling_dir is not None:
+        docling_dir = Path(docling_dir)
+        docling_dir.mkdir(parents=True, exist_ok=True)
+        docling_json_path = docling_dir / f"{pdf_path.stem}.docling.json"
+        markdown_path = docling_dir / f"{pdf_path.stem}.md"
+    else:
+        docling_json_path = pdf_path.with_suffix(".docling.json")
+        markdown_path = pdf_path.with_suffix(".md")
+
     converter = _build_converter(use_gpu)
 
     # Debug: log GPU usage setting
@@ -168,13 +180,13 @@ def parse_pdf_document(
         image_mode = ImageRefMode.EMBEDDED if extract_images else ImageRefMode.PLACEHOLDER
 
         # Save the full Docling document (layout, bounding boxes, every
-        # item type) next to the PDF for further processing.
+        # item type) for further processing.
         if save_docling_document:
-            doc.save_as_json(pdf_path.with_suffix(".docling.json"), image_mode=image_mode)
+            doc.save_as_json(docling_json_path, image_mode=image_mode)
 
-        # Save a Markdown rendering next to the PDF for easy preview.
+        # Save a Markdown rendering for easy preview.
         if save_markdown:
-            doc.save_as_markdown(pdf_path.with_suffix(".md"), image_mode=image_mode)
+            doc.save_as_markdown(markdown_path, image_mode=image_mode)
 
         # Initialize parsed document
         parsed = ParsedDocument(

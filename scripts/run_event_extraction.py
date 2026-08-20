@@ -142,6 +142,10 @@ Examples:
 
   # Use custom data root
   python scripts/run_event_extraction.py case_67 --data-root /path/to/cases
+
+  # Use custom output root (default: data/extraction) - e.g. to keep
+  # iteration output separate from a data root shared across branches
+  python scripts/run_event_extraction.py case_67 --output-root /tmp/extraction
         """
     )
 
@@ -179,7 +183,15 @@ Examples:
     parser.add_argument(
         "--data-root",
         type=Path,
-        help="Root directory for case data (overrides config)"
+        help="Root directory for source case data (overrides config)"
+    )
+
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help="Root directory for pipeline-generated artifacts (overrides config, "
+             "default data/extraction). Kept separate from --data-root so a run's "
+             "outputs can be wiped and regenerated without touching source data."
     )
 
     args = parser.parse_args()
@@ -199,7 +211,8 @@ Examples:
         with LogFile(log_file):
             pipeline = EventExtractionPipeline(
                 config_path=args.config,
-                data_root=args.data_root
+                data_root=args.data_root,
+                output_root=args.output_root,
             )
     except Exception as e:
         print(f"Error initializing pipeline: {e}")
@@ -271,7 +284,7 @@ Examples:
                         tqdm.write(msg)
                     else:
                         print(f"\n{msg}")
-                        print(f"Outputs saved to: data/cases/{case_id}/events/")
+                        print(f"Outputs saved to: {pipeline.config.paths.output_root}/{case_id}/events/")
                 else:
                     failures.append(case_id)
                     msg = f"✗ {case_id} failed"

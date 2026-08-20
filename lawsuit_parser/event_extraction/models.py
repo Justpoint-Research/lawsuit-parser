@@ -46,6 +46,50 @@ class DoclingMetadata(BaseModel):
     title: str | None = None
     header: str | None = None
     cm_ecf: CMECFMetadata | None = None
+    document_signature: str | None = Field(
+        default=None,
+        description="This document's own filing/document number as stamped by its e-filing "
+                     "system (e.g. '11' from 'NYSCEF DOC. NO. 11') - not tied to any one "
+                     "state/system, see utils.extract_document_signature",
+    )
+
+
+class ConfirmationMetadata(BaseModel):
+    """Metadata extracted from a document's e-filing confirmation notice.
+
+    Confirmations live alongside documents under a case's confirmations/
+    directory, same file name, different content: an acknowledgement of who
+    filed the document, with whom, and when - not the document itself. See
+    lawsuit_parser.parsers.batch and BaseStage.get_confirmations_dir.
+    """
+
+    assigned_judge: str | None = None
+    filer_name: str | None = None
+    filer_email: str | None = None
+    filer_phone: str | None = None
+    notice_timestamp: str | None = None
+
+
+class DocumentReference(BaseModel):
+    """A citation of one document's filing/document number found in
+    another document's text - e.g. "see Doc. No. 7" found in doc_id
+    doc_012. Not tied to any one e-filing system's citation wording.
+
+    See BaseStage.get_documents_dir / Stage1Metadata for how doc_number is
+    resolved to doc_id: every document's own number is collected first (its
+    "signature", see DoclingMetadata.document_signature), then every other
+    document's citations are matched against that map.
+    """
+
+    doc_number: str = Field(description="The cited document number, as it appears (e.g. '7')")
+    doc_id: str | None = Field(
+        default=None,
+        description="Resolved doc_id of the referenced document, if doc_number matches a "
+                     "document in this case's own document set; None if it couldn't be resolved "
+                     "(e.g. it cites a document outside this case's scanned set)",
+    )
+    char_start: int | None = Field(default=None, description="Character offset of the citation in canonical text")
+    char_end: int | None = Field(default=None, description="Character offset of the citation in canonical text")
 
 
 class DocumentMetadata(BaseModel):
@@ -53,22 +97,27 @@ class DocumentMetadata(BaseModel):
 
     doc_id: str
     file_name: str
-    document_number: str | None = None
+    document_number: str | None = Field(
+        default=None,
+        description="This document's own filing/document number (its 'signature') - from a "
+                     "federal CM/ECF header or a state e-filing system's own document-number "
+                     "stamp - used to resolve other documents' citations of it (see referenced_by)",
+    )
     document_title: str | None = None
     filing_date: str | None = None
     filed_by: str | None = None
     pdf_metadata: PDFMetadata | None = None
     docling_metadata: DoclingMetadata | None = None
+    confirmation_metadata: ConfirmationMetadata | None = None
     extracted_dates: list[ExtractedDate] = Field(default_factory=list)
-
-
-class PartyDiscovered(BaseModel):
-    """A party discovered during metadata extraction."""
-
-    name: str
-    role: str
-    source: str = Field(description="Source of discovery (e.g., 'database', 'docling_header', 'pdf_metadata')")
-    aliases: list[str] = Field(default_factory=list)
+    referenced_documents: list[DocumentReference] = Field(
+        default_factory=list,
+        description="Other documents this one cites by document number, found in its own text",
+    )
+    referenced_by: list[str] = Field(
+        default_factory=list,
+        description="doc_ids of documents in this case whose text cites this document's number",
+    )
 
 
 class DatabaseMetadata(BaseModel):
@@ -86,24 +135,69 @@ class FilesScan(BaseModel):
     """Complete output of Stage 1 metadata extraction.
 
     This artifact contains all metadata gathered from database, PDFs, and
-    Docling files, plus all dates extracted from any source.
+    Docling files, plus all dates extracted from any source. Actor/party
+    identification lives in the separate actors.json artifact (see Actor,
+    ActorsArtifact below).
     """
 
     case_id: str
     scan_timestamp: datetime = Field(default_factory=datetime.now)
     database_metadata: DatabaseMetadata | None = None
     documents: list[DocumentMetadata] = Field(default_factory=list)
-    parties_discovered: list[PartyDiscovered] = Field(default_factory=list)
     all_dates: list[ExtractedDate] = Field(default_factory=list, description="All dates from all sources")
 
 
 class Actor(BaseModel):
-    """An actor (party) in the case with GLiNER label configuration."""
+    """A named or role-based entity relevant to the case: a party or role
+    (plaintiff, defendant, judge, court clerk, counsel, witness) OR an
+    accused product (drug, medical device, cosmetic product, chemical
+    substance - see products.json / Stage1Metadata's product-identification
+    step). Both are "actors" in the sense used here: something GLiNER should
+    have a dedicated detection label for.
 
-    canonical_name: str
-    role: str
+    Named entries (is_named=True) carry a specific name/product found in
+    the database, document text, or an LLM read of the case's pleadings.
+    Unnamed entries are generic role placeholders (e.g. "Witness") added so
+    GLiNER still has a label to search for even when no specific individual
+    is known in advance.
+    """
+
+    canonical_name: str = Field(description="Name, or a generic role designation when unnamed (e.g. 'Witness')")
+    role: str = Field(
+        description="Party role (plaintiff, defendant, judge, court_clerk, counsel, witness, "
+                     "attorney) or product type (drug, medical_device, cosmetic_product, "
+                     "chemical_substance, other_product)"
+    )
+    is_named: bool = Field(default=True, description="False for generic role placeholders with no known individual")
+    source: str = Field(description="Where discovered: 'database', 'caption', 'confirmation', 'llm', or 'generic'")
     aliases: list[str] = Field(default_factory=list)
-    gliner_label: str = Field(description="Label to use for GLiNER detection")
+    doc_ids: list[str] = Field(default_factory=list, description="Documents this actor was found in")
+    attributed_to: list[str] = Field(
+        default_factory=list,
+        description="For an accused product: canonical name(s) of the defendant(s) it's "
+                     "attributed to (its manufacturer/seller/distributor). Empty for party/role actors.",
+    )
+    gliner_label: str | None = Field(
+        default=None,
+        description="Label used for GLiNER detection - unset in actors.json/products.json, "
+                     "assigned when building gliner_config.json",
+    )
+
+
+class ActorsArtifact(BaseModel):
+    """Stage 1 output: every actor identified in the case from the
+    database and PDF/confirmation text, with a clear name/designation and
+    role. This is the roster gliner_config.json's dynamic labels are built
+    from (see Stage1Metadata._generate_gliner_config).
+
+    Used for two separate artifacts sharing this same shape: actors.json
+    (parties/roles) and products.json (accused products - see
+    Stage1Metadata's product-identification step).
+    """
+
+    case_id: str
+    extraction_timestamp: datetime = Field(default_factory=datetime.now)
+    actors: list[Actor] = Field(default_factory=list)
 
 
 class GLiNERLabels(BaseModel):
@@ -132,7 +226,7 @@ class GLiNERConfig(BaseModel):
 # ============================================================================
 
 class Entity(BaseModel):
-    """An entity detected by GLiNER."""
+    """An entity detected either by GLiNER or by the gazetteer pass."""
 
     entity_id: str
     text: str
@@ -148,6 +242,12 @@ class Entity(BaseModel):
     context: str | None = Field(
         default=None,
         description="Surrounding text for context (optional)"
+    )
+    detection_method: str = Field(
+        default="gliner",
+        description="'gliner' (model detection) or 'gazetteer' (exact regex match on a known "
+                     "actor's name/alias, added as a recall backstop for spans GLiNER's "
+                     "threshold missed - see Stage2GLiNER._gazetteer_entities)",
     )
 
 
@@ -167,7 +267,7 @@ class EntitiesArtifact(BaseModel):
 
     case_id: str
     extraction_timestamp: datetime = Field(default_factory=datetime.now)
-    model_config: ModelConfig
+    gliner_config: ModelConfig
     entities: list[Entity] = Field(default_factory=list)
     entity_counts: dict[str, int] = Field(
         default_factory=dict,

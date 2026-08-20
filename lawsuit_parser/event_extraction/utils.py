@@ -5,12 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-try:
-    from PyPDF2 import PdfReader
-    HAS_PYPDF2 = True
-except ImportError:
-    HAS_PYPDF2 = False
-    PdfReader = None
+import pypdfium2 as pdfium
+from nltk.tokenize.punkt import PunktParameters, PunktSentenceTokenizer
 
 
 def extract_dates_from_text(text: str, patterns: list[str]) -> list[tuple[str, int, int]]:
@@ -41,36 +37,239 @@ def extract_dates_from_text(text: str, patterns: list[str]) -> list[tuple[str, i
 
 
 def extract_cm_ecf_header(text: str) -> dict[str, str] | None:
-    """Extract CM/ECF header information from document text.
+    """Extract filing header information from a document's header text.
 
-    Looks for patterns like:
-    "Case 3:24-cv-12345 Document 1 Filed 01/15/2024 Page 1 of 42"
+    Supports two formats seen in practice:
+    - Federal CM/ECF: "Case 3:24-cv-12345 Document 1 Filed 01/15/2024 Page 1 of 42"
+    - NY State e-filing (NYSCEF): "FILED: NEW YORK COUNTY CLERK 02/26/2026 10:40 AM"
 
     Args:
-        text: Document text (typically first 500 characters)
+        text: Document header text (typically the page_header of the first page)
 
     Returns:
-        Dictionary with extracted fields, or None if no header found
+        Dictionary with extracted fields, or None if no known header format found
     """
-    # Pattern for CM/ECF header
     pattern = r"Case\s+([^\s]+)\s+Document\s+(\d+)\s+Filed\s+([\d/]+)(?:\s+Page\s+(\d+)\s+of\s+(\d+))?"
 
     match = re.search(pattern, text, re.IGNORECASE)
-    if not match:
-        return None
+    if match:
+        case_number, doc_number, filing_date, page_num, total_pages = match.groups()
 
-    case_number, doc_number, filing_date, page_num, total_pages = match.groups()
+        result = {
+            "case_number": case_number,
+            "document_number": doc_number,
+            "filing_date": filing_date,
+        }
 
-    result = {
-        "case_number": case_number,
-        "document_number": doc_number,
-        "filing_date": filing_date,
-    }
+        if page_num and total_pages:
+            result["page_info"] = f"Page {page_num} of {total_pages}"
 
-    if page_num and total_pages:
-        result["page_info"] = f"Page {page_num} of {total_pages}"
+        return result
+
+    # State e-filing systems that stamp "FILED: <COUNTY> COUNTY CLERK <date>" -
+    # seen from NY's NYSCEF; add more states' header formats here as needed.
+    county_clerk_efiling_pattern = r"FILED:\s*.+?COUNTY\s+CLERK\s+(\d{1,2}/\d{1,2}/\d{4})(?:\s+(\d{1,2}:\d{2}\s*[AP]M))?"
+
+    match = re.search(county_clerk_efiling_pattern, text, re.IGNORECASE)
+    if match:
+        filing_date, filing_time = match.groups()
+        return {
+            "filing_date": f"{filing_date} {filing_time}" if filing_time else filing_date,
+        }
+
+    return None
+
+
+CONFIRMATION_TIMESTAMP_PATTERN = re.compile(
+    r"received an electronic filing on\s+(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)",
+    re.IGNORECASE,
+)
+CONFIRMATION_JUDGE_PATTERN = re.compile(r"Assigned Judge:\s*(.+)", re.IGNORECASE)
+CONFIRMATION_FILER_PATTERN = re.compile(
+    r"^([A-Z][A-Za-z.,'\-\s]*?)\s*\|\s*([\w.+-]+@[\w.-]+\.\w+)\s*\|\s*(\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4})"
+)
+# Matches both "Hon. Nancy T. Sunshine, Kings County Clerk..." and
+# "Maureen O'Connell, Nassau County Clerk..." (the "Hon." title is optional).
+CONFIRMATION_CLERK_PATTERN = re.compile(
+    r"^(?:Hon\.\s+)?([A-Z][A-Za-z.'\-\s]+?),\s*[\w\s]*?County Clerk"
+)
+
+
+def extract_confirmation_details(paragraphs: list[str]) -> dict[str, str]:
+    """Extract filer, judge, and clerk details from an e-filing confirmation notice.
+
+    NYSCEF confirmation notices report, one per paragraph, the filing
+    timestamp ("...received an electronic filing on <date> <time>..."), the
+    assigned judge ("Assigned Judge: <name>"), the filing user as
+    "<NAME> | <email> | <phone>", and the county clerk ("Hon. <name>, <County>
+    County Clerk..."). Matching per-paragraph, rather than on text joined
+    across paragraphs, keeps the name captures from bleeding into the
+    previous or next paragraph.
+
+    Args:
+        paragraphs: Confirmation notice paragraphs, as parsed from the
+            confirmation PDF's JSON (same shape as a regular document's)
+
+    Returns:
+        Dictionary with any of "notice_timestamp", "assigned_judge",
+        "filer_name", "filer_email", "filer_phone", "court_clerk" that
+        were found
+    """
+    result: dict[str, str] = {}
+
+    for paragraph in paragraphs:
+        if "notice_timestamp" not in result:
+            match = CONFIRMATION_TIMESTAMP_PATTERN.search(paragraph)
+            if match:
+                result["notice_timestamp"] = match.group(1)
+
+        if "assigned_judge" not in result:
+            match = CONFIRMATION_JUDGE_PATTERN.search(paragraph)
+            if match:
+                judge = match.group(1).strip()
+                if judge and judge.lower() != "none recorded":
+                    result["assigned_judge"] = judge
+
+        if "filer_name" not in result:
+            match = CONFIRMATION_FILER_PATTERN.search(paragraph.strip())
+            if match:
+                name, email, phone = match.groups()
+                result["filer_name"] = name.strip().strip(",")
+                result["filer_email"] = email.strip()
+                result["filer_phone"] = phone.strip()
+
+        if "court_clerk" not in result:
+            match = CONFIRMATION_CLERK_PATTERN.search(paragraph.strip())
+            if match:
+                result["court_clerk"] = match.group(1).strip()
 
     return result
+
+
+# ============================================================================
+# Case caption parsing (plaintiff/defendant identification from document text)
+# ============================================================================
+
+_CAPTION_BOILERPLATE_SUBSTRINGS = (
+    "supreme court", "county of", "nyscef doc", "index no", "filed:",
+    "received nyscef", "summons", "complaint", "basis of venue",
+    "designates", "docket", "case no", "civil action", "district court",
+    "united states",
+    # Document-type headings NY filings commonly interleave between the
+    # party list and the closing role marker (e.g. "...defendant list...
+    # Index No.: X / STIPULATION / Defendants.") - not party names.
+    "stipulation", "affidavit", "affirmation", "notice of motion",
+    "memorandum of law", "order to show cause", "certificate of merit",
+    "notice of appearance", "cross motion", "bill of particulars",
+    "verified answer", "verified complaint", "judicial intervention",
+    "preliminary conference", "so ordered", "notice of entry",
+)
+_CAPTION_DASH_LINE_PATTERN = re.compile(r"^-{3,}x?$", re.IGNORECASE)
+_CAPTION_ADDRESS_PATTERN = re.compile(r"\b[A-Z]{2}\s*\d{5}\b")
+_CAPTION_STREET_START_PATTERN = re.compile(r"^\d+[\s\-]")
+_CAPTION_ROLE_LINE_PATTERN = re.compile(
+    r"^(plaintiffs?|defendants?|petitioners?|respondents?)"
+    r"(\s*\(s\))?"
+    r"(\s*/\s*(plaintiffs?|defendants?|petitioners?|respondents?)(\s*\(s\))?)?"
+    r"\s*[.,]?$",
+    re.IGNORECASE,
+)
+_CAPTION_PLAINTIFF_ROLE_PATTERN = re.compile(r"plaintiff|petitioner", re.IGNORECASE)
+_CAPTION_DEFENDANT_ROLE_PATTERN = re.compile(r"defendant|respondent", re.IGNORECASE)
+_CAPTION_SEPARATOR_PATTERN = re.compile(r"^-?\s*(against|vs?\.)\s*-?", re.IGNORECASE)
+
+
+def _is_caption_boilerplate(line: str) -> bool:
+    if _CAPTION_DASH_LINE_PATTERN.match(line.strip()):
+        return True
+    low = line.lower()
+    return any(s in low for s in _CAPTION_BOILERPLATE_SUBSTRINGS)
+
+
+def _is_caption_address(line: str) -> bool:
+    return bool(_CAPTION_ADDRESS_PATTERN.search(line)) or bool(_CAPTION_STREET_START_PATTERN.match(line.strip()))
+
+
+def _split_caption_names(lines: list[str]) -> list[str]:
+    """Split caption name lines (semicolon/'and'-joined co-parties) into
+    individual party names, stripping "et al." and trailing punctuation."""
+    names = []
+    for line in lines:
+        for part in re.split(r";", line):
+            part = part.strip()
+            part = re.sub(r"^and\s+", "", part, flags=re.IGNORECASE)
+            part = re.sub(r"\s*,?\s*et\.?\s*al\.?$", "", part, flags=re.IGNORECASE)
+            part = part.strip(" ,.")
+            if part and re.search(r"[A-Za-z]{2,}", part):
+                names.append(part)
+    return names
+
+
+def parse_caption_block(lines: list[str]) -> dict[str, list[str]]:
+    """Parse plaintiff/defendant names out of a document's case-caption block.
+
+    NY state (and similar) pleadings open with a caption: plaintiff
+    name(s), a role marker line ("Plaintiff/Petitioner," or "Plaintiff(s)"),
+    a separator ("-against-", "v.", "vs."), defendant name(s), and a closing
+    role marker ("Defendant/Respondent." or "Defendant(s)"). This looks for
+    that shape in the flattened, in-order text lines of a document's first
+    page (as Docling emits them) and pulls out the names on both sides -
+    tolerating the boilerplate (docket headers, venue text, addresses) that
+    NYSCEF filings interleave around the caption.
+
+    Args:
+        lines: First-page text lines, in document order (e.g. from a
+            Docling export's `texts`, filtered to page 1)
+
+    Returns:
+        Dict with "plaintiffs" and "defendants" name lists (either may be
+        empty if no caption block was found or recognized)
+    """
+    p_idx = next(
+        (i for i, line in enumerate(lines)
+         if _CAPTION_ROLE_LINE_PATTERN.match(line.strip()) and _CAPTION_PLAINTIFF_ROLE_PATTERN.search(line)),
+        None,
+    )
+    if p_idx is None:
+        return {"plaintiffs": [], "defendants": []}
+
+    # Anchor the plaintiff-name search to just after the last boilerplate
+    # line before p_idx (typically the court/venue header). Without this,
+    # a stray line above the real caption - a document-type heading like
+    # "AFFIDAVIT OF SERVICE", OCR noise from elsewhere on the page - gets
+    # mistaken for a party name.
+    anchor_idx = next(
+        (i for i in range(p_idx - 1, -1, -1) if _is_caption_boilerplate(lines[i])),
+        None,
+    )
+    start_idx = anchor_idx + 1 if anchor_idx is not None else 0
+
+    s_idx = next(
+        (i for i in range(p_idx + 1, len(lines)) if _CAPTION_SEPARATOR_PATTERN.match(lines[i].strip())),
+        None,
+    )
+    d_idx = next(
+        (i for i in range(p_idx + 1, len(lines))
+         if _CAPTION_ROLE_LINE_PATTERN.match(lines[i].strip()) and _CAPTION_DEFENDANT_ROLE_PATTERN.search(lines[i])),
+        None,
+    )
+
+    plaintiff_lines = [
+        line for line in lines[start_idx:p_idx]
+        if line.strip() and not _is_caption_boilerplate(line) and not _is_caption_address(line)
+    ]
+
+    defendant_lines = []
+    if s_idx is not None and d_idx is not None and d_idx > s_idx:
+        defendant_lines = [
+            line for line in lines[s_idx + 1:d_idx]
+            if line.strip() and not _is_caption_boilerplate(line) and not _is_caption_address(line)
+        ]
+
+    return {
+        "plaintiffs": _split_caption_names(plaintiff_lines),
+        "defendants": _split_caption_names(defendant_lines),
+    }
 
 
 def extract_pdf_metadata(pdf_path: Path) -> dict[str, Any]:
@@ -82,39 +281,35 @@ def extract_pdf_metadata(pdf_path: Path) -> dict[str, Any]:
     Returns:
         Dictionary with PDF metadata (created, modified, pages, etc.)
     """
-    if not HAS_PYPDF2:
-        print(f"  Warning: PyPDF2 not installed, skipping PDF metadata extraction")
-        return {}
-
     try:
-        reader = PdfReader(pdf_path)
-        metadata = reader.metadata or {}
+        doc = pdfium.PdfDocument(str(pdf_path))
+        try:
+            result: dict[str, Any] = {"pages": len(doc)}
+            metadata = doc.get_metadata_dict()
 
-        result = {
-            "pages": len(reader.pages),
-        }
+            # Extract creation/modification dates
+            if metadata.get("CreationDate"):
+                try:
+                    result["created"] = parse_pdf_date(metadata["CreationDate"])
+                except Exception:
+                    pass
 
-        # Extract creation/modification dates
-        if "/CreationDate" in metadata:
-            try:
-                result["created"] = parse_pdf_date(metadata["/CreationDate"])
-            except Exception:
-                pass
+            if metadata.get("ModDate"):
+                try:
+                    result["modified"] = parse_pdf_date(metadata["ModDate"])
+                except Exception:
+                    pass
 
-        if "/ModDate" in metadata:
-            try:
-                result["modified"] = parse_pdf_date(metadata["/ModDate"])
-            except Exception:
-                pass
+            # Extract text fields
+            if metadata.get("Title"):
+                result["title"] = metadata["Title"]
 
-        # Extract text fields
-        if "/Title" in metadata:
-            result["title"] = str(metadata["/Title"])
+            if metadata.get("Author"):
+                result["author"] = metadata["Author"]
 
-        if "/Author" in metadata:
-            result["author"] = str(metadata["/Author"])
-
-        return result
+            return result
+        finally:
+            doc.close()
 
     except Exception as e:
         print(f"Warning: Failed to extract PDF metadata from {pdf_path}: {e}")
@@ -252,3 +447,168 @@ def normalize_role(role: str) -> str:
     }
 
     return role_mapping.get(role_lower, "other")
+
+
+# ============================================================================
+# Sentence splitting (for entity context extraction)
+# ============================================================================
+
+# Seeds NLTK's Punkt tokenizer with legal/court-filing abbreviations it
+# wouldn't otherwise know, so it doesn't split "Hon. Brendan T. Lantry" or
+# "N.Y. C.P.L.R." into fragments at every period. Built from parameters
+# alone - no pretrained NLTK corpus download required.
+_SENTENCE_ABBREVIATIONS = {
+    # Honorifics / titles
+    "mr", "mrs", "ms", "dr", "hon", "esq", "jr", "sr", "prof",
+    # Legal citation / procedural
+    "no", "nos", "vs", "v", "id", "al", "et", "sec", "art", "ch", "para", "pt",
+    "cir", "supp", "f.2d", "f.3d", "f.supp", "u.s.c", "c.f.r", "cplr", "c.p.l.r",
+    "fed", "civ", "crim", "proc", "r", "rule", "reg",
+    # Generic Latin/abbreviations
+    "i.e", "e.g", "etc", "cf",
+    # NYSCEF/court boilerplate
+    "nyscef", "doc", "dept", "div", "co", "corp", "inc", "ltd", "llc", "llp", "lp",
+    "assoc", "bros",
+    # Geography
+    "u.s", "n.y", "st", "ave", "blvd", "ct",
+    # Months
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    # Misc
+    "vol", "pg", "pp",
+}
+
+_sentence_tokenizer: PunktSentenceTokenizer | None = None
+
+
+def _get_sentence_tokenizer() -> PunktSentenceTokenizer:
+    global _sentence_tokenizer
+    if _sentence_tokenizer is None:
+        params = PunktParameters()
+        params.abbrev_types = set(_SENTENCE_ABBREVIATIONS)
+        _sentence_tokenizer = PunktSentenceTokenizer(params)
+    return _sentence_tokenizer
+
+
+def split_sentences(text: str) -> list[tuple[int, int]]:
+    """Split text into sentences, returning their (char_start, char_end) spans.
+
+    Args:
+        text: Document text
+
+    Returns:
+        List of (start, end) offsets, one per sentence, in document order.
+        Empty if text is blank.
+    """
+    if not text.strip():
+        return []
+    return list(_get_sentence_tokenizer().span_tokenize(text))
+
+
+# ============================================================================
+# Cross-document references (linking a document's own filing number to
+# citations of it in other documents' text)
+#
+# Not tied to any one court/state's e-filing system: different systems
+# label a document's self-identifying stamp differently (NY's NYSCEF prints
+# "NYSCEF DOC. NO. <N>"; others may say "DOCUMENT NO.", "FILING ID:", etc.).
+# _DOCUMENT_SIGNATURE_LABEL_PATTERNS is an ordered, extensible list - add a
+# pattern per system as new ones are seen rather than hardcoding one.
+# ============================================================================
+
+_DOCUMENT_SIGNATURE_LABEL_PATTERNS = [
+    # NY state e-filing (NYSCEF)
+    re.compile(r"NYSCEF\s+DOC(?:UMENT)?\.?\s*NO\.?\s*(\d+)", re.IGNORECASE),
+    # Generic fallback: any system that just labels its own document number
+    # "DOC. NO. <N>" / "DOCUMENT NO. <N>" without a named system prefix. A
+    # citation to another document is rare this early in a filing, so the
+    # first bare label found on the first page is reliably this document's
+    # own number.
+    re.compile(r"\bDOC(?:UMENT)?\.?\s*NO\.?\s*(\d+)", re.IGNORECASE),
+]
+
+
+def extract_document_signature(text: str) -> str | None:
+    """Extract a document's own filing/document number - its "signature"
+    within the case.
+
+    e.g. "NYSCEF DOC. NO. 11" -> "11". This is the number other filings
+    cite when referencing this document (see find_document_references).
+
+    Args:
+        text: Document text to search (typically its first-page text)
+
+    Returns:
+        The document number as a string, or None if no known stamp format matched
+    """
+    for pattern in _DOCUMENT_SIGNATURE_LABEL_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(1)
+    return None
+
+
+# Citations elsewhere in a filing's body are looser than the self-
+# identifying stamp above: real-world phrasing varies by system and by
+# author ("Doc. No. 7", "Document No. 7", "NYSCEF Doc. No. 7", ...). Known
+# system-name prefixes are optional alternatives here, not requirements -
+# add more as new systems are seen.
+DOCUMENT_REFERENCE_PATTERN = re.compile(
+    r"(?:(?:NYSCEF|ECF)\s+)?Doc(?:ument)?\.?\s*No\.?\s*(\d+)", re.IGNORECASE
+)
+
+
+def find_document_references(text: str) -> list[tuple[str, int, int]]:
+    """Find every "Doc. No. <N>" / "Document No. <N>" style citation in
+    text - how one filing refers to another by its document number.
+
+    Args:
+        text: Document text to search (typically the full body)
+
+    Returns:
+        List of (doc_number, char_start, char_end) tuples, in document order
+    """
+    return [
+        (match.group(1), match.start(), match.end())
+        for match in DOCUMENT_REFERENCE_PATTERN.finditer(text)
+    ]
+
+
+# ============================================================================
+# Litigation-caption product signals (regex pre-scan feeding LLM product
+# identification - see llm_validation.identify_products_with_llm)
+# ============================================================================
+
+# Coordinated/MDL proceedings routinely name the accused product right in
+# the case caption: "In Re Depo-Provera Litigation", "In re Depo-Provera
+# (Depot Medroxyprogesterone Acetate) Products Liability Litigation". This
+# is a strong, court/state-agnostic signal when present - not every
+# product-liability case has one (a single-plaintiff filing naming a
+# category of products, e.g. "the Cosmetic Products", won't), so this is
+# only ever one input alongside LLM-based identification, never the sole
+# source.
+LITIGATION_CAPTION_PATTERN = re.compile(
+    r"In\s+Re:?\s+(.+?)\s+(?:\([^)]*\)\s+)?(?:Products?\s+Liability\s+)?Litigation\b",
+    re.IGNORECASE,
+)
+
+
+def find_litigation_captions(text: str) -> list[str]:
+    """Find "In Re <product/subject> [Products Liability] Litigation" style
+    captions and return the named subject.
+
+    Args:
+        text: Document text to search
+
+    Returns:
+        Deduplicated (case-insensitive) list of captured subject names, in
+        order of first appearance
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in LITIGATION_CAPTION_PATTERN.finditer(text):
+        name = match.group(1).strip(" ,:")
+        key = name.upper()
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names

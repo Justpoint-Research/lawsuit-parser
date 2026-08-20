@@ -80,6 +80,31 @@ def get_output_path(
     return output_path
 
 
+def get_docling_dir(pdf_path: Path) -> Path:
+    """
+    Determine the directory to save a PDF's Docling outputs
+    (.docling.json, .md) into.
+
+    A case directory holds PDFs of the same name under multiple source
+    subdirectories (e.g. `documents/` and `confirmations/` can each contain
+    a `document_<id>.pdf` that are different files). Saving Docling output
+    next to the PDF, as `parse_pdf_document` does by default, spreads it
+    across those source subdirectories and risks collisions if they're ever
+    flattened. Mirroring the source subdirectory under a single case-level
+    `docling/` directory keeps generated artifacts out of the source
+    directories while still avoiding name collisions.
+
+    Args:
+        pdf_path: Path to PDF file (e.g. data/cases/case_104/documents/foo.pdf)
+
+    Returns:
+        Directory to save Docling outputs into
+        (e.g. data/cases/case_104/docling/documents)
+    """
+    case_dir = pdf_path.parents[1]
+    return case_dir / "docling" / pdf_path.parent.name
+
+
 def load_case_metadata(case_dir: Path) -> dict[str, Any] | None:
     """
     Load case metadata from case JSON file.
@@ -175,6 +200,7 @@ def parse_and_save_pdf(
             use_gpu=use_gpu,
             extract_tables=True,
             extract_images=False,
+            docling_dir=get_docling_dir(pdf_path),
         )
 
         # Run postprocessing steps on the extracted text

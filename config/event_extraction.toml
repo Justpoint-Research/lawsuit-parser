@@ -2,6 +2,10 @@
 
 [paths]
 data_root = "data/cases"
+# Pipeline-generated artifacts (events/, stages/) are written here instead of
+# under data_root, so an iteration's output can be wiped with e.g.
+# `rm -rf data/extraction/case_95` without touching source case data.
+output_root = "data/extraction"
 events_dir = "events"
 
 [stage_1]
@@ -13,6 +17,38 @@ extract_from_pdfs = true
 
 # Extract metadata from Docling parsed files
 extract_from_docling = true
+
+# Extract filer/assigned-judge/timestamp/court-clerk metadata from each
+# document's matching e-filing confirmation notice under confirmations/. The
+# document itself (documents/) remains the sole source for entity detection
+# in Stage 2.
+extract_from_confirmations = true
+
+# Sanity-check the regex-discovered actor roster with an LLM before writing
+# actors.json - corrects mis-assigned roles, drops obvious junk (e.g. a
+# stray address line), and phrases the GLiNER labels. Falls back to the
+# unvalidated, deterministically-labeled roster if the backend server isn't
+# reachable, so this is safe to leave on.
+validate_actors_with_llm = true
+
+# "ollama" (default, verified against this repo's local Ollama server) or
+# "nuextract" (this repo's existing vLLM-served NuExtract client, same one
+# lawsuit_parser.extraction.registry uses - see config/extraction.toml).
+# Switching backend means also swapping llm_model/llm_base_url below to the
+# matching pair:
+#   ollama:    llm_model = "gemma4:e4b"        llm_base_url = "http://localhost:11434"
+#   nuextract: llm_model = "numind/NuExtract3"  llm_base_url = "http://localhost:8000/v1"
+llm_backend = "ollama"
+llm_model = "gemma4:e4b"
+llm_base_url = "http://localhost:11434"
+
+# Identify the medical substance/drug/medical device/cosmetic product the
+# plaintiff accuses of causing harm, and the defendant(s) it's attributed
+# to, via the same llm_backend above (there's no fixed textual format to
+# regex an arbitrary product name from, unlike a caption or citation - this
+# is a reading-comprehension task). Written to products.json and merged
+# into gliner_config.json's dynamic labels alongside actors.json.
+extract_products = true
 
 # Regex patterns for date extraction
 date_patterns = [
@@ -39,6 +75,24 @@ batch_size = 8
 # Use GPU if available
 use_gpu = true
 
+# Minimum full sentences of context captured before/after each detected
+# entity (fewer only at a document boundary). Sentence-anchored rather than
+# a fixed character window, so context isn't cut off mid-sentence.
+context_sentences_before = 2
+context_sentences_after = 2
+
+# After GLiNER runs, regex-search each named actor's canonical name/aliases
+# (from actors.json) over the document text and add any exact-match spans
+# GLiNER's threshold missed - a deterministic recall backstop for known
+# parties. Complements GLiNER rather than replacing it: GLiNER is still the
+# only source for generic/unnamed labels (temporal expression, monetary
+# amount, witness) that have no fixed string to search for.
+enable_gazetteer = true
+
+# Skip actor names/aliases shorter than this many characters, to cut noise
+# from short acronyms/initials colliding with unrelated text.
+gazetteer_min_term_length = 3
+
 # Static entity labels (general entity types)
 static_labels = [
     "temporal expression",
@@ -48,6 +102,7 @@ static_labels = [
     "monetary amount",
     "document reference",
     "case citation",
+    "medical substance, drug, medical device, or cosmetic product",
 ]
 
 # Dynamic labels will be generated automatically based on discovered parties
