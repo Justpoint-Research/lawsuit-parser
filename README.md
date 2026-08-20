@@ -9,6 +9,7 @@ lawsuit-parser/
 ├── lawsuit_parser/     # Main Python package
 ├── apps/              # Streamlit or standalone applications
 ├── config/            # Configuration files
+├── docs/              # Documentation (see docs/README.md)
 ├── notebooks/         # Jupyter notebooks for analysis
 ├── scripts/           # Data processing and utility scripts
 ├── sql/              # SQL queries and schema definitions
@@ -16,6 +17,16 @@ lawsuit-parser/
 ├── pyproject.toml    # Project dependencies and configuration
 └── Makefile          # Build and development commands
 ```
+
+## Documentation
+
+All documentation is organized in the [`docs/`](docs/) folder:
+- [Event Extraction Usage Guide](docs/event_extraction_usage.md)
+- [Case Exporter Usage](docs/case_exporter_usage.md)
+- [Local Case Browser](docs/local_case_browser.md)
+- [Database Schema](docs/court_tables_relationships.md)
+
+See [docs/README.md](docs/README.md) for the complete documentation index.
 
 ## Setup
 
@@ -383,6 +394,44 @@ for span in all_artifacts:
 ```
 
 This ensures perfect provenance tracking - every extracted fact points to its exact location in the source text.
+
+### Event Extraction Pipeline (New)
+
+A modular pipeline for extracting legal events and timelines from parsed documents. This complements the existing extraction pipeline above with a focus on event-centric analysis.
+
+**Quick Start:**
+```bash
+# Run event extraction pipeline for a case
+python scripts/run_event_extraction.py case_67
+
+# Run only Stage 1 (metadata scan)
+python scripts/run_event_extraction.py case_67 --stages 1
+
+# Check pipeline status
+python scripts/run_event_extraction.py case_67 --status
+
+# Force re-run
+python scripts/run_event_extraction.py case_67 --force
+```
+
+**Pipeline Stages:**
+- **Stage 1:** Metadata extraction from database, PDFs, and Docling headers → `files_scan.json`, `gliner_config.json`
+- **Stage 2:** GLiNER entity detection with dynamic actor labels → `entities.json`
+- **Future:** Event timeline construction, temporal ordering, relationship extraction
+
+**Key Features:**
+- Extracts parties (plaintiffs, defendants, etc.) from multiple sources
+- Generates dynamic GLiNER labels based on discovered actors
+- Detects entities (dates, events, locations, amounts) with provenance tracking
+- Extensible architecture - new stages can be added without modifying existing code
+
+**Configuration:** Edit `config/event_extraction.toml` to customize:
+- Date extraction patterns
+- GLiNER model and threshold
+- Entity labels
+- Database/PDF/Docling extraction toggles
+
+**Documentation:** See [Event Extraction Usage Guide](docs/event_extraction_usage.md) for detailed documentation.
 
 ### Running Tests
 

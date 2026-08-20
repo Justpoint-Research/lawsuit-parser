@@ -30,6 +30,7 @@ dependencies = [
     "rapidfuzz>=3.0.0",
     "tomli-w>=1.0.0",
     "tomli>=2.4.1",
+    "dvc[gs]>=3.0.0",
     # Pin torch to the newest CUDA 12.4 build (the cu124 wheel index tops out
     # at 2.6.0). transformers>=5 requires torch 2.6+ for proper model loading.
     "torch>=2.6.0,<2.7.0",

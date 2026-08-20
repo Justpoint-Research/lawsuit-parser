@@ -1,0 +1,54 @@
+# Configuration for event extraction pipeline
+
+[paths]
+data_root = "data/cases"
+events_dir = "events"
+
+[stage_1]
+# Extract metadata from database
+extract_from_database = true
+
+# Extract metadata from PDF files
+extract_from_pdfs = true
+
+# Extract metadata from Docling parsed files
+extract_from_docling = true
+
+# Regex patterns for date extraction
+date_patterns = [
+    # MM/DD/YYYY or M/D/YYYY
+    "\\d{1,2}/\\d{1,2}/\\d{4}",
+    # YYYY-MM-DD
+    "\\d{4}-\\d{2}-\\d{2}",
+    # Month DD, YYYY (e.g., January 15, 2024)
+    "(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}",
+    # Mon DD, YYYY (e.g., Jan 15, 2024)
+    "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\.?\\s+\\d{1,2},\\s+\\d{4}",
+]
+
+[stage_2]
+# GLiNER model to use
+model = "urchade/gliner_multi-v2.1"
+
+# Confidence threshold for entity detection (0.0-1.0)
+threshold = 0.5
+
+# Batch size for GLiNER processing
+batch_size = 8
+
+# Use GPU if available
+use_gpu = true
+
+# Static entity labels (general entity types)
+static_labels = [
+    "temporal expression",
+    "legal action or event",
+    "court",
+    "geographic location",
+    "monetary amount",
+    "document reference",
+    "case citation",
+]
+
+# Dynamic labels will be generated automatically based on discovered parties
+# from Stage 1 (e.g., "plaintiff (Jane Doe)", "defendant (ACME Inc.)")
