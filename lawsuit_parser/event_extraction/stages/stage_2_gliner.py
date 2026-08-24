@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ...extraction.models import GlinerRunner
+from ..gliner_runner import GlinerRunner
 from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
 from ..models import (

@@ -315,25 +315,6 @@ That's it! The pipeline will automatically discover and execute the new stage.
 7. **Error Handling** - Graceful degradation when optional features unavailable
 8. **Configuration** - All tunables externalized to config file
 
-## Integration with Existing Pipeline
-
-The new event extraction pipeline complements the existing extraction pipeline:
-
-**Existing Pipeline** (`lawsuit_parser/extraction/`):
-- Stages 0-4: Canonical text, metadata (NuExtract3), party registry, spans (GLiNER), proto-events
-- Outputs to `data/cases/<case_id>/stages/`
-- Focused on comprehensive entity and party extraction
-
-**Event Pipeline** (`lawsuit_parser/event_extraction/`):
-- Stages 1-N: Metadata scan, entity detection, timeline (future)
-- Outputs to `data/cases/<case_id>/events/`
-- Focused on event-centric analysis and timelines
-
-**Shared Resources:**
-- Both use canonical text from `documents/` directory
-- Both use GLiNER for entity extraction
-- Can be run independently or together
-
 ## Testing
 
 To test the pipeline, you'll need:

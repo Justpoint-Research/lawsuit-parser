@@ -9,9 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
 from ..llm_validation import (
+    identify_document_title_with_llm,
+    identify_document_title_with_nuextract,
     identify_products_with_llm,
     identify_products_with_nuextract,
     validate_actors_with_llm,
@@ -41,6 +45,7 @@ from ..utils import (
     find_document_references,
     find_litigation_captions,
     find_party_aliases,
+    find_title_candidates,
     normalize_party_name,
     normalize_role,
     parse_caption_block,
@@ -128,6 +133,15 @@ class Stage1Metadata(BaseStage):
         extract_from_docling = config.get("extract_from_docling", True)
         extract_from_confirmations = config.get("extract_from_confirmations", True)
         date_patterns = config.get("date_patterns", [])
+        identify_document_titles = config.get("identify_document_titles", True)
+        # Shared by every LLM-assisted step below (title/actor/product
+        # identification): which backend, model, and endpoint to use.
+        backend = config.get("llm_backend", "ollama")
+        llm_model = config.get("llm_model", "gemma4:e4b")
+        llm_base_url = config.get("llm_base_url", "http://localhost:11434")
+        identify_title = (
+            identify_document_title_with_nuextract if backend == "nuextract" else identify_document_title_with_llm
+        )
 
         # Initialize results
         database_metadata = None
@@ -147,9 +161,13 @@ class Stage1Metadata(BaseStage):
                 for defendant in database_metadata.defendant:
                     self._add_actor(actors, defendant, "defendant", "database")
 
-        # 2. Find all case documents
+        # 2. Find all case documents, oldest filing first (see
+        # _document_sort_key) - this is also the order doc_id numbers
+        # (doc_000, doc_001, ...) get assigned in below, so doc_id order
+        # is a chronological reading order, not arbitrary filesystem order.
         documents_dir = self.get_documents_dir(case_id)
         pdf_files = list(documents_dir.glob("*.pdf")) if documents_dir.exists() else []
+        pdf_files = sorted(pdf_files, key=self._document_sort_key)
         parsed_files = list(documents_dir.glob("*.json")) if documents_dir.exists() else []
 
         # Docling outputs (.docling.json, .md) live under a case-level
@@ -198,9 +216,32 @@ class Stage1Metadata(BaseStage):
 
                 if docling_data is not None:
                     print(f"  Extracting Docling metadata...")
-                    docling_meta, docling_dates = self._extract_from_docling(docling_data, date_patterns)
+                    docling_meta, docling_dates, first_page_text = self._extract_from_docling(docling_data, date_patterns)
                     if docling_meta:
                         doc_metadata.docling_metadata = docling_meta
+
+                        # Final title: an LLM reads the page-1 text plus
+                        # Docling's own detected title (if any) and the
+                        # heuristic candidate lines (see
+                        # utils.find_title_candidates) and decides the
+                        # actual title - neither signal alone is reliable
+                        # enough on its own (Docling rarely tags a "title"
+                        # element on these filings; the heuristic can't
+                        # tell a title from a party-name line by itself).
+                        if identify_document_titles and (
+                            first_page_text or docling_meta.title_candidates or docling_meta.title
+                        ):
+                            print(f"  Identifying document title (backend={backend})...")
+                            title = identify_title(
+                                text_excerpt=first_page_text[:3000],
+                                candidates=docling_meta.title_candidates,
+                                docling_title=docling_meta.title,
+                                model=llm_model,
+                                base_url=llm_base_url,
+                            )
+                            if title:
+                                doc_metadata.document_title = title
+                                print(f"  Title: {title}")
 
                         # Extract CM/ECF (or NYSCEF) metadata if available
                         if docling_meta.cm_ecf:
@@ -234,8 +275,17 @@ class Stage1Metadata(BaseStage):
                 if parsed_path.exists():
                     try:
                         parsed_data = self.load_json(parsed_path)
-                        if "title" in parsed_data and not doc_metadata.document_title:
-                            doc_metadata.document_title = parsed_data["title"]
+                        legacy_title = parsed_data.get("title")
+                        # Some upstream parsers default "title" to the input
+                        # filename when they found no real title - that's not
+                        # a title, it's the file_name field again under a
+                        # different name. Only trust it if it isn't that.
+                        if (
+                            legacy_title
+                            and legacy_title != pdf_path.stem
+                            and not doc_metadata.document_title
+                        ):
+                            doc_metadata.document_title = legacy_title
                     except Exception as e:
                         print(f"  Warning: Failed to load parsed JSON: {e}")
 
@@ -363,7 +413,6 @@ class Stage1Metadata(BaseStage):
         caption, court, case_type = self._load_case_context(case_id)
 
         # 4. Validate the discovered actor roster with an LLM (optional)
-        backend = config.get("llm_backend", "ollama")
         if config.get("validate_actors_with_llm", True) and actors:
             print(f"\n→ Validating actor roster with LLM (backend={backend})...")
             validator = validate_actors_with_nuextract if backend == "nuextract" else validate_actors_with_llm
@@ -371,8 +420,8 @@ class Stage1Metadata(BaseStage):
                 actors,
                 caption=caption,
                 court=court,
-                model=config.get("llm_model", "gemma4:e4b"),
-                base_url=config.get("llm_base_url", "http://localhost:11434"),
+                model=llm_model,
+                base_url=llm_base_url,
             )
             print(f"  Roster after validation: {len(actors)} actors")
 
@@ -398,8 +447,8 @@ class Stage1Metadata(BaseStage):
                 litigation_caption_candidates=list(litigation_caption_hits.keys()),
                 defendant_names=defendant_names,
                 text_sample=sample_text,
-                model=config.get("llm_model", "gemma4:e4b"),
-                base_url=config.get("llm_base_url", "http://localhost:11434"),
+                model=llm_model,
+                base_url=llm_base_url,
             )
 
             for result in results:
@@ -659,9 +708,60 @@ class Stage1Metadata(BaseStage):
             print(f"  Database module not available")
             return None
 
+    def _document_sort_key(self, pdf_path: Path) -> tuple[bool, datetime, str]:
+        """Sort key for ordering documents oldest-to-newest, then by
+        filename - this determines the doc_id (doc_000, doc_001, ...) each
+        document gets assigned in run(), so doc_id order becomes a
+        chronological reading order instead of arbitrary filesystem order.
+
+        Prefers the document's own filing date (its CM/ECF-style header
+        stamp, e.g. NYSCEF's "FILED: ... 03/03/2026"); falls back to the
+        PDF's own CreationDate metadata when no header filing date is
+        found. Documents with neither sort last (grouped after every dated
+        document), tie-broken by filename like everything else.
+
+        Args:
+            pdf_path: Path to the PDF file being sorted
+
+        Returns:
+            (is_undated, date, file_name) - sortable tuple; is_undated
+            pushes undated documents to the end regardless of the
+            placeholder date used for them
+        """
+        sort_date = None
+
+        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+        if docling_path.exists():
+            try:
+                docling_data = self.load_json(docling_path)
+                # date_patterns=[] skips ExtractedDate collection (not needed
+                # here) but still runs the (unconditional) CM/ECF header parse.
+                docling_meta, _, _ = self._extract_from_docling(docling_data, date_patterns=[])
+                if docling_meta and docling_meta.cm_ecf and docling_meta.cm_ecf.filing_date:
+                    sort_date = self._parse_date_loosely(docling_meta.cm_ecf.filing_date)
+            except Exception:
+                pass
+
+        if sort_date is None:
+            pdf_meta = extract_pdf_metadata(pdf_path)
+            sort_date = pdf_meta.get("created")
+
+        return (sort_date is None, sort_date or datetime.max, pdf_path.name)
+
+    @staticmethod
+    def _parse_date_loosely(text: str) -> datetime | None:
+        """Best-effort parse of a raw date string (e.g. "03/03/2026",
+        "August 25, 2026") into a real datetime, for sorting only - the
+        stored ExtractedDate.text values remain unparsed surface strings."""
+        try:
+            ts = pd.to_datetime(text, errors="coerce")
+        except Exception:
+            return None
+        return None if pd.isna(ts) else ts.to_pydatetime()
+
     def _extract_from_docling(
         self, docling_data: dict, date_patterns: list[str]
-    ) -> tuple[DoclingMetadata | None, list[ExtractedDate]]:
+    ) -> tuple[DoclingMetadata | None, list[ExtractedDate], str]:
         """Extract metadata and timestamps from parsed Docling JSON data.
 
         Docling's current export schema lists every text item in a flat
@@ -676,7 +776,11 @@ class Stage1Metadata(BaseStage):
                 header and first page text
 
         Returns:
-            Tuple of (Docling metadata, timestamps found in the header/first page)
+            Tuple of (Docling metadata, timestamps found in the header/first
+            page, first-page text) - the text is returned separately since
+            callers also use it as LLM context for title identification
+            (see identify_document_title_with_llm), not just for date/
+            signature extraction.
         """
         try:
             texts = docling_data.get("texts", [])
@@ -695,6 +799,11 @@ class Stage1Metadata(BaseStage):
                     if text:
                         title = text
                         break
+
+            # Heuristic candidates for a document's title/type, used to
+            # arbitrate the final title via an LLM when Docling doesn't
+            # tag one - see utils.find_title_candidates.
+            title_candidates = find_title_candidates(first_page_items)
 
             # Header: page_header item(s) on the first page
             header_parts = [
@@ -747,13 +856,20 @@ class Stage1Metadata(BaseStage):
                         ))
 
             return (
-                DoclingMetadata(title=title, header=header, cm_ecf=cm_ecf, document_signature=document_signature),
+                DoclingMetadata(
+                    title=title,
+                    title_candidates=title_candidates,
+                    header=header,
+                    cm_ecf=cm_ecf,
+                    document_signature=document_signature,
+                ),
                 extracted_dates,
+                first_page_text,
             )
 
         except Exception as e:
             print(f"  Warning: Failed to extract Docling metadata: {e}")
-            return None, []
+            return None, [], ""
 
     def _extract_caption_actors(self, docling_data: dict) -> dict[str, list[str]]:
         """Parse plaintiff/defendant names out of a document's first-page

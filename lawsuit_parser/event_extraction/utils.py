@@ -527,6 +527,62 @@ _DOCUMENT_SIGNATURE_LABEL_PATTERNS = [
 ]
 
 
+_TITLE_BOILERPLATE_MARKERS = (
+    "court", "county of", "state of", "index no", "doc. no", "docket no",
+    "case no", "filed:", "received", "-against-", " vs ", " v. ",
+    "attorneys for", "telephone", "esq",
+)
+
+# Caption labels excluded only as a whole-line match (e.g. "Defendants,")
+# - unlike _TITLE_BOILERPLATE_MARKERS, a substring match here would also
+# reject genuine titles that happen to name a party's role, e.g.
+# "STIPULATION OF DISCONTINUANCE AS AGAINST DEFENDANT KKR & CO."
+_TITLE_CAPTION_LABELS = {"plaintiff", "plaintiffs", "defendant", "defendants"}
+
+
+def find_title_candidates(first_page_items: list[dict], max_candidates: int = 5) -> list[str]:
+    """Heuristic candidates for a document's title/type: short, mostly-
+    uppercase text lines on page 1 - the convention pleadings/motions use
+    for a document's formal name (e.g. "SUMMONS", "NOTICE OF MOTION",
+    "STIPULATION OF DISCONTINUANCE...") - that aren't obvious court/
+    caption/header boilerplate. Not tied to any one court/e-filing system's
+    layout.
+
+    Not authoritative on their own: an LLM makes the final call using
+    these as a hint alongside the actual page text - see
+    llm_validation.identify_document_title_with_llm.
+
+    Args:
+        first_page_items: Docling text items on page 1 (dicts with "text"/"label")
+        max_candidates: Maximum number of candidates to return
+
+    Returns:
+        Candidate strings, in page order
+    """
+    candidates = []
+    for item in first_page_items:
+        if item.get("label") in ("page_header", "page_footer"):
+            continue
+        text = (item.get("text") or "").strip()
+        if not (4 <= len(text) <= 150):
+            continue
+        letters = [c for c in text if c.isalpha()]
+        if not letters:
+            continue
+        upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if upper_ratio < 0.8:
+            continue
+        low = text.lower()
+        if low.strip(" ,.:;") in _TITLE_CAPTION_LABELS:
+            continue
+        if any(marker in low for marker in _TITLE_BOILERPLATE_MARKERS):
+            continue
+        candidates.append(text)
+        if len(candidates) >= max_candidates:
+            break
+    return candidates
+
+
 def extract_document_signature(text: str) -> str | None:
     """Extract a document's own filing/document number - its "signature"
     within the case.

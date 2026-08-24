@@ -32,10 +32,9 @@ extract_from_confirmations = true
 validate_actors_with_llm = true
 
 # "ollama" (default, verified against this repo's local Ollama server) or
-# "nuextract" (this repo's existing vLLM-served NuExtract client, same one
-# lawsuit_parser.extraction.registry uses - see config/extraction.toml).
-# Switching backend means also swapping llm_model/llm_base_url below to the
-# matching pair:
+# "nuextract" (this repo's existing vLLM-served NuExtract client - see
+# lawsuit_parser.event_extraction.nuextract_client). Switching backend means
+# also swapping llm_model/llm_base_url below to the matching pair:
 #   ollama:    llm_model = "gemma4:e4b"        llm_base_url = "http://localhost:11434"
 #   nuextract: llm_model = "numind/NuExtract3"  llm_base_url = "http://localhost:8000/v1"
 llm_backend = "ollama"
@@ -107,3 +106,20 @@ static_labels = [
 
 # Dynamic labels will be generated automatically based on discovered parties
 # from Stage 1 (e.g., "plaintiff (Jane Doe)", "defendant (ACME Inc.)")
+
+[stage_3]
+# Generate a 1-3 sentence summary of each document's core purpose (why it
+# was filed/created, what it accomplishes) via an LLM. Falls back to no
+# summary for a document if the backend server isn't reachable, so this is
+# safe to leave on.
+summarize_documents = true
+
+# Same backend options as [stage_1] above.
+llm_backend = "ollama"
+llm_model = "gemma4:e4b"
+llm_base_url = "http://localhost:11434"
+
+# Maximum characters of document text sent to the LLM - larger than Stage
+# 1's title excerpt, since a document's core purpose often isn't stated on
+# page 1 alone (e.g. a complaint's factual background, a motion's argument).
+max_chars = 8000

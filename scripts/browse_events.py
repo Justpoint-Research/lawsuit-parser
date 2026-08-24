@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""Browse extracted event-candidate segments for a case.
+"""Browse event_extraction pipeline output for a case.
 
-Full structured proto-events (predicate + typed actor/date/location edges)
-require GLiNER-Relex, which isn't implemented yet (relex.enabled = false in
-config/extraction.toml runs a no-op stub, so 04_protoevents.json's
-proto_events list is always empty). What IS available after stages 0-4 is
-priority_segments: paragraphs flagged as event-bearing because they contain
-a temporal expression, or a legal-action span plus a party mention.
-
-This prints a case-level summary followed by those priority segments as a
-table (timestamp / actors / one-line summary / source text / document /
-page) - the closest thing to "browsing events" the pipeline currently
-produces. Pass --detail for the full per-segment entity breakdown (label,
-span text, confidence score) instead of the table.
+Reads the Stage 1/2/3 artifacts under data/extraction/<case_id>/events/ (see
+`make extract-events` / scripts/run_event_extraction.py). A real event/
+timeline concept (Stage 4+) isn't built yet, so this browses at document
+granularity: one row per scanned document, showing the dates Stage 1 found
+in it, the actors Stage 2 linked to it, and the short summary Stage 3
+generated for it - the closest thing to "browsing events" the pipeline
+currently produces. Pass --detail for the full per-document entity
+breakdown (label, span text, confidence score, context) instead of the table.
 
 For interactive filtering (e.g. by actor), see apps/event_browser.py instead.
 
 Usage:
-    uv run scripts/browse_events.py --case-id case_2132
-    uv run scripts/browse_events.py --case-id case_2132 --detail
+    uv run scripts/browse_events.py --case-id case_95
+    uv run scripts/browse_events.py --case-id case_95 --detail
 """
 
 import argparse
@@ -27,13 +23,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lawsuit_parser.extraction.browse import (
+from lawsuit_parser.event_extraction.browse import (
     EVENT_TABLE_COLUMNS,
     CaseArtifacts,
-    EventRow,
-    build_event_rows,
+    DocumentRow,
+    build_document_rows,
     compute_case_summary,
-    event_rows_to_table_dicts,
+    document_rows_to_table_dicts,
     load_case_artifacts,
     render_ascii_table,
 )
@@ -60,10 +56,10 @@ def print_case_summary(artifacts: CaseArtifacts) -> None:
         other_str = "; ".join(f"{role}: {', '.join(names)}" for role, names in summary.other_roles.items())
         print(f"Other parties:     {other_str}")
 
-    print(
-        f"Registry parties:  {summary.num_registry_parties} total "
-        f"({summary.num_mentions} mentions, {summary.num_unresolved} unresolved)"
-    )
+    if summary.products:
+        print(f"Accused products:  {', '.join(summary.products)}")
+
+    print(f"Parties/roles:     {summary.num_parties} total")
 
     if summary.temporal_count:
         if summary.year_range and summary.year_range[0] != summary.year_range[1]:
@@ -72,32 +68,46 @@ def print_case_summary(artifacts: CaseArtifacts) -> None:
             span_str = str(summary.year_range[0])
         else:
             span_str = "no years detected"
-        print(f"Time span:         {span_str} ({summary.temporal_count} temporal expressions)")
+        print(f"Time span:         {span_str} ({summary.temporal_count} dates found)")
 
     label_str = ", ".join(
         f"{label}: {count}" for label, count in sorted(summary.label_counts.items(), key=lambda kv: -kv[1])
     )
-    print(f"Entity spans:      {sum(summary.label_counts.values())} total ({label_str})")
+    print(f"Entities:          {summary.num_entities} total ({summary.num_linked} linked to a known actor)")
+    if label_str:
+        print(f"  by label:        {label_str}")
 
-    print(f"Priority segments (event candidates): {summary.num_priority_segments}")
-    print(f"Proto-events (requires relex, currently disabled): {summary.num_proto_events}")
+    if summary.gliner_model:
+        print(f"GLiNER model:      {summary.gliner_model} (threshold={summary.gliner_threshold})")
     print("=" * 78)
     print()
 
 
-def print_detail(rows: list[EventRow]) -> None:
-    """The original verbose view: full segment text plus every entity span
-    with its label and confidence score."""
+def print_detail(rows: list[DocumentRow]) -> None:
+    """Full per-document breakdown: dates found, plus every entity with its
+    label, confidence score, and surrounding context."""
     for row in rows:
         print("=" * 78)
-        print(f"[{row.seg_id}] {row.doc_id}  {row.section_type}  (page {row.page})")
+        print(f"[{row.doc_id}] {row.file_name}")
+        if row.document_title:
+            print(row.document_title)
         print("-" * 78)
-        print(row.text.strip())
+
+        if row.filing_date:
+            print(f"Filed: {row.filing_date}" + (f" (by {row.filed_by})" if row.filed_by else ""))
+
+        if row.summary:
+            print(f"\nSummary: {row.summary}")
+
+        if row.dates:
+            print("\nDates found:")
+            for dtype, text in row.dates:
+                print(f"  [{dtype:14s}] {text}")
 
         if row.entities:
             print("\nEntities:")
             for label, span_text, score in row.entities:
-                print(f"  [{label:22s}] {span_text!r}  (score={score:.2f})")
+                print(f"  [{label:35s}] {span_text!r}  (score={score:.2f})")
 
         if row.actors:
             print(f"\nActors: {', '.join(row.actors)}")
@@ -106,31 +116,32 @@ def print_detail(rows: list[EventRow]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Browse extracted events for a case")
-    parser.add_argument("--case-id", required=True, help="Case identifier (e.g., case_2132)")
-    parser.add_argument("--data-root", default="data/cases", help="Root data directory")
+    parser = argparse.ArgumentParser(description="Browse event_extraction pipeline output for a case")
+    parser.add_argument("--case-id", required=True, help="Case identifier (e.g., case_95)")
+    parser.add_argument("--data-root", default="data/cases", help="Root directory for source case data (caption lookup)")
+    parser.add_argument("--output-root", default="data/extraction", help="Root directory for extraction artifacts")
     parser.add_argument(
         "--detail",
         action="store_true",
-        help="Print the full per-segment entity breakdown instead of the summary table",
+        help="Print the full per-document entity breakdown instead of the summary table",
     )
     args = parser.parse_args()
 
-    artifacts = load_case_artifacts(args.case_id, Path(args.data_root))
+    artifacts = load_case_artifacts(args.case_id, Path(args.data_root), Path(args.output_root))
 
     print_case_summary(artifacts)
 
-    rows = build_event_rows(artifacts)
+    rows = build_document_rows(artifacts)
     if not rows:
-        print("No priority segments found for this case.")
+        print("No documents found for this case.")
         return
 
     if args.detail:
         print_detail(rows)
         return
 
-    print(f"EVENT CANDIDATES ({len(rows)})")
-    print(render_ascii_table(EVENT_TABLE_COLUMNS, event_rows_to_table_dicts(rows)))
+    print(f"DOCUMENTS ({len(rows)})")
+    print(render_ascii_table(EVENT_TABLE_COLUMNS, document_rows_to_table_dicts(rows)))
 
 
 if __name__ == "__main__":

@@ -95,12 +95,39 @@ class Stage2Config(BaseModel):
     )
 
 
+class Stage3Config(BaseModel):
+    """Stage 3 (Document Summary) configuration."""
+
+    summarize_documents: bool = Field(
+        default=True,
+        description="Generate a 1-3 sentence summary of each document's core purpose via an "
+                     "LLM. Falls back to no summary for a document if the backend server isn't "
+                     "reachable, so this is safe to leave on.",
+    )
+    llm_backend: str = Field(
+        default="ollama",
+        description="'ollama' (local Ollama server) or 'nuextract' (this repo's existing "
+                     "vLLM-served NuExtract client). Switching backend also requires setting "
+                     "llm_model/llm_base_url to match - see config/event_extraction.toml.",
+    )
+    llm_model: str = Field(default="gemma4:e4b", description="Model tag/name for the selected llm_backend")
+    llm_base_url: str = Field(default="http://localhost:11434", description="Server URL for the selected llm_backend")
+    max_chars: int = Field(
+        default=8000,
+        gt=0,
+        description="Maximum characters of document text sent to the LLM - larger than Stage "
+                     "1's title excerpt since a document's core purpose often isn't stated on "
+                     "page 1 alone (e.g. a complaint's factual background, a motion's argument).",
+    )
+
+
 class EventExtractionConfig(BaseModel):
     """Complete configuration for event extraction pipeline."""
 
     paths: PathsConfig = Field(default_factory=PathsConfig)
     stage_1: Stage1Config = Field(default_factory=Stage1Config)
     stage_2: Stage2Config = Field(default_factory=Stage2Config)
+    stage_3: Stage3Config = Field(default_factory=Stage3Config)
 
 
 def load_config(config_path: Path | None = None) -> EventExtractionConfig:

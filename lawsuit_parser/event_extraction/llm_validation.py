@@ -1,5 +1,5 @@
-"""Optional LLM assistance for Stage 1: actor roster validation, and
-accused-product identification.
+"""Optional LLM assistance for Stage 1 (actor roster validation, accused-
+product identification, document title) and Stage 3 (document summary).
 
 Regex/heuristic extraction (database, caption parsing, confirmation
 notices) can mis-assign a role or let a stray fragment (an address line, a
@@ -15,19 +15,30 @@ a reading-comprehension task with no fixed textual format (unlike a
 caption block or a citation), so an LLM does the identification directly
 rather than being a validation pass over a regex-built candidate list.
 
-Two backends are available for both, selected via Stage1Config.llm_backend:
+identify_document_title_with_llm/identify_document_title_with_nuextract
+identify a single document's formal title/type (e.g. "Summons",
+"Stipulation of Discontinuance"). Docling rarely tags an actual "title"
+element on these filings, and a plain heuristic (see
+utils.find_title_candidates) can't reliably tell a title line from a
+party-name or boilerplate line by itself - so the LLM makes the final call,
+reading the page-1 text with Docling's title (if any) and the heuristic
+candidates as hints, not a hard candidate list.
+
+summarize_document_with_llm/summarize_document_with_nuextract produce a
+1-3 sentence summary of a document's core purpose (why it exists / what it
+accomplishes), given a longer text excerpt and the identified title as a
+hint. Runs in Stage 3.
+
+Two backends are available for all of these, selected via each stage's
+own llm_backend config (Stage1Config.llm_backend, Stage3Config.llm_backend):
 - "ollama" (default): a locally running Ollama model, e.g. gemma4:e4b.
   Verified working against this repo's local Ollama server.
-- "nuextract": this codebase's existing structured-extraction client (see
-  lawsuit_parser.extraction.models.NuExtractClient) against the vLLM
-  server already used by the lawsuit_parser.extraction pipeline (see
-  config/extraction.toml). Not exercised against a live server as part of
-  this change - the vLLM endpoint wasn't reachable in this environment -
-  but implemented against the same client interface registry.py already
-  uses successfully, so it should work once that server is up. Switching
-  to it also means overriding llm_model/llm_base_url to the NuExtract
-  values (numind/NuExtract3, http://localhost:8000/v1) - see
-  config/event_extraction.toml.
+- "nuextract": this module's NuExtractClient (see .nuextract_client) against
+  a vLLM-served NuExtract3 endpoint. Not exercised against a live server as
+  part of this change - the vLLM endpoint wasn't reachable in this
+  environment. Switching to it also means overriding llm_model/llm_base_url
+  to the NuExtract values (numind/NuExtract3, http://localhost:8000/v1) -
+  see config/event_extraction.toml.
 
 Both fall back to the unvalidated, deterministically-labeled roster on any
 failure (server down, model missing, bad/malformed response) rather than
@@ -175,9 +186,8 @@ def validate_actors_with_nuextract(
 
     Same contract as validate_actors_with_llm (Ollama-backed): corrects
     roles, drops junk entries, and fills in gliner_label - but goes
-    through this codebase's existing structured-extraction client (see
-    lawsuit_parser.extraction.models.NuExtractClient), the same one
-    lawsuit_parser.extraction.registry already uses for alias harvesting.
+    through NuExtractClient (see .nuextract_client) against a vLLM-served
+    NuExtract3 endpoint.
 
     Args:
         actors: Regex/heuristic-discovered actors to validate
@@ -194,14 +204,13 @@ def validate_actors_with_nuextract(
         return actors
 
     try:
-        from ..extraction.models import ExtractionError, NuExtractClient
+        from .nuextract_client import ExtractionError, NuExtractClient
     except ImportError as e:
         print(f"  Warning: NuExtract client unavailable ({e}), keeping unvalidated roster")
         return actors
 
     # NuExtract templates describe the desired output shape with
-    # placeholder values, matching the convention already used in
-    # lawsuit_parser.extraction.registry's alias_template.
+    # placeholder values.
     template = {
         "actors": [
             {
@@ -409,8 +418,8 @@ def identify_products_with_nuextract(
     """Identify the accused product(s) with NuExtract, served via vLLM.
 
     Same contract as identify_products_with_llm (Ollama-backed) - see that
-    function's docstring. Goes through this codebase's existing
-    lawsuit_parser.extraction.models.NuExtractClient.
+    function's docstring. Goes through NuExtractClient (see
+    .nuextract_client).
 
     Returns:
         List of dicts with "name", "product_type", "attributed_to",
@@ -418,7 +427,7 @@ def identify_products_with_nuextract(
         is unreachable/its response can't be used.
     """
     try:
-        from ..extraction.models import ExtractionError, NuExtractClient
+        from .nuextract_client import ExtractionError, NuExtractClient
     except ImportError as e:
         print(f"  Warning: NuExtract client unavailable ({e})")
         return []
@@ -449,3 +458,278 @@ def identify_products_with_nuextract(
         return []
 
     return _clean_product_results(raw_products)
+
+
+# ============================================================================
+# Document title identification
+# ============================================================================
+
+TITLE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+    },
+    "required": ["title"],
+}
+
+
+def _build_title_prompt(text_excerpt: str, candidates: list[str], docling_title: str | None) -> str:
+    lines = [
+        "You are identifying the formal name/type of a single legal document "
+        "from its first page (e.g. \"Summons\", \"Verified Complaint\", "
+        "\"Notice of Motion\", \"Stipulation of Discontinuance\", \"Affidavit "
+        "of Service\", \"Memorandum of Law in Support\").",
+    ]
+    if docling_title:
+        lines.append(f"A layout-detection pass found this as a likely title: {docling_title!r}")
+    if candidates:
+        lines.append(
+            "Short, mostly-uppercase lines found on page 1 that may name the "
+            f"document (not necessarily the title - could be a party name or "
+            f"boilerplate): {', '.join(repr(c) for c in candidates)}"
+        )
+    if text_excerpt:
+        lines.append("\nFirst-page text, for context:\n" + text_excerpt)
+    lines.append(
+        "\nReturn the single best short title for this document, in normal "
+        "title case (not all-caps) even if the source text is all-caps. "
+        "Return an empty string if the text doesn't clearly name a specific "
+        "document type - do not guess or invent one."
+    )
+    return "\n".join(lines)
+
+
+def _clean_title_result(raw_title: str | None) -> str | None:
+    title = str(raw_title or "").strip()
+    return title or None
+
+
+def _parse_single_field_response(content: str, field: str) -> str | None:
+    """Pull a single string field out of an Ollama chat response's content.
+
+    Despite the JSON-schema `format` constraint, gemma4 sometimes returns
+    the value as a bare string (e.g. "Stipulation of Discontinuance")
+    instead of the requested {"<field>": "..."} object - salvage that
+    rather than discarding a perfectly good answer.
+    """
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    return parsed.get(field) if isinstance(parsed, dict) else parsed
+
+
+def identify_document_title_with_llm(
+    text_excerpt: str | None = None,
+    candidates: list[str] | None = None,
+    docling_title: str | None = None,
+    model: str = "gemma4:e4b",
+    base_url: str = "http://localhost:11434",
+    timeout: float = 60.0,
+) -> str | None:
+    """Identify a document's formal title/type with a local Ollama model.
+
+    Combines heuristic candidate lines (see utils.find_title_candidates)
+    and Docling's own layout-detected title (if any) with an actual read of
+    the page text - the LLM makes the final call rather than picking
+    blindly from the candidate list, since neither signal is reliable
+    enough alone (Docling rarely tags a title element on these filings; the
+    heuristic can't distinguish a title line from a party-name or
+    boilerplate line by itself).
+
+    Args:
+        text_excerpt: First-page text, for context
+        candidates: Heuristic candidate title lines (see utils.find_title_candidates)
+        docling_title: Docling's own layout-detected title, if any
+        model: Ollama model tag (must already be pulled)
+        base_url: Ollama server URL
+        timeout: Request timeout in seconds
+
+    Returns:
+        The identified title, or None if undeterminable or the model is
+        unreachable/its response can't be used.
+    """
+    prompt = _build_title_prompt(text_excerpt or "", candidates or [], docling_title)
+
+    try:
+        response = requests.post(
+            f"{base_url}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "format": TITLE_RESPONSE_SCHEMA,
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        content = response.json()["message"]["content"]
+        raw_title = _parse_single_field_response(content, "title")
+    except Exception as e:
+        print(f"  Warning: LLM title identification unavailable ({e})")
+        return None
+
+    return _clean_title_result(raw_title)
+
+
+def identify_document_title_with_nuextract(
+    text_excerpt: str | None = None,
+    candidates: list[str] | None = None,
+    docling_title: str | None = None,
+    model: str = "numind/NuExtract3",
+    base_url: str = "http://localhost:8000/v1",
+    timeout: float = 60.0,
+) -> str | None:
+    """Identify a document's formal title/type with NuExtract, served via
+    vLLM. Same contract as identify_document_title_with_llm (Ollama-backed) -
+    see that function's docstring.
+
+    Returns:
+        The identified title, or None if undeterminable or the vLLM server
+        is unreachable/its response can't be used.
+    """
+    try:
+        from .nuextract_client import ExtractionError, NuExtractClient
+    except ImportError as e:
+        print(f"  Warning: NuExtract client unavailable ({e})")
+        return None
+
+    template = {"title": ""}
+    prompt = _build_title_prompt(text_excerpt or "", candidates or [], docling_title)
+
+    try:
+        client = NuExtractClient(base_url=base_url, model=model, timeout_s=int(timeout))
+        result = client.extract(prompt, template)
+        raw_title = result.get("title")
+    except ExtractionError as e:
+        print(f"  Warning: NuExtract title identification failed ({e})")
+        return None
+    except Exception as e:
+        print(f"  Warning: NuExtract title identification unavailable ({e})")
+        return None
+
+    return _clean_title_result(raw_title)
+
+
+# ============================================================================
+# Document summary (Stage 3)
+# ============================================================================
+
+SUMMARY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+    },
+    "required": ["summary"],
+}
+
+
+def _build_summary_prompt(text_excerpt: str, document_title: str | None) -> str:
+    lines = [
+        "You are summarizing a single legal document in 1-3 sentences. "
+        "Focus on the document's core purpose: why it was filed or created, "
+        "and what it accomplishes (e.g. who is asking a court for what, who "
+        "is notifying whom of what, what fact or event it records) - not a "
+        "restatement of its contents or boilerplate caption/header text.",
+    ]
+    if document_title:
+        lines.append(f"This document's identified title/type: {document_title!r}")
+    if text_excerpt:
+        lines.append("\nDocument text, for context:\n" + text_excerpt)
+    lines.append(
+        "\nReturn a 1-3 sentence summary. Return an empty string if the "
+        "text doesn't give you enough to summarize - do not guess or "
+        "invent one."
+    )
+    return "\n".join(lines)
+
+
+def _clean_summary_result(raw_summary: str | None) -> str | None:
+    summary = str(raw_summary or "").strip()
+    return summary or None
+
+
+def summarize_document_with_llm(
+    text_excerpt: str | None = None,
+    document_title: str | None = None,
+    model: str = "gemma4:e4b",
+    base_url: str = "http://localhost:11434",
+    timeout: float = 60.0,
+) -> str | None:
+    """Summarize a document's core purpose in 1-3 sentences with a local
+    Ollama model.
+
+    Args:
+        text_excerpt: Document text, for context (see Stage3Config.max_chars
+            for how much of the document this typically covers)
+        document_title: The document's identified title/type (see
+            identify_document_title_with_llm), used as a hint
+        model: Ollama model tag (must already be pulled)
+        base_url: Ollama server URL
+        timeout: Request timeout in seconds
+
+    Returns:
+        The summary, or None if undeterminable or the model is
+        unreachable/its response can't be used.
+    """
+    prompt = _build_summary_prompt(text_excerpt or "", document_title)
+
+    try:
+        response = requests.post(
+            f"{base_url}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "format": SUMMARY_RESPONSE_SCHEMA,
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        content = response.json()["message"]["content"]
+        raw_summary = _parse_single_field_response(content, "summary")
+    except Exception as e:
+        print(f"  Warning: LLM document summarization unavailable ({e})")
+        return None
+
+    return _clean_summary_result(raw_summary)
+
+
+def summarize_document_with_nuextract(
+    text_excerpt: str | None = None,
+    document_title: str | None = None,
+    model: str = "numind/NuExtract3",
+    base_url: str = "http://localhost:8000/v1",
+    timeout: float = 60.0,
+) -> str | None:
+    """Summarize a document's core purpose in 1-3 sentences with NuExtract,
+    served via vLLM. Same contract as summarize_document_with_llm
+    (Ollama-backed) - see that function's docstring.
+
+    Returns:
+        The summary, or None if undeterminable or the vLLM server is
+        unreachable/its response can't be used.
+    """
+    try:
+        from .nuextract_client import ExtractionError, NuExtractClient
+    except ImportError as e:
+        print(f"  Warning: NuExtract client unavailable ({e})")
+        return None
+
+    template = {"summary": ""}
+    prompt = _build_summary_prompt(text_excerpt or "", document_title)
+
+    try:
+        client = NuExtractClient(base_url=base_url, model=model, timeout_s=int(timeout))
+        result = client.extract(prompt, template)
+        raw_summary = result.get("summary")
+    except ExtractionError as e:
+        print(f"  Warning: NuExtract document summarization failed ({e})")
+        return None
+    except Exception as e:
+        print(f"  Warning: NuExtract document summarization unavailable ({e})")
+        return None
+
+    return _clean_summary_result(raw_summary)

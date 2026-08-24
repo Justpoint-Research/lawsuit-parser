@@ -44,6 +44,13 @@ class DoclingMetadata(BaseModel):
     """Metadata extracted from Docling parsed files."""
 
     title: str | None = None
+    title_candidates: list[str] = Field(
+        default_factory=list,
+        description="Heuristic candidate title lines from page 1 (see "
+                     "utils.find_title_candidates), used to arbitrate the final "
+                     "document title via an LLM - see "
+                     "llm_validation.identify_document_title_with_llm",
+    )
     header: str | None = None
     cm_ecf: CMECFMetadata | None = None
     document_signature: str | None = Field(
@@ -273,6 +280,32 @@ class EntitiesArtifact(BaseModel):
         default_factory=dict,
         description="Count of entities by label"
     )
+
+
+# ============================================================================
+# Stage 3: Document Summary Models
+# ============================================================================
+
+class DocumentSummary(BaseModel):
+    """A short, LLM-generated summary of one document's core purpose - why
+    it exists / what it accomplishes, not a description of its contents."""
+
+    doc_id: str
+    file_name: str
+    summary: str | None = Field(
+        default=None,
+        description="1-3 sentence summary of the document's core purpose, or "
+                     "None if undeterminable or the LLM backend was unreachable",
+    )
+    model: str | None = Field(default=None, description="LLM model tag used to generate the summary")
+
+
+class SummariesArtifact(BaseModel):
+    """Stage 3 output: a short summary for every document in the case."""
+
+    case_id: str
+    extraction_timestamp: datetime = Field(default_factory=datetime.now)
+    documents: list[DocumentSummary] = Field(default_factory=list)
 
 
 # ============================================================================

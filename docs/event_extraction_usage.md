@@ -310,17 +310,6 @@ That's it! The pipeline orchestrator will automatically discover and run the new
 5. **Validation** - Each stage validates its inputs before execution
 6. **Error Handling** - Failures are logged but don't prevent other stages
 
-## Integration with Existing Pipeline
-
-This event extraction pipeline complements the existing extraction pipeline (`lawsuit_parser/extraction/`):
-
-- **Existing pipeline** (Stages 0-4): Focused on NuExtract3-based metadata and GLiNER spans
-- **Event pipeline** (Stages 1-N): Focused on event extraction and timeline construction
-
-Both can coexist and share data:
-- Event pipeline can read canonical text from existing pipeline's `documents/` directory
-- Event pipeline outputs to separate `events/` directory
-
 ## Troubleshooting
 
 ### Case directory not found
