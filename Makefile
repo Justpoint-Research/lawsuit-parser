@@ -1,7 +1,7 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
-        download-sample-cases
+        download-sample-cases download-wayback-files
 
 # The default shell for make
 SHELL := /bin/bash
@@ -37,6 +37,7 @@ help:
 	@echo "  make event-browser     - Start Event Browser Streamlit app (extracted events, actor filtering)"
 	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
 	@echo "  make download_sample_cases - Export sample cases (95, 227, 309, 377, 2303) to data/cases"
+	@echo "  make download-wayback-files - Download archived MDL files from Wayback Machine"
 	@echo ""
 	@echo "Database commands:"
 	@echo "  make sql-proxy-setup   - Download Cloud SQL proxy binary"
@@ -149,6 +150,16 @@ download-sample-cases: ensure-venv
 		$(PYTHON) scripts/export_case.py $$case_id --output-dir data/cases || exit 1; \
 	done
 	@echo "Sample cases downloaded to data/cases"
+
+download-wayback-files: ensure-venv
+	@echo "Downloading archived MDL files from Wayback Machine..."
+	@echo "This will check 396 URLs and download available files"
+	@echo "Estimated time: ~6-8 minutes (with 1.0s delay)"
+	@echo ""
+	uv run scripts/wayback_auto_download.py \
+		-f medical-research-data/MDL_summaries.txt \
+		-d medical-research-data/archived_files \
+		--delay 1.0
 
 # ---------------------------------------------------------------------------
 # Database / Cloud SQL Proxy

@@ -1,0 +1,6 @@
+outs:
+- md5: 95af5a8f967529757b22e02a62814569.dir
+  size: 1395349
+  nfiles: 21
+  hash: md5
+  path: medical-research-data
