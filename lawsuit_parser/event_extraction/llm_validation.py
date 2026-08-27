@@ -36,7 +36,9 @@ what happened, the outcome if stated, and who was involved - "who" is
 constrained to the cluster's own candidate_actors (via a JSON-schema enum
 built per call, see prompts.build_event_response_schema) so the model can
 only name someone GLiNER already resolved, never invent one. Runs in
-Stage 5.
+Stage 5. synthesize_events_batch_with_llm does the same but for several
+clusters in one call (Ollama only - see its own docstring); Stage 5 uses it
+whenever [stage_5].batch_size > 1.
 
 Prompt wording for all of the above lives in config/llm_prompts.toml,
 assembled by .prompts - edit that file to change what's asked, this one to
@@ -77,6 +79,8 @@ from .prompts import (
     TITLE_RESPONSE_SCHEMA,
     VALID_ROLES,
     build_actor_prompt,
+    build_batch_event_prompt,
+    build_batch_event_response_schema,
     build_event_prompt,
     build_event_response_schema,
     build_product_prompt,
@@ -652,6 +656,55 @@ def synthesize_events_with_llm(
         return _clean_event_results(raw_events, candidate_actors, dates)
 
     return _with_fallback("LLM event synthesis", [], call)
+
+
+def synthesize_events_batch_with_llm(
+    *,
+    model: str,
+    base_url: str,
+    items: list[dict],
+    timeout: float = 240.0,
+) -> dict[str, list[dict]]:
+    """Synthesize events for several Stage 4 DateClusters in a single Ollama
+    call instead of one call each - cuts round-trips (and the per-call
+    JSON-schema grammar-compile tax) roughly len(items)-fold, at the cost of
+    a larger prompt/schema per call. Each item's `actors`/`dates` stay
+    enum-constrained to that item's own candidate_actors/dates via its own
+    nested schema (see build_batch_event_response_schema), the same
+    grounding guarantee as the single-cluster path - batching doesn't let
+    the model borrow an actor from a different passage.
+
+    Args:
+        items: dicts with "key" (a short id unique within this call, e.g.
+            "c0"), "citation", "dates", "candidate_actors", and optional
+            "document_title"/"document_summary" - one entry per DateCluster
+            to synthesize, same fields as synthesize_events_with_llm's args
+            plus "key"
+        timeout: Request timeout in seconds for the whole batch call
+
+    Returns:
+        {key: cleaned events list} for every key in `items`. On failure
+        (Ollama unreachable, bad JSON, timeout) every key in the batch maps
+        to [] - the fallback is batch-wide, unlike the single-cluster path's
+        per-cluster fallback, so a failed batch loses every cluster in it.
+    """
+    items = [it for it in items if it["dates"]]
+    if not items:
+        return {}
+
+    def call() -> dict[str, list[dict]]:
+        prompt = build_batch_event_prompt(items)
+        schema = build_batch_event_response_schema(items)
+        content = _call_ollama(model=model, base_url=base_url, prompt=prompt, schema=schema, timeout=timeout)
+        raw = json.loads(content)
+        return {
+            it["key"]: _clean_event_results(
+                raw.get(it["key"], {}).get("events", []), it["candidate_actors"], it["dates"]
+            )
+            for it in items
+        }
+
+    return _with_fallback("LLM batch event synthesis", {it["key"]: [] for it in items}, call)
 
 
 def synthesize_events_with_nuextract(

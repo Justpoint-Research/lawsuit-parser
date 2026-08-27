@@ -1,22 +1,26 @@
 """Event Browser - Browse event_extraction pipeline output with actor filtering.
 
-Same input as scripts/browse_events.py (the Stage 1/2/3 artifacts under
+Same input as scripts/browse_events.py (the Stage 1-5 artifacts under
 data/extraction/<case_id>/events/, written by `make extract-events`),
 presented as an interactive Streamlit app instead of a terminal table. The
 main addition over the CLI script is tag-style filtering: pick one or more
 actors and the document list narrows to documents mentioning them.
 
-A real event/timeline concept (Stage 4+) isn't built yet, so this browses at
-document granularity: one row per scanned document, showing the dates Stage 1
-found in it, the actors Stage 2 linked to it, and the short summary Stage 3
-generated for it.
+The document table browses at document granularity: one row per scanned
+document, showing the dates Stage 1 found in it, the actors Stage 2 linked
+to it, and the short summary Stage 3 generated for it. Below it, a "Case
+graph" section (see lawsuit_parser.event_extraction.graph) renders an
+interactive node-link view of the same case - documents, actors, products,
+document-to-document citations, and (optionally) Stage 5's events - via
+pyvis/vis.js embedded through st.iframe.
 
-NOTE: the table is rendered as a plain HTML <table> via
+NOTE: the document table is rendered as a plain HTML <table> via
 st.markdown(..., unsafe_allow_html=True), never st.dataframe/st.table. In
 this environment those Arrow-backed widgets segfault the whole server
 process - confirmed directly (a bare st.dataframe call crashes with
 SIGSEGV via streamlit.testing.v1.AppTest). See render_html_table in
-lawsuit_parser/event_extraction/browse.py.
+lawsuit_parser/event_extraction/browse.py. The graph view sidesteps this
+entirely - pyvis's HTML/JS output never touches Arrow.
 
 Usage:
     streamlit run apps/event_browser.py
@@ -39,6 +43,7 @@ from lawsuit_parser.event_extraction.browse import (
     load_case_artifacts,
     render_html_table,
 )
+from lawsuit_parser.event_extraction.graph import build_case_graph, filter_to_actors, render_pyvis_html
 
 st.set_page_config(
     page_title="Event Browser",
@@ -49,14 +54,23 @@ st.set_page_config(
 
 
 @st.cache_data(show_spinner=False)
-def _load_summary_and_rows(case_id: str, data_root: str, output_root: str):
+def _load_artifacts(case_id: str, data_root: str, output_root: str):
     """Cached so switching filters doesn't re-read artifacts from disk.
     Cache key is (case_id, data_root, output_root); re-run extraction and
     rerun the app to pick up fresh output for a case."""
-    artifacts = load_case_artifacts(case_id, Path(data_root), Path(output_root))
-    summary = compute_case_summary(artifacts)
-    rows = build_document_rows(artifacts)
-    return summary, rows
+    return load_case_artifacts(case_id, Path(data_root), Path(output_root))
+
+
+@st.cache_data(show_spinner=False)
+def _render_graph_html(case_id: str, data_root: str, output_root: str, include_events: bool, actor_filter: tuple[str, ...]) -> str:
+    """Cached on every input that changes the rendered graph, so toggling
+    something unrelated (e.g. the document-list actor filter, which is a
+    separate control) doesn't re-run pyvis's layout/HTML generation."""
+    artifacts = _load_artifacts(case_id, data_root, output_root)
+    g = build_case_graph(artifacts, include_events=include_events)
+    if actor_filter:
+        g = filter_to_actors(g, set(actor_filter))
+    return render_pyvis_html(g)
 
 
 def render_summary(summary) -> None:
@@ -147,6 +161,31 @@ def render_documents(rows, selected_actors: list[str], match_all: bool) -> None:
                     st.write(f"- [{label}] {text!r} (score={score:.2f})")
 
 
+def render_graph(case_id: str, data_root: str, output_root: str, has_events: bool, selected_actors: list[str]) -> None:
+    st.markdown("### Case graph")
+    st.caption(
+        "Documents (boxes), actors (dots, colored by role), and products (diamonds), linked by "
+        "who's mentioned in which document and which document cites which. Drag nodes, "
+        "scroll to zoom, hover for details."
+    )
+
+    include_events = False
+    if has_events:
+        include_events = st.checkbox(
+            "Include events (Stage 5) as nodes - adds one node per event, linked to its "
+            "source document and involved actors. Can get dense on a large case.",
+            value=False,
+        )
+    else:
+        st.caption("No events.json for this case yet (Stage 5 hasn't run) - showing documents/actors/products only.")
+
+    if selected_actors:
+        st.caption(f"Graph scoped to {len(selected_actors)} selected actor(s) via the filter above.")
+
+    html = _render_graph_html(case_id, data_root, output_root, include_events, tuple(sorted(selected_actors)))
+    st.iframe(html, height=780)
+
+
 def main():
     st.title("\U0001F4C5 Event Browser")
 
@@ -166,10 +205,12 @@ def main():
         case_id = st.selectbox("Case ID", cases)
 
     try:
-        summary, rows = _load_summary_and_rows(case_id, data_root, output_root)
+        artifacts = _load_artifacts(case_id, data_root, output_root)
     except FileNotFoundError as e:
         st.error(f"Missing extraction artifact for {case_id}: {e}")
         st.stop()
+    summary = compute_case_summary(artifacts)
+    rows = build_document_rows(artifacts)
 
     render_summary(summary)
     st.divider()
@@ -190,6 +231,9 @@ def main():
 
     st.divider()
     render_documents(rows, selected_actors, match_all)
+
+    st.divider()
+    render_graph(case_id, data_root, output_root, has_events=artifacts.events is not None, selected_actors=selected_actors)
 
 
 if __name__ == "__main__":

@@ -374,14 +374,24 @@ class DatesArtifact(BaseModel):
 # ============================================================================
 
 class Event(BaseModel):
-    """A legal event synthesized by an LLM from one Stage 4 DateCluster:
-    what happened, its outcome (if stated), and who was involved -
-    constrained to actors/products entities.json already resolved, so this
-    is graph-ready (a node per actor, an edge per event connecting them)."""
+    """One dated occurrence from Stage 4's dates.json, in graph-ready form
+    (actors are canonical names entities.json already resolved, never
+    invented). Populated one of two ways, per [stage_5].use_llm:
+    - False (default, deterministic - no LLM call): `description` is a
+      direct quote (the sentence containing the date, plus one sentence of
+      context on each side), `event_type`/`outcome` are left unset, and
+      `actors` is the source DateCluster's full candidate_actors (no
+      per-event curation).
+    - True: an LLM reads the cluster's citation and fills in `event_type`/
+      `description`/`outcome`, and curates `actors` down to who was
+      actually involved - constrained to candidate_actors via a
+      JSON-schema enum so it can never name someone GLiNER didn't already
+      resolve. Much slower (one LLM call, or one call per batch - see
+      [stage_5].batch_size - per distinct cluster)."""
 
     event_id: str
     cluster_id: str = Field(description="The DateCluster (dates.json) this event was synthesized from")
-    event_type: str
+    event_type: str | None = Field(default=None, description="Only set when [stage_5].use_llm is true")
     description: str
     outcome: str | None = Field(default=None, description="What the event resulted in, if the text states one")
     actors: list[str] = Field(
@@ -403,3 +413,31 @@ class EventTimeline(BaseModel):
     case_id: str
     extraction_timestamp: datetime = Field(default_factory=datetime.now)
     events: list[Event] = Field(default_factory=list)
+
+
+class StampDate(BaseModel):
+    """A Stage 4 DateEntry whose text couldn't be located anywhere in its
+    document's canonical body text - in practice, almost always a page
+    header/footer/e-filing stamp date (Stage 1's docling_header/
+    docling_first_page sources - see
+    stage_1_metadata._extract_from_docling), which is deliberately scanned
+    only once, from page 1, rather than re-processed on every page it
+    repeats on, and so has no counterpart anywhere in the canonical body
+    text. With nothing to quote or synthesize an Event from, Stage 5 sets
+    it aside here instead of putting it in events.json."""
+
+    cluster_id: str
+    doc_id: str
+    date_id: str
+    text: str
+    parsed_date: datetime | None = None
+    date_type: str
+    source: str
+
+
+class StampDatesArtifact(BaseModel):
+    """Stage 5 output: dates set aside as stamp-only (see StampDate)."""
+
+    case_id: str
+    extraction_timestamp: datetime = Field(default_factory=datetime.now)
+    dates: list[StampDate] = Field(default_factory=list)

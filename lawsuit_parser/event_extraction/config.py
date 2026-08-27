@@ -142,6 +142,21 @@ class Stage5Config(BaseModel):
     )
     llm_model: str = Field(description="Model tag/name for the selected llm_backend")
     llm_base_url: str = Field(description="Server URL for the selected llm_backend")
+    use_llm: bool = Field(
+        default=False,
+        description="False (default): build each Event deterministically, no LLM call - "
+                     "description is a direct quote (date's sentence +/-1 sentence of context), "
+                     "event_type/outcome unset, actors is the cluster's full candidate_actors. "
+                     "True: LLM-synthesize event_type/description/outcome and curate actors - "
+                     "much slower, see config/event_extraction.toml.",
+    )
+    batch_size: int = Field(
+        default=1,
+        description="Synthesize this many distinct date clusters per LLM call instead of one "
+                     "call each (Ollama backend only, ignored for 'nuextract'). Only used when "
+                     "use_llm is true. See config/event_extraction.toml for the full tradeoff "
+                     "explanation.",
+    )
 
 
 class EventExtractionConfig(BaseModel):

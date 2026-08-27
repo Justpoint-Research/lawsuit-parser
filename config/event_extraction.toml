@@ -130,12 +130,36 @@ max_chars = 8000
 # actors from entities.json) has no settings of its own yet.
 
 [stage_5]
-# Synthesize an Event (what happened, outcome, who was involved) for each
-# Stage 4 date cluster via an LLM. Falls back to no events for a cluster if
-# the backend server isn't reachable, so this is safe to leave on.
+# Build an Event for each Stage 4 date cluster. Falls back to no events for
+# a cluster if the backend server isn't reachable (use_llm=true only), so
+# this is safe to leave on either way.
 synthesize_events = true
 
-# Same backend options as [stage_1] above.
+# false (default, no LLM call - fast): each Event's description is a
+# direct quote - the sentence containing the date, plus one sentence of
+# context on each side - and actors is the cluster's full candidate_actors
+# list, uncurated. event_type/outcome are left unset.
+# true: an LLM reads each cluster and fills in event_type/description/
+# outcome and curates actors down to who was actually involved. Much
+# slower - a full case can be ~250+ eligible clusters, and even batched
+# (see batch_size below) this was still ~1h/case with qwen3:30b-a3b, so
+# only turn this on deliberately, not as a default full-batch run.
+use_llm = false
+
+# Same backend options as [stage_1] above. Only used when use_llm = true.
 llm_backend = "ollama"
 llm_model = "qwen3:30b-a3b"
 llm_base_url = "http://localhost:11434"
+
+# Synthesize this many distinct date clusters per LLM call instead of one
+# call each (Ollama backend only - ignored for "nuextract", which always
+# does one call per cluster). Only used when use_llm = true. Each cluster
+# keeps its own actors/dates enum-grounding inside the batch, so this
+# doesn't loosen the "never invent an actor" guarantee - it only cuts
+# round-trips and the per-call JSON-schema grammar-compile tax. Raising it
+# trades per-call latency for fewer, larger calls; too high risks the
+# model losing track of which passage a date/actor belongs to, or blowing
+# past the model's context window on cases with long citations. 1 = old
+# one-call-per-cluster behavior (still deduped first, see Stage 5's own
+# cache_hits logging).
+batch_size = 6

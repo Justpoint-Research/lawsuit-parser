@@ -117,6 +117,21 @@ def build_event_response_schema(candidate_actors: list[str], candidate_dates: li
     }
 
 
+def build_batch_event_response_schema(items: list[dict]) -> dict:
+    """Response schema for a batched event_synthesis call (Stage 5): one
+    call synthesizing events for several DateClusters at once, each still
+    keyed and enum-constrained independently via build_event_response_schema
+    - batching only cuts LLM round-trips, it doesn't loosen the per-cluster
+    actors/dates grounding.
+
+    Args:
+        items: dicts with "key" (a short id unique within this call, e.g.
+            "c0"), "candidate_actors", "dates" (see build_event_response_schema)
+    """
+    properties = {item["key"]: build_event_response_schema(item["candidate_actors"], item["dates"]) for item in items}
+    return {"type": "object", "properties": properties, "required": list(properties.keys())}
+
+
 @lru_cache(maxsize=1)
 def _templates() -> dict:
     path = Path(__file__).resolve().parent.parent.parent / "config" / "llm_prompts.toml"
@@ -211,4 +226,35 @@ def build_event_prompt(
         sections.append(t["no_actors_line"])
     sections.append(t["passage_line"].format(citation=citation))
     sections.append(t["closing"])
+    return _render(sections)
+
+
+def build_batch_event_prompt(items: list[dict]) -> str:
+    """Prompt for a batched event_synthesis call: several passages in one
+    message, each labeled with its own key and reusing the same per-passage
+    lines as build_event_prompt, followed by one shared closing instruction
+    covering every passage.
+
+    Args:
+        items: dicts with "key", "citation", "dates", "candidate_actors",
+            and optional "document_title"/"document_summary" - same fields
+            as build_event_prompt's args, plus "key"
+    """
+    t = _templates()["event_synthesis"]
+    tb = _templates()["event_synthesis_batch"]
+    sections = [tb["intro"]]
+    for item in items:
+        block = [tb["passage_header"].format(key=item["key"])]
+        if item.get("document_title"):
+            block.append(t["title_line"].format(document_title=repr(item["document_title"])))
+        if item.get("document_summary"):
+            block.append(t["summary_line"].format(document_summary=item["document_summary"]))
+        block.append(t["dates_line"].format(dates=", ".join(repr(d) for d in item["dates"])))
+        if item["candidate_actors"]:
+            block.append(t["actors_line"].format(candidate_actors=", ".join(repr(a) for a in item["candidate_actors"])))
+        else:
+            block.append(t["no_actors_line"])
+        block.append(t["passage_line"].format(citation=item["citation"]))
+        sections.append(_render(block))
+    sections.append(tb["closing"])
     return _render(sections)

@@ -23,7 +23,16 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .models import ActorsArtifact, EntitiesArtifact, Entity, ExtractedDate, FilesScan, SummariesArtifact
+from .models import (
+    ActorsArtifact,
+    DatesArtifact,
+    EntitiesArtifact,
+    Entity,
+    EventTimeline,
+    ExtractedDate,
+    FilesScan,
+    SummariesArtifact,
+)
 
 # Loose year match, tolerating a trailing "s" for decades ("1920s", "mid-1960s")
 # - used only to give a rough min/max on top of raw date strings, which are
@@ -111,6 +120,8 @@ class CaseArtifacts:
         products: ActorsArtifact,
         entities: EntitiesArtifact,
         summaries: SummariesArtifact | None = None,
+        dates: DatesArtifact | None = None,
+        events: EventTimeline | None = None,
     ):
         self.case_id = case_id
         self.caption = caption
@@ -122,6 +133,12 @@ class CaseArtifacts:
         # optional here - a case extracted before it existed still browses,
         # just without a Summary column.
         self.summaries = summaries
+        # Stage 4/5 (date clustering, event synthesis) are newer still and
+        # optional here too - see graph.py, the only current consumer. A
+        # case that's only had Stage 1/2/3 run still browses fine, just
+        # without event nodes in the graph view.
+        self.dates = dates
+        self.events = events
 
 
 def _events_dir(case_id: str, output_root: Path) -> Path:
@@ -154,10 +171,13 @@ def load_case_artifacts(case_id: str, data_root: Path, output_root: Path) -> Cas
     (see `make extract-events`) - summaries.json alone is optional, since
     Stage 3 postdates cases already extracted with just Stage 1/2."""
     events_dir = _events_dir(case_id, output_root)
-    try:
-        summaries = _load_artifact(events_dir, "summaries.json", SummariesArtifact)
-    except FileNotFoundError:
-        summaries = None
+
+    def _optional(filename: str, model_cls):
+        try:
+            return _load_artifact(events_dir, filename, model_cls)
+        except FileNotFoundError:
+            return None
+
     return CaseArtifacts(
         case_id=case_id,
         caption=read_case_caption(case_id, data_root),
@@ -165,7 +185,9 @@ def load_case_artifacts(case_id: str, data_root: Path, output_root: Path) -> Cas
         actors=_load_artifact(events_dir, "actors.json", ActorsArtifact),
         products=_load_artifact(events_dir, "products.json", ActorsArtifact),
         entities=_load_artifact(events_dir, "entities.json", EntitiesArtifact),
-        summaries=summaries,
+        summaries=_optional("summaries.json", SummariesArtifact),
+        dates=_optional("dates.json", DatesArtifact),
+        events=_optional("events.json", EventTimeline),
     )
 
 
