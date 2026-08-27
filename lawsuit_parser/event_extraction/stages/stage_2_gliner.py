@@ -12,10 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rapidfuzz import fuzz
 from tqdm import tqdm
 
 from ..gliner_runner import GlinerRunner
-from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
 from ..models import (
     Actor,
@@ -28,6 +28,14 @@ from ..models import (
 from ..utils import split_sentences
 
 logger = logging.getLogger(__name__)
+
+# Minimum rapidfuzz token_set_ratio (0-100) for an entity's text to be
+# considered a match against a known actor's name/alias in _link_to_actor.
+# Chosen from spot-checking real name variants (e.g. "Jonathan Sedgh" vs.
+# roster name "JONATHAN MICHAEL SEDGH" scores 100 on token_set_ratio,
+# since it's a token subset) against generic role phrases like "lead
+# counsel" or "the attorney" (which score well under 50).
+_FUZZY_MATCH_THRESHOLD = 85.0
 
 
 class Stage2GLiNER(BaseStage):
@@ -94,7 +102,7 @@ class Stage2GLiNER(BaseStage):
             logger.info(f"\n→ Processing {doc_metadata.file_name} (doc_id={doc_id})...")
 
             # Load canonical text
-            text = self._load_document_text(case_id, doc_id, doc_metadata.file_name)
+            text = self.load_document_text(case_id, doc_id, doc_metadata.file_name)
             if not text:
                 logger.warning(f"  Warning: No text found for {doc_id}, skipping")
                 continue
@@ -266,50 +274,6 @@ class Stage2GLiNER(BaseStage):
         events_dir = self.get_events_dir(case_id)
         return [events_dir / "entities.json"]
 
-    def _load_document_text(self, case_id: str, doc_id: str, file_name: str) -> str:
-        """Load canonical text for a document.
-
-        Args:
-            case_id: Case identifier
-            doc_id: Document ID
-            file_name: Original file name
-
-        Returns:
-            Document text
-        """
-        # Try canonical text from existing pipeline
-        text_path = self.get_documents_dir(case_id) / f"{doc_id}.txt"
-        if text_path.exists():
-            return self.load_text(text_path)
-
-        # Try to load from parsed files, alongside the PDF in documents/
-        pdf_path = self.get_documents_dir(case_id) / file_name
-        parsed_path = pdf_path.with_suffix(".json")
-
-        if parsed_path.exists():
-            try:
-                parsed_data = self.load_json(parsed_path)
-                if "raw_text" in parsed_data:
-                    return parsed_data["raw_text"]
-                if "paragraphs" in parsed_data:
-                    return "\n\n".join(parsed_data["paragraphs"])
-            except Exception as e:
-                logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
-
-        # Try Docling JSON, saved under docling/documents/ - see
-        # lawsuit_parser.parsers.batch.get_docling_dir.
-        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
-        if docling_path.exists():
-            try:
-                docling_data = self.load_json(docling_path)
-                if "texts" in docling_data:
-                    texts = [item.get("text", "") for item in docling_data["texts"]]
-                    return "\n".join(texts)
-            except Exception as e:
-                logger.warning(f"  Warning: Failed to load Docling JSON: {e}")
-
-        return ""
-
     def _segment_text(self, text: str, max_length: int = 1000, overlap: int = 100) -> list[dict[str, Any]]:
         """Segment text into overlapping chunks for GLiNER processing.
 
@@ -467,27 +431,53 @@ class Stage2GLiNER(BaseStage):
     def _link_to_actor(self, entity_text: str, label: str, gliner_config: GLiNERConfig) -> str | None:
         """Link an entity to a known actor if possible.
 
+        Tries, in order:
+        1. Exact match of `label` to a *named* actor's own dynamic label
+           (GLiNER predicted e.g. "judge (Brendan T. Lantry)" directly) -
+           the strongest possible signal.
+        2. Fuzzy (lowercased, rapidfuzz token_set_ratio) match of
+           `entity_text` against every named actor's canonical name/aliases,
+           so a real name GLiNER extracted under a generic role label (e.g.
+           "Jonathan Sedgh" under the fallback "attorney" label, rather than
+           the roster's own "counsel (JONATHAN MICHAEL SEDGH)" label) still
+           links to that actor instead of falling through to a bare role.
+        3. If `label` matches a generic role placeholder (Attorney/Witness/
+           Judge/Court Clerk - see GENERIC_ACTOR_ROLES) and neither of the
+           above matched, return the entity's own text. This is a person
+           genuinely absent from the case roster; better to surface the
+           name GLiNER found than collapse them to the bare role.
+
         Args:
             entity_text: Entity text
             label: Entity label
             gliner_config: GLiNER configuration
 
         Returns:
-            Canonical actor name if linked, None otherwise
+            Canonical actor name, the entity's own text, or None if this
+            entity isn't actor-shaped at all (e.g. a static label like
+            "monetary amount").
         """
-        # Check if label is a dynamic actor label
         for actor in gliner_config.actors:
-            if label == actor.gliner_label:
+            if actor.is_named and label == actor.gliner_label:
                 return actor.canonical_name
 
-            # Also check if entity matches actor name or aliases
-            entity_lower = entity_text.lower()
-            if entity_lower == actor.canonical_name.lower():
-                return actor.canonical_name
+        entity_lower = entity_text.lower()
+        best_actor: Actor | None = None
+        best_score = 0.0
+        for actor in gliner_config.actors:
+            if not actor.is_named:
+                continue
+            for name in (actor.canonical_name, *actor.aliases):
+                score = fuzz.token_set_ratio(entity_lower, name.lower())
+                if score > best_score:
+                    best_score = score
+                    best_actor = actor
+        if best_actor is not None and best_score >= _FUZZY_MATCH_THRESHOLD:
+            return best_actor.canonical_name
 
-            for alias in actor.aliases:
-                if entity_lower == alias.lower():
-                    return actor.canonical_name
+        for actor in gliner_config.actors:
+            if not actor.is_named and label == actor.gliner_label:
+                return entity_text
 
         return None
 

@@ -342,20 +342,16 @@ def clip_text(text: str, max_len: int) -> str:
     return compact[: max_len - 1].rsplit(" ", 1)[0] + "..."
 
 
-def format_actors(actors: list[str], max_actors: int = 4) -> str:
+def format_actors(actors: list[str]) -> str:
     if not actors:
         return "-"
-    if len(actors) > max_actors:
-        return ", ".join(actors[:max_actors]) + f" (+{len(actors) - max_actors} more)"
     return ", ".join(actors)
 
 
-def format_dates(dates: list[tuple[str, str]], max_dates: int = 3) -> str:
+def format_dates(dates: list[tuple[str, str]]) -> str:
     if not dates:
         return "-"
-    shown = [f"{text} ({dtype})" for dtype, text in dates[:max_dates]]
-    suffix = f" (+{len(dates) - max_dates} more)" if len(dates) > max_dates else ""
-    return ", ".join(shown) + suffix
+    return ", ".join(f"{text} ({dtype})" for dtype, text in dates)
 
 
 def document_rows_to_table_dicts(rows: list[DocumentRow]) -> list[dict]:

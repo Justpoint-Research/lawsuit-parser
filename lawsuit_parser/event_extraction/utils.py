@@ -6,10 +6,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pypdfium2 as pdfium
 from nltk.tokenize.punkt import PunktParameters, PunktSentenceTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def parse_date_loosely(text: str) -> datetime | None:
+    """Best-effort parse of a raw date string (e.g. "03/03/2026", "August
+    25, 2026") into a real datetime. Used both for Stage 1's document sort
+    order and Stage 4's date parsing - the stored ExtractedDate.text values
+    themselves remain unparsed surface strings regardless."""
+    try:
+        ts = pd.to_datetime(text, errors="coerce")
+    except Exception:
+        return None
+    return None if pd.isna(ts) else ts.to_pydatetime()
 
 
 def extract_dates_from_text(text: str, patterns: list[str]) -> list[tuple[str, int, int]]:
@@ -505,6 +518,47 @@ def split_sentences(text: str) -> list[tuple[int, int]]:
     if not text.strip():
         return []
     return list(_get_sentence_tokenizer().span_tokenize(text))
+
+
+_PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
+
+
+def split_paragraphs(text: str) -> list[tuple[int, int]]:
+    """Split text into paragraphs, returning their (char_start, char_end)
+    spans - same span-based contract as split_sentences. A paragraph is a
+    run of text between blank-line separators; each span is trimmed to its
+    actual content (surrounding whitespace excluded), and a run that's
+    blank after trimming (consecutive separators) is skipped.
+
+    Used to group same-paragraph dates/entities (see Stage4Dates) - a
+    coarser grain than split_sentences' per-sentence context window.
+
+    Args:
+        text: Document text
+
+    Returns:
+        List of (start, end) offsets, one per paragraph, in document order.
+        Empty if text is blank.
+    """
+    if not text.strip():
+        return []
+
+    spans = []
+    pos = 0
+    for m in _PARAGRAPH_SPLIT_RE.finditer(text):
+        spans.append((pos, m.start()))
+        pos = m.end()
+    spans.append((pos, len(text)))
+
+    trimmed = []
+    for start, end in spans:
+        segment = text[start:end]
+        stripped = segment.strip()
+        if not stripped:
+            continue
+        lstrip_len = len(segment) - len(segment.lstrip())
+        trimmed.append((start + lstrip_len, start + lstrip_len + len(stripped)))
+    return trimmed
 
 
 # ============================================================================

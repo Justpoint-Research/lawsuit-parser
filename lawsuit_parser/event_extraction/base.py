@@ -8,6 +8,8 @@ from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
+from ..parsers.batch import get_docling_dir
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -181,6 +183,50 @@ class BaseStage(ABC):
 
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
+
+    def load_document_text(self, case_id: str, doc_id: str, file_name: str) -> str:
+        """Load canonical text for a document: a cached <doc_id>.txt if one
+        exists, else a legacy parsed JSON sidecar next to the PDF, else
+        Docling's own parsed JSON. Shared by every stage that needs a
+        document's full text (Stage 2/3/4) - previously three near-identical
+        private copies of this same lookup.
+
+        Args:
+            case_id: Case identifier
+            doc_id: Document ID
+            file_name: Original file name
+
+        Returns:
+            Document text, or "" if none of the sources are available
+        """
+        text_path = self.get_documents_dir(case_id) / f"{doc_id}.txt"
+        if text_path.exists():
+            return self.load_text(text_path)
+
+        pdf_path = self.get_documents_dir(case_id) / file_name
+        parsed_path = pdf_path.with_suffix(".json")
+
+        if parsed_path.exists():
+            try:
+                parsed_data = self.load_json(parsed_path)
+                if "raw_text" in parsed_data:
+                    return parsed_data["raw_text"]
+                if "paragraphs" in parsed_data:
+                    return "\n\n".join(parsed_data["paragraphs"])
+            except Exception as e:
+                logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
+
+        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+        if docling_path.exists():
+            try:
+                docling_data = self.load_json(docling_path)
+                if "texts" in docling_data:
+                    texts = [item.get("text", "") for item in docling_data["texts"]]
+                    return "\n".join(texts)
+            except Exception as e:
+                logger.warning(f"  Warning: Failed to load Docling JSON: {e}")
+
+        return ""
 
     @abstractmethod
     def run(self, case_id: str, config: dict[str, Any]) -> None:

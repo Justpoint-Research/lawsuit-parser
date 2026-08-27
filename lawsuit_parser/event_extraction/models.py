@@ -309,27 +309,97 @@ class SummariesArtifact(BaseModel):
 
 
 # ============================================================================
-# Future: Event Timeline Models (placeholder)
+# Stage 4: Date Clustering Models
+# ============================================================================
+
+class DateEntry(BaseModel):
+    """One ExtractedDate (see Stage 1), carried into Stage 4 with a real
+    parsed value alongside its unparsed surface text."""
+
+    date_id: str
+    text: str = Field(description="Raw date text, unchanged from Stage 1's ExtractedDate.text")
+    parsed_date: datetime | None = Field(
+        default=None,
+        description="Best-effort real parse of `text` (see utils.parse_date_loosely) - "
+                     "None if the string didn't parse as a date at all",
+    )
+    date_type: str = Field(description="Carried over from ExtractedDate.type (filing_date/event_date/...)")
+    source: str = Field(description="Carried over from ExtractedDate.source")
+    doc_id: str
+    char_start: int | None = None
+    char_end: int | None = None
+
+
+class DateCluster(BaseModel):
+    """Every DateEntry found in one document paragraph (see
+    utils.split_paragraphs), plus the actors/products already linked to
+    entities GLiNER found in that same paragraph - the unit Stage 5 turns
+    into one or more Event records.
+
+    Dates with no char offset (e.g. a confirmation notice's timestamp,
+    never regex-matched against document text - see Stage1Metadata) can't
+    be placed in a paragraph; each becomes its own single-date cluster with
+    no citation/candidate_actors.
+    """
+
+    cluster_id: str
+    doc_id: str
+    char_start: int | None = None
+    char_end: int | None = None
+    citation: str | None = Field(
+        default=None,
+        description="The paragraph's text, with each contained date substring wrapped in ** "
+                     "markers - same convention as Entity.context",
+    )
+    dates: list[DateEntry] = Field(default_factory=list)
+    candidate_actors: list[str] = Field(
+        default_factory=list,
+        description="Canonical linked_actor names of entities.json entries found in this same "
+                     "paragraph (people, defendants, products - never a static/unlinked label). "
+                     "Stage 5 constrains its LLM's 'who was involved' answer to this list.",
+    )
+
+
+class DatesArtifact(BaseModel):
+    """Stage 4 output: every case date, parsed and grouped into
+    same-paragraph clusters with their candidate actors."""
+
+    case_id: str
+    extraction_timestamp: datetime = Field(default_factory=datetime.now)
+    clusters: list[DateCluster] = Field(default_factory=list)
+
+
+# ============================================================================
+# Stage 5: Event Timeline Models
 # ============================================================================
 
 class Event(BaseModel):
-    """A legal event extracted from the case."""
+    """A legal event synthesized by an LLM from one Stage 4 DateCluster:
+    what happened, its outcome (if stated), and who was involved -
+    constrained to actors/products entities.json already resolved, so this
+    is graph-ready (a node per actor, an edge per event connecting them)."""
 
     event_id: str
+    cluster_id: str = Field(description="The DateCluster (dates.json) this event was synthesized from")
     event_type: str
     description: str
-    actors: list[str] = Field(default_factory=list, description="Actors involved in the event")
-    temporal_expression: str | None = None
-    date_parsed: str | None = None
+    outcome: str | None = Field(default=None, description="What the event resulted in, if the text states one")
+    actors: list[str] = Field(
+        default_factory=list,
+        description="Canonical linked_actor names involved - each one is a name from the "
+                     "source DateCluster's candidate_actors, never LLM-invented",
+    )
+    dates: list[str] = Field(default_factory=list, description="Raw date text(s) (DateEntry.text) this event covers")
+    date_parsed: datetime | None = Field(default=None, description="Earliest parsed date among `dates`, if any parsed")
     source_doc_id: str
-    char_start: int
-    char_end: int
+    char_start: int | None = None
+    char_end: int | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
 
 class EventTimeline(BaseModel):
-    """Complete timeline of events for a case."""
+    """Stage 5 output: complete timeline of events for a case."""
 
     case_id: str
+    extraction_timestamp: datetime = Field(default_factory=datetime.now)
     events: list[Event] = Field(default_factory=list)
-    timeline_generated: datetime = Field(default_factory=datetime.now)

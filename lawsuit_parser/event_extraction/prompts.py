@@ -80,6 +80,43 @@ SUMMARY_RESPONSE_SCHEMA = {
 }
 
 
+def build_event_response_schema(candidate_actors: list[str], candidate_dates: list[str]) -> dict:
+    """Response schema for event_synthesis, built per call rather than as a
+    module-level constant: `actors`/`dates` are constrained via JSON-schema
+    `enum` to exactly this DateCluster's own candidate_actors/dates, so the
+    model can only pick from names entities.json already resolved (or dates
+    already found in this passage) - never invent one. An empty
+    candidate_actors list (no known actor found nearby) uses maxItems=0
+    instead of enum, since an empty `enum` array is invalid JSON Schema.
+    """
+    actors_items = {"type": "string", "enum": candidate_actors} if candidate_actors else {"type": "string"}
+    actors_schema: dict = {"type": "array", "items": actors_items}
+    if not candidate_actors:
+        actors_schema["maxItems"] = 0
+
+    return {
+        "type": "object",
+        "properties": {
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string"},
+                        "description": {"type": "string"},
+                        "outcome": {"type": "string"},
+                        "actors": actors_schema,
+                        "dates": {"type": "array", "items": {"type": "string", "enum": candidate_dates}},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["event_type", "description", "actors", "dates", "confidence"],
+                },
+            },
+        },
+        "required": ["events"],
+    }
+
+
 @lru_cache(maxsize=1)
 def _templates() -> dict:
     path = Path(__file__).resolve().parent.parent.parent / "config" / "llm_prompts.toml"
@@ -150,5 +187,28 @@ def build_summary_prompt(text_excerpt: str, document_title: str | None) -> str:
         sections.append(t["title_line"].format(document_title=repr(document_title)))
     if text_excerpt:
         sections.append(t["text_excerpt_line"].format(text_excerpt=text_excerpt))
+    sections.append(t["closing"])
+    return _render(sections)
+
+
+def build_event_prompt(
+    citation: str,
+    dates: list[str],
+    candidate_actors: list[str],
+    document_title: str | None,
+    document_summary: str | None,
+) -> str:
+    t = _templates()["event_synthesis"]
+    sections = [t["intro"]]
+    if document_title:
+        sections.append(t["title_line"].format(document_title=repr(document_title)))
+    if document_summary:
+        sections.append(t["summary_line"].format(document_summary=document_summary))
+    sections.append(t["dates_line"].format(dates=", ".join(repr(d) for d in dates)))
+    if candidate_actors:
+        sections.append(t["actors_line"].format(candidate_actors=", ".join(repr(a) for a in candidate_actors)))
+    else:
+        sections.append(t["no_actors_line"])
+    sections.append(t["passage_line"].format(citation=citation))
     sections.append(t["closing"])
     return _render(sections)

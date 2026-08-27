@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 from tqdm import tqdm
 
 from ...parsers.batch import get_docling_dir
@@ -52,6 +51,7 @@ from ..utils import (
     find_title_candidates,
     normalize_party_name,
     parse_caption_block,
+    parse_date_loosely,
 )
 
 # Generic role placeholders added to the roster when no named individual
@@ -750,7 +750,7 @@ class Stage1Metadata(BaseStage):
                 # here) but still runs the (unconditional) CM/ECF header parse.
                 docling_meta, _, _ = self._extract_from_docling(docling_data, date_patterns=[])
                 if docling_meta and docling_meta.cm_ecf and docling_meta.cm_ecf.filing_date:
-                    sort_date = self._parse_date_loosely(docling_meta.cm_ecf.filing_date)
+                    sort_date = parse_date_loosely(docling_meta.cm_ecf.filing_date)
             except Exception:
                 pass
 
@@ -759,17 +759,6 @@ class Stage1Metadata(BaseStage):
             sort_date = pdf_meta.get("created")
 
         return (sort_date is None, sort_date or datetime.max, pdf_path.name)
-
-    @staticmethod
-    def _parse_date_loosely(text: str) -> datetime | None:
-        """Best-effort parse of a raw date string (e.g. "03/03/2026",
-        "August 25, 2026") into a real datetime, for sorting only - the
-        stored ExtractedDate.text values remain unparsed surface strings."""
-        try:
-            ts = pd.to_datetime(text, errors="coerce")
-        except Exception:
-            return None
-        return None if pd.isna(ts) else ts.to_pydatetime()
 
     def _extract_from_docling(
         self, docling_data: dict, date_patterns: list[str]

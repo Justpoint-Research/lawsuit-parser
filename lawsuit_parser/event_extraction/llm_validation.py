@@ -29,6 +29,15 @@ summarize_document_with_llm/summarize_document_with_nuextract produce a
 accomplishes), given a longer text excerpt and the identified title as a
 hint. Runs in Stage 3.
 
+synthesize_events_with_llm/synthesize_events_with_nuextract read one
+Stage 4 DateCluster (a document paragraph, its date(s), and the actors/
+products entities.json already resolved nearby) and produce Event records:
+what happened, the outcome if stated, and who was involved - "who" is
+constrained to the cluster's own candidate_actors (via a JSON-schema enum
+built per call, see prompts.build_event_response_schema) so the model can
+only name someone GLiNER already resolved, never invent one. Runs in
+Stage 5.
+
 Prompt wording for all of the above lives in config/llm_prompts.toml,
 assembled by .prompts - edit that file to change what's asked, this one to
 change how it's asked (backend I/O) or how a response is turned into a
@@ -68,6 +77,8 @@ from .prompts import (
     TITLE_RESPONSE_SCHEMA,
     VALID_ROLES,
     build_actor_prompt,
+    build_event_prompt,
+    build_event_response_schema,
     build_product_prompt,
     build_summary_prompt,
     build_title_prompt,
@@ -546,3 +557,143 @@ def summarize_document_with_nuextract(
         return _clean_summary_result(result.get("summary"))
 
     return _with_fallback("NuExtract document summarization", None, call)
+
+
+# ============================================================================
+# Event synthesis (Stage 5)
+# ============================================================================
+
+
+def _clean_event_results(raw_events: list[dict], candidate_actors: list[str], candidate_dates: list[str]) -> list[dict]:
+    """Validate/clean the model's raw `events` list: drop entries missing
+    an event_type/description, drop an entry whose `dates` don't match any
+    of this cluster's own date texts (nothing to anchor it to), and filter
+    `actors` down to entries actually on the candidate list - a safety net
+    behind the JSON-schema `enum` constraint (see build_event_response_schema),
+    since the "nuextract" backend has no equivalent constraint to enforce
+    grounding at the format level."""
+    valid_actors = set(candidate_actors)
+    valid_dates = set(candidate_dates)
+
+    results = []
+    for event in raw_events:
+        event_type = str(event.get("event_type") or "").strip()
+        description = str(event.get("description") or "").strip()
+        if not event_type or not description:
+            continue
+
+        dates = [d for d in (str(d).strip() for d in (event.get("dates") or [])) if d in valid_dates]
+        if not dates:
+            continue
+
+        outcome = str(event.get("outcome") or "").strip() or None
+        actors = [a for a in (str(a).strip() for a in (event.get("actors") or [])) if a in valid_actors]
+
+        try:
+            confidence = float(event.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+
+        results.append({
+            "event_type": event_type,
+            "description": description,
+            "outcome": outcome,
+            "actors": actors,
+            "dates": dates,
+            "confidence": confidence,
+        })
+    return results
+
+
+def synthesize_events_with_llm(
+    *,
+    model: str,
+    base_url: str,
+    citation: str,
+    dates: list[str],
+    candidate_actors: list[str],
+    document_title: str | None = None,
+    document_summary: str | None = None,
+    timeout: float = 90.0,
+) -> list[dict]:
+    """Synthesize event(s) from one Stage 4 DateCluster with a local Ollama
+    model: what happened on the date(s) found in this paragraph, the
+    outcome if stated, and who was involved - grounded to entities.json by
+    constraining `actors` to `candidate_actors` via a JSON-schema `enum`
+    built per call (see build_event_response_schema), so the model can only
+    name someone entities.json already resolved, never invent one.
+
+    Args:
+        citation: Paragraph text, with each date substring marked (see
+            DateCluster.citation)
+        dates: Raw date text(s) found in this paragraph (DateEntry.text)
+        candidate_actors: Canonical linked_actor names of entities.json
+            entries found in the same paragraph
+        document_title: The document's identified title/type, for context
+        document_summary: The document's Stage 3 summary, for context
+        model: Ollama model tag (must already be pulled)
+        base_url: Ollama server URL
+        timeout: Request timeout in seconds
+
+    Returns:
+        List of dicts with "event_type", "description", "outcome",
+        "actors", "dates", "confidence" - empty if no event was identified
+        or the model is unreachable/its response can't be used.
+    """
+    if not dates:
+        return []
+
+    def call() -> list[dict]:
+        prompt = build_event_prompt(citation, dates, candidate_actors, document_title, document_summary)
+        schema = build_event_response_schema(candidate_actors, dates)
+        content = _call_ollama(model=model, base_url=base_url, prompt=prompt, schema=schema, timeout=timeout)
+        raw_events = json.loads(content).get("events", [])
+        return _clean_event_results(raw_events, candidate_actors, dates)
+
+    return _with_fallback("LLM event synthesis", [], call)
+
+
+def synthesize_events_with_nuextract(
+    *,
+    model: str,
+    base_url: str,
+    citation: str,
+    dates: list[str],
+    candidate_actors: list[str],
+    document_title: str | None = None,
+    document_summary: str | None = None,
+    timeout: float = 90.0,
+) -> list[dict]:
+    """Synthesize event(s) from one Stage 4 DateCluster with NuExtract,
+    served via vLLM. Same contract as synthesize_events_with_llm
+    (Ollama-backed) - see that function's docstring. NuExtract has no
+    format-level enum constraint, so grounding relies entirely on the
+    prompt plus _clean_event_results' post-hoc filtering.
+
+    Returns:
+        List of event dicts, empty if no event was identified or the vLLM
+        server is unreachable/its response can't be used.
+    """
+    if not dates:
+        return []
+
+    template = {
+        "events": [
+            {
+                "event_type": "",
+                "description": "",
+                "outcome": "",
+                "actors": [""],
+                "dates": [""],
+                "confidence": "0.0-1.0",
+            }
+        ]
+    }
+
+    def call() -> list[dict]:
+        prompt = build_event_prompt(citation, dates, candidate_actors, document_title, document_summary)
+        result = _call_nuextract(model=model, base_url=base_url, prompt=prompt, template=template, timeout=timeout)
+        return _clean_event_results(result.get("events", []), candidate_actors, dates)
+
+    return _with_fallback("NuExtract event synthesis", [], call)

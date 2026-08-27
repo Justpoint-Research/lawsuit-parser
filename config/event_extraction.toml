@@ -125,3 +125,17 @@ llm_base_url = "http://localhost:11434"
 # 1's title excerpt, since a document's core purpose often isn't stated on
 # page 1 alone (e.g. a complaint's factual background, a motion's argument).
 max_chars = 8000
+
+# Stage 4 (date clustering - parsing + same-paragraph grouping + candidate
+# actors from entities.json) has no settings of its own yet.
+
+[stage_5]
+# Synthesize an Event (what happened, outcome, who was involved) for each
+# Stage 4 date cluster via an LLM. Falls back to no events for a cluster if
+# the backend server isn't reachable, so this is safe to leave on.
+synthesize_events = true
+
+# Same backend options as [stage_1] above.
+llm_backend = "ollama"
+llm_model = "qwen3:30b-a3b"
+llm_base_url = "http://localhost:11434"

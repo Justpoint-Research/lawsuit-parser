@@ -121,6 +121,29 @@ class Stage3Config(BaseModel):
     )
 
 
+class Stage4Config(BaseModel):
+    """Stage 4 (Date Clustering) configuration."""
+
+
+class Stage5Config(BaseModel):
+    """Stage 5 (Event Synthesis) configuration."""
+
+    synthesize_events: bool = Field(
+        default=True,
+        description="Synthesize an Event (what happened, outcome, who was involved) for each "
+                    "Stage 4 date cluster via an LLM. Falls back to no events for a cluster if "
+                    "the backend server isn't reachable, so this is safe to leave on.",
+    )
+    llm_backend: str = Field(
+        default="ollama",
+        description="'ollama' (local Ollama server) or 'nuextract' (this repo's existing "
+                     "vLLM-served NuExtract client). Switching backend also requires setting "
+                     "llm_model/llm_base_url to match - see config/event_extraction.toml.",
+    )
+    llm_model: str = Field(description="Model tag/name for the selected llm_backend")
+    llm_base_url: str = Field(description="Server URL for the selected llm_backend")
+
+
 class EventExtractionConfig(BaseModel):
     """Complete configuration for event extraction pipeline."""
 
@@ -128,6 +151,8 @@ class EventExtractionConfig(BaseModel):
     stage_1: Stage1Config = Field(default_factory=Stage1Config)
     stage_2: Stage2Config = Field(default_factory=Stage2Config)
     stage_3: Stage3Config = Field(default_factory=Stage3Config)
+    stage_4: Stage4Config = Field(default_factory=Stage4Config)
+    stage_5: Stage5Config = Field(default_factory=Stage5Config)
 
 
 def load_config(config_path: Path | None = None) -> EventExtractionConfig:

@@ -58,3 +58,17 @@ text_excerpt_line = "Document text, for context:\n{text_excerpt}"
 closing = """
 Return a 1-3 sentence summary. Return an empty string if the text doesn't give you enough to summarize - do not guess or invent one.
 """
+
+[event_synthesis]
+intro = """
+You are analyzing one passage from a legal filing to identify what actually happened on the specific date(s) found in it, for building a case timeline/graph.
+"""
+title_line = "This document's identified title/type: {document_title}"
+summary_line = "This document's overall purpose: {document_summary}"
+dates_line = "Date(s) found in this passage: {dates}"
+actors_line = "People, organizations, and products already identified near this passage - name only people/organizations/products from this exact list as involved, never one you don't see here: {candidate_actors}"
+no_actors_line = "No specific people, organizations, or products were identified near this passage - do not name anyone as involved."
+passage_line = "Passage text (each date is marked with ** ):\n{citation}"
+closing = """
+For each date above that corresponds to an actual event in this case's own history - not a citation to unrelated case law, a form's boilerplate date range, or garbled OCR text - return one event: a short event_type (e.g. "filing", "hearing", "service of process", "deposition", "order issued", "settlement"), a 1-2 sentence description of what happened, the outcome if the passage states one (omit it otherwise), which of the listed people/organizations/products were involved, and which of the listed dates it corresponds to (a single event can cover more than one date if the passage describes them together). Assign a confidence from 0 to 1. Return an empty events list if none of the dates correspond to an identifiable case event.
+"""

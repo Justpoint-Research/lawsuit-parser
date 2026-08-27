@@ -12,7 +12,6 @@ from typing import Any
 
 from tqdm import tqdm
 
-from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
 from ..llm_validation import summarize_document_with_llm, summarize_document_with_nuextract
 from ..models import DocumentSummary, FilesScan, SummariesArtifact
@@ -65,7 +64,7 @@ class Stage3Summary(BaseStage):
             pbar.set_postfix_str(doc.file_name)
             logger.info(f"\n→ Summarizing {doc.file_name} (doc_id={doc.doc_id})...")
 
-            text = self._load_document_text(case_id, doc.doc_id, doc.file_name)
+            text = self.load_document_text(case_id, doc.doc_id, doc.file_name)
             if not text:
                 logger.warning(f"  Warning: No text found for {doc.doc_id}, skipping")
                 summaries.append(DocumentSummary(doc_id=doc.doc_id, file_name=doc.file_name))
@@ -121,45 +120,3 @@ class Stage3Summary(BaseStage):
             List of output file paths
         """
         return [self.get_events_dir(case_id) / "summaries.json"]
-
-    def _load_document_text(self, case_id: str, doc_id: str, file_name: str) -> str:
-        """Load canonical text for a document (same lookup order as Stage 1
-        and Stage 2's text loaders): a cached <doc_id>.txt, then a legacy
-        parsed JSON sidecar, then Docling's parsed JSON.
-
-        Args:
-            case_id: Case identifier
-            doc_id: Document ID
-            file_name: Original file name
-
-        Returns:
-            Document text, or "" if none of the sources are available
-        """
-        text_path = self.get_documents_dir(case_id) / f"{doc_id}.txt"
-        if text_path.exists():
-            return self.load_text(text_path)
-
-        pdf_path = self.get_documents_dir(case_id) / file_name
-        parsed_path = pdf_path.with_suffix(".json")
-
-        if parsed_path.exists():
-            try:
-                parsed_data = self.load_json(parsed_path)
-                if "raw_text" in parsed_data:
-                    return parsed_data["raw_text"]
-                if "paragraphs" in parsed_data:
-                    return "\n\n".join(parsed_data["paragraphs"])
-            except Exception as e:
-                logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
-
-        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
-        if docling_path.exists():
-            try:
-                docling_data = self.load_json(docling_path)
-                if "texts" in docling_data:
-                    texts = [item.get("text", "") for item in docling_data["texts"]]
-                    return "\n".join(texts)
-            except Exception as e:
-                logger.warning(f"  Warning: Failed to load Docling JSON: {e}")
-
-        return ""
