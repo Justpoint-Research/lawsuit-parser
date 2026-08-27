@@ -1,7 +1,7 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
-        download-sample-cases download-wayback-files
+        download-sample-cases download-wayback-files parse-pdfs
 
 # The default shell for make
 SHELL := /bin/bash
@@ -52,6 +52,7 @@ help:
 	@echo "  make run-vllm          - Start vLLM server with NuExtract3 (port 8000)"
 	@echo "  make check-vllm        - Check if vLLM server is running"
 	@echo "  make check-gpu         - Check if GPU/CUDA is available for parsing"
+	@echo "  make parse-pdfs        - Parse all PDFs in data/cases with Docling (case_* and mdl-*)"
 	@echo "  make extract-events    - Run event extraction on all cases in data/cases"
 
 # ---------------------------------------------------------------------------
@@ -288,6 +289,11 @@ check-vllm:
 check-gpu: ensure-venv
 	@echo "Checking GPU/CUDA availability for PDF parsing..."
 	@$(PYTHON) scripts/check_gpu.py
+
+parse-pdfs: ensure-venv
+	@echo "Parsing all PDFs in data/cases with Docling (case_* and mdl-*)..."
+	@echo "Skipping files already parsed (--skip-existing); full log: pdf_parsing.log"
+	$(PYTHON) scripts/parse_all_pdfs.py --skip-existing
 
 extract-events: ensure-venv
 	@echo "Running event extraction on all cases..."

@@ -5,11 +5,14 @@ e-filing confirmation notices. Produces actors.json, products.json,
 files_scan.json, and gliner_config.json artifacts.
 """
 
+import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from tqdm import tqdm
 
 from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
@@ -18,6 +21,7 @@ from ..llm_validation import (
     identify_document_title_with_nuextract,
     identify_products_with_llm,
     identify_products_with_nuextract,
+    unload_ollama_model,
     validate_actors_with_llm,
     validate_actors_with_nuextract,
 )
@@ -47,7 +51,6 @@ from ..utils import (
     find_party_aliases,
     find_title_candidates,
     normalize_party_name,
-    normalize_role,
     parse_caption_block,
 )
 
@@ -70,6 +73,8 @@ _PRODUCT_CONTEXT_KEYWORDS = (
     "manufactured", "ingredient", "exposure", "toxic", "hazard", "product liability",
 )
 _PRODUCT_CONTEXT_MIN_SCORE = 3
+
+logger = logging.getLogger(__name__)
 
 
 class Stage1Metadata(BaseStage):
@@ -123,9 +128,9 @@ class Stage1Metadata(BaseStage):
             case_id: Case identifier
             config: Stage-specific configuration
         """
-        print(f"\n{'='*60}")
-        print(f"Stage 1: Metadata Extraction - {case_id}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Stage 1: Metadata Extraction - {case_id}")
+        logger.info(f"{'='*60}\n")
 
         # Extract configuration
         extract_from_database = config.get("extract_from_database", True)
@@ -137,8 +142,8 @@ class Stage1Metadata(BaseStage):
         # Shared by every LLM-assisted step below (title/actor/product
         # identification): which backend, model, and endpoint to use.
         backend = config.get("llm_backend", "ollama")
-        llm_model = config.get("llm_model", "gemma4:e4b")
-        llm_base_url = config.get("llm_base_url", "http://localhost:11434")
+        llm_model = config["llm_model"]
+        llm_base_url = config["llm_base_url"]
         identify_title = (
             identify_document_title_with_nuextract if backend == "nuextract" else identify_document_title_with_llm
         )
@@ -153,7 +158,7 @@ class Stage1Metadata(BaseStage):
 
         # 1. Extract from database (if enabled)
         if extract_from_database:
-            print("→ Extracting metadata from database...")
+            logger.info("→ Extracting metadata from database...")
             database_metadata = self._extract_from_database(case_id)
             if database_metadata:
                 for plaintiff in database_metadata.plaintiff:
@@ -179,18 +184,20 @@ class Stage1Metadata(BaseStage):
         confirmations_dir = self.get_confirmations_dir(case_id)
         confirmation_files = list(confirmations_dir.glob("*.json")) if confirmations_dir.exists() else []
 
-        print(f"  Found {len(pdf_files)} PDF files")
-        print(f"  Found {len(docling_files)} Docling files")
-        print(f"  Found {len(parsed_files)} parsed JSON files")
-        print(f"  Found {len(confirmation_files)} confirmation files")
+        logger.info(f"  Found {len(pdf_files)} PDF files")
+        logger.info(f"  Found {len(docling_files)} Docling files")
+        logger.info(f"  Found {len(parsed_files)} parsed JSON files")
+        logger.info(f"  Found {len(confirmation_files)} confirmation files")
 
         # 3. Extract metadata for each document
         doc_id_counter = 0
-        for pdf_path in pdf_files:
+        pbar = tqdm(pdf_files, desc="Stage 1: metadata", unit="doc", file=sys.__stderr__)
+        for pdf_path in pbar:
             doc_id = f"doc_{doc_id_counter:03d}"
             doc_id_counter += 1
+            pbar.set_postfix_str(pdf_path.name)
 
-            print(f"\n→ Processing {pdf_path.name} (doc_id={doc_id})...")
+            logger.info(f"\n→ Processing {pdf_path.name} (doc_id={doc_id})...")
 
             doc_metadata = DocumentMetadata(
                 doc_id=doc_id,
@@ -199,7 +206,7 @@ class Stage1Metadata(BaseStage):
 
             # Extract PDF metadata (if enabled)
             if extract_from_pdfs:
-                print(f"  Extracting PDF metadata...")
+                logger.info(f"  Extracting PDF metadata...")
                 pdf_meta = extract_pdf_metadata(pdf_path)
                 if pdf_meta:
                     doc_metadata.pdf_metadata = PDFMetadata(**pdf_meta)
@@ -212,10 +219,10 @@ class Stage1Metadata(BaseStage):
                     try:
                         docling_data = self.load_json(docling_path)
                     except Exception as e:
-                        print(f"  Warning: Failed to load Docling JSON: {e}")
+                        logger.warning(f"  Warning: Failed to load Docling JSON: {e}")
 
                 if docling_data is not None:
-                    print(f"  Extracting Docling metadata...")
+                    logger.info(f"  Extracting Docling metadata...")
                     docling_meta, docling_dates, first_page_text = self._extract_from_docling(docling_data, date_patterns)
                     if docling_meta:
                         doc_metadata.docling_metadata = docling_meta
@@ -231,7 +238,7 @@ class Stage1Metadata(BaseStage):
                         if identify_document_titles and (
                             first_page_text or docling_meta.title_candidates or docling_meta.title
                         ):
-                            print(f"  Identifying document title (backend={backend})...")
+                            logger.info(f"  Identifying document title (backend={backend})...")
                             title = identify_title(
                                 text_excerpt=first_page_text[:3000],
                                 candidates=docling_meta.title_candidates,
@@ -241,7 +248,7 @@ class Stage1Metadata(BaseStage):
                             )
                             if title:
                                 doc_metadata.document_title = title
-                                print(f"  Title: {title}")
+                                logger.info(f"  Title: {title}")
 
                         # Extract CM/ECF (or NYSCEF) metadata if available
                         if docling_meta.cm_ecf:
@@ -287,7 +294,7 @@ class Stage1Metadata(BaseStage):
                         ):
                             doc_metadata.document_title = legacy_title
                     except Exception as e:
-                        print(f"  Warning: Failed to load parsed JSON: {e}")
+                        logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
 
             # Extract metadata from the matching e-filing confirmation notice
             # (same file name under confirmations/ - see get_confirmations_dir).
@@ -305,11 +312,11 @@ class Stage1Metadata(BaseStage):
                             confirmation_data.get("paragraphs", [])
                         )
                     except Exception as e:
-                        print(f"  Warning: Failed to load confirmation metadata: {e}")
+                        logger.warning(f"  Warning: Failed to load confirmation metadata: {e}")
                         details = {}
 
                     if details:
-                        print(f"  Extracting confirmation metadata...")
+                        logger.info(f"  Extracting confirmation metadata...")
                         doc_metadata.confirmation_metadata = ConfirmationMetadata(**details)
                         if not doc_metadata.filed_by and details.get("filer_name"):
                             doc_metadata.filed_by = details["filer_name"]
@@ -346,7 +353,7 @@ class Stage1Metadata(BaseStage):
 
             # Extract dates from document
             if date_patterns and text:
-                print(f"  Extracting dates from text...")
+                logger.info(f"  Extracting dates from text...")
                 dates = extract_dates_from_text(text, date_patterns)
                 for date_text, start, end in dates:
                     extracted_date = ExtractedDate(
@@ -375,7 +382,7 @@ class Stage1Metadata(BaseStage):
                     ))
                 if doc_metadata.referenced_documents:
                     cited = sorted({r.doc_number for r in doc_metadata.referenced_documents})
-                    print(f"  Cites document number(s): {', '.join(cited)}")
+                    logger.info(f"  Cites document number(s): {', '.join(cited)}")
 
             # Litigation-caption hint for product identification below (see
             # utils.find_litigation_captions): coordinated/MDL proceedings
@@ -386,15 +393,15 @@ class Stage1Metadata(BaseStage):
 
             documents.append(doc_metadata)
 
-        print(f"\n→ Extracted metadata for {len(documents)} documents")
-        print(f"→ Discovered {len(actors)} actors")
-        print(f"→ Found {len(all_dates)} dates")
+        logger.info(f"\n→ Extracted metadata for {len(documents)} documents")
+        logger.info(f"→ Discovered {len(actors)} actors")
+        logger.info(f"→ Found {len(all_dates)} dates")
 
         # 3.5. Resolve cross-document references now that every document's
         # own document_number (its "signature") is known, and build the
         # reverse index (referenced_by) so a document can be looked up by
         # what cites it, not just what it cites.
-        print("\n→ Resolving cross-document references...")
+        logger.info("\n→ Resolving cross-document references...")
         docs_by_id = {doc.doc_id: doc for doc in documents}
         doc_number_to_id = {doc.document_number: doc.doc_id for doc in documents if doc.document_number}
         resolved_count = 0
@@ -408,13 +415,13 @@ class Stage1Metadata(BaseStage):
                 target = docs_by_id[target_id]
                 if doc.doc_id not in target.referenced_by:
                     target.referenced_by.append(doc.doc_id)
-        print(f"  Resolved {resolved_count} references to documents in this case")
+        logger.info(f"  Resolved {resolved_count} references to documents in this case")
 
         caption, court, case_type = self._load_case_context(case_id)
 
         # 4. Validate the discovered actor roster with an LLM (optional)
         if config.get("validate_actors_with_llm", True) and actors:
-            print(f"\n→ Validating actor roster with LLM (backend={backend})...")
+            logger.info(f"\n→ Validating actor roster with LLM (backend={backend})...")
             validator = validate_actors_with_nuextract if backend == "nuextract" else validate_actors_with_llm
             actors = validator(
                 actors,
@@ -423,7 +430,7 @@ class Stage1Metadata(BaseStage):
                 model=llm_model,
                 base_url=llm_base_url,
             )
-            print(f"  Roster after validation: {len(actors)} actors")
+            logger.info(f"  Roster after validation: {len(actors)} actors")
 
         # 4.5. Identify the accused product(s) - the medical substance/drug/
         # medical device/cosmetic product the plaintiff blames for harm,
@@ -435,7 +442,7 @@ class Stage1Metadata(BaseStage):
         # harm (see _select_product_context_document).
         products: list[Actor] = []
         if config.get("extract_products", True):
-            print("\n→ Identifying accused product(s)...")
+            logger.info("\n→ Identifying accused product(s)...")
             sample_doc_id, sample_text = self._select_product_context_document(documents, doc_texts)
             defendant_names = [a.canonical_name for a in actors if a.role == "defendant"]
 
@@ -465,10 +472,10 @@ class Stage1Metadata(BaseStage):
                     attributed_to=result["attributed_to"],
                 ))
                 attribution = f" (attributed to {', '.join(result['attributed_to'])})" if result["attributed_to"] else ""
-                print(f"  {result['product_type']}: {result['name']}{attribution}")
+                logger.info(f"  {result['product_type']}: {result['name']}{attribution}")
 
             if not products:
-                print("  No accused product identified")
+                logger.info("  No accused product identified")
 
         products_artifact = ActorsArtifact(case_id=case_id, actors=products)
         self.save_artifact(case_id, "products.json", products_artifact)
@@ -499,14 +506,20 @@ class Stage1Metadata(BaseStage):
         self.save_artifact(case_id, "files_scan.json", files_scan)
 
         # 7. Generate GLiNER config from the combined actor + product roster
-        print("\n→ Generating GLiNER configuration...")
+        logger.info("\n→ Generating GLiNER configuration...")
         combined_roster = ActorsArtifact(case_id=case_id, actors=actors + products)
         gliner_config = self._generate_gliner_config(combined_roster, config)
         self.save_artifact(case_id, "gliner_config.json", gliner_config)
 
-        print(f"\n{'='*60}")
-        print(f"Stage 1 Complete!")
-        print(f"{'='*60}\n")
+        # Ollama keeps llm_model resident in GPU memory for a few minutes
+        # after our last call above - release it now rather than leaving it
+        # to compete with Stage 2/GLiNER's own model for VRAM right after.
+        if backend == "ollama":
+            unload_ollama_model(llm_model, llm_base_url)
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Stage 1 Complete!")
+        logger.info(f"{'='*60}\n")
 
     def validate_inputs(self, case_id: str) -> bool:
         """Check if case directory exists.
@@ -519,7 +532,7 @@ class Stage1Metadata(BaseStage):
         """
         case_dir = self.get_case_dir(case_id)
         if not case_dir.exists():
-            print(f"Error: Case directory not found: {case_dir}")
+            logger.error(f"Error: Case directory not found: {case_dir}")
             return False
         return True
 
@@ -643,69 +656,68 @@ class Stage1Metadata(BaseStage):
         return best_doc_id, text[start:start + max_chars]
 
     def _extract_from_database(self, case_id: str) -> DatabaseMetadata | None:
-        """Extract metadata from PostgreSQL database.
+        """Extract case-level metadata from the "scrapping" Cloud SQL
+        instance's public.court_cases table (port 5433 - see README.md;
+        config/database.toml's default port 5432 reaches an unrelated
+        "hidden-danger" database with no court tables at all).
+
+        court_cases has no plaintiff/defendant columns and there is no
+        separate "parties" table in this schema (see
+        docs/court_tables_relationships.md) - party names come from caption
+        parsing elsewhere in this stage, not the database.
 
         Args:
-            case_id: Case identifier
+            case_id: Case identifier, e.g. "case_227" - the numeric suffix
+                is court_cases.id (its integer primary key), not the same
+                as court_cases.case_id (the court's own text docket number).
 
         Returns:
-            Database metadata, or None if database not available
+            Database metadata, or None if undeterminable/unavailable
         """
+        prefix = "case_"
+        if not case_id.startswith(prefix) or not case_id[len(prefix):].isdigit():
+            logger.info(f"  Skipping database lookup: {case_id!r} doesn't match the expected 'case_<id>' form")
+            return None
+        numeric_id = int(case_id[len(prefix):])
+
         try:
             from ...utils.db import fetch_from_postgres
 
-            # Try to query case metadata (adjust query based on actual schema)
-            # This is a placeholder - adjust based on your actual database schema
             query = f"""
                 SELECT
-                    case_number,
+                    case_id,
                     court,
-                    status,
-                    filed_date
-                FROM cases
-                WHERE case_id = '{case_id}'
+                    case_status,
+                    case_received_date
+                FROM public.court_cases
+                WHERE id = {numeric_id}
                 LIMIT 1
             """
 
             try:
-                df = fetch_from_postgres(query)
+                df = fetch_from_postgres(query, port=5433)
                 if df.empty:
-                    print(f"  No database record found for case {case_id}")
+                    logger.info(f"  No database record found for case {case_id}")
                     return None
 
                 row = df.iloc[0]
                 metadata = DatabaseMetadata(
-                    case_number=row.get("case_number"),
+                    case_number=row.get("case_id"),
                     court=row.get("court"),
-                    status=row.get("status"),
-                    case_filed_date=str(row.get("filed_date")) if row.get("filed_date") else None,
+                    status=row.get("case_status"),
+                    case_filed_date=str(row.get("case_received_date")) if row.get("case_received_date") else None,
                 )
 
-                # Query parties (adjust based on actual schema)
-                party_query = f"""
-                    SELECT name, role
-                    FROM parties
-                    WHERE case_id = '{case_id}'
-                """
-                party_df = fetch_from_postgres(party_query)
-
-                for _, party_row in party_df.iterrows():
-                    role = normalize_role(party_row["role"])
-                    if role == "plaintiff":
-                        metadata.plaintiff.append(party_row["name"])
-                    elif role == "defendant":
-                        metadata.defendant.append(party_row["name"])
-
-                print(f"  ✓ Loaded database metadata for {case_id}")
+                logger.info(f"  ✓ Loaded database metadata for {case_id}")
                 return metadata
 
             except Exception as e:
-                print(f"  Database query failed: {e}")
-                print(f"  (This is OK if database is not set up or schema differs)")
+                logger.error(f"  Database query failed: {e}")
+                logger.info(f"  (This is OK if database is not set up or schema differs)")
                 return None
 
         except ImportError:
-            print(f"  Database module not available")
+            logger.info(f"  Database module not available")
             return None
 
     def _document_sort_key(self, pdf_path: Path) -> tuple[bool, datetime, str]:
@@ -868,7 +880,7 @@ class Stage1Metadata(BaseStage):
             )
 
         except Exception as e:
-            print(f"  Warning: Failed to extract Docling metadata: {e}")
+            logger.warning(f"  Warning: Failed to extract Docling metadata: {e}")
             return None, [], ""
 
     def _extract_caption_actors(self, docling_data: dict) -> dict[str, list[str]]:
@@ -890,7 +902,7 @@ class Stage1Metadata(BaseStage):
             ]
             return parse_caption_block(first_page_lines)
         except Exception as e:
-            print(f"  Warning: Failed to parse caption block: {e}")
+            logger.warning(f"  Warning: Failed to parse caption block: {e}")
             return {"plaintiffs": [], "defendants": []}
 
     def _get_document_text(self, pdf_path: Path, doc_id: str) -> str:

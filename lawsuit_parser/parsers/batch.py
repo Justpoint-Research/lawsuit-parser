@@ -28,7 +28,10 @@ def find_all_pdfs(data_dir: Path, case_id: str | None = None) -> list[Path]:
 
     Args:
         data_dir: Root data directory
-        case_id: Optional case ID to filter (e.g., "104")
+        case_id: Optional case directory to filter to - either a full
+            directory name (e.g. "case_104", "mdl-1358") or a bare case
+            number (e.g. "104", kept for backward compatibility - implies
+            "case_104")
 
     Returns:
         List of PDF file paths
@@ -38,11 +41,14 @@ def find_all_pdfs(data_dir: Path, case_id: str | None = None) -> list[Path]:
     if not cases_dir.exists():
         raise FileNotFoundError(f"Cases directory not found: {cases_dir}")
 
-    # Find PDF files
+    # Find PDF files. No case_id filter processes every case directory
+    # (case_* NYSCEF exports and mdl-* MDL docket scrapes alike), not just
+    # case_*.
     if case_id:
-        pattern = f"case_{case_id}/**/*.pdf"
+        dir_name = case_id if (cases_dir / case_id).is_dir() else f"case_{case_id}"
+        pattern = f"{dir_name}/**/*.pdf"
     else:
-        pattern = "case_*/**/*.pdf"
+        pattern = "*/**/*.pdf"
 
     pdfs = sorted(cases_dir.glob(pattern))
 

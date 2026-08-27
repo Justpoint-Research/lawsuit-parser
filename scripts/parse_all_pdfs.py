@@ -96,7 +96,8 @@ def quiet_console(log_path: Path):
     '--case-id',
     type=str,
     default=None,
-    help='Process only specific case ID (e.g., 104)'
+    help='Process only a specific case directory: a bare case number (e.g. 104, '
+         'implies case_104), or a full directory name (e.g. case_104, mdl-1358)'
 )
 @click.option(
     '--skip-existing',

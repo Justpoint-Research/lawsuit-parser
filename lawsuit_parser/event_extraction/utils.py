@@ -1,5 +1,6 @@
 """Utility functions for event extraction pipeline."""
 
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Any
 
 import pypdfium2 as pdfium
 from nltk.tokenize.punkt import PunktParameters, PunktSentenceTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 def extract_dates_from_text(text: str, patterns: list[str]) -> list[tuple[str, int, int]]:
@@ -312,7 +315,7 @@ def extract_pdf_metadata(pdf_path: Path) -> dict[str, Any]:
             doc.close()
 
     except Exception as e:
-        print(f"Warning: Failed to extract PDF metadata from {pdf_path}: {e}")
+        logger.warning(f"Failed to extract PDF metadata from {pdf_path}: {e}")
         return {}
 
 

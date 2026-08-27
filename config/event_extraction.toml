@@ -35,10 +35,12 @@ validate_actors_with_llm = true
 # "nuextract" (this repo's existing vLLM-served NuExtract client - see
 # lawsuit_parser.event_extraction.nuextract_client). Switching backend means
 # also swapping llm_model/llm_base_url below to the matching pair:
-#   ollama:    llm_model = "gemma4:e4b"        llm_base_url = "http://localhost:11434"
+#   ollama:    llm_model = "qwen3:30b-a3b"      llm_base_url = "http://localhost:11434"
 #   nuextract: llm_model = "numind/NuExtract3"  llm_base_url = "http://localhost:8000/v1"
+# To swap to a different Ollama model, just change llm_model to any tag
+# already pulled locally (`ollama pull <tag>`) - no code changes needed.
 llm_backend = "ollama"
-llm_model = "gemma4:e4b"
+llm_model = "qwen3:30b-a3b"
 llm_base_url = "http://localhost:11434"
 
 # Identify the medical substance/drug/medical device/cosmetic product the
@@ -116,7 +118,7 @@ summarize_documents = true
 
 # Same backend options as [stage_1] above.
 llm_backend = "ollama"
-llm_model = "gemma4:e4b"
+llm_model = "qwen3:30b-a3b"
 llm_base_url = "http://localhost:11434"
 
 # Maximum characters of document text sent to the LLM - larger than Stage

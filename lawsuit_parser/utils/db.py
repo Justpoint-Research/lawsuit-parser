@@ -115,6 +115,7 @@ def fetch_from_postgres(
     query: str,
     output_filename: str | None = None,
     force_refresh: bool = False,
+    port: int | None = None,
 ) -> pd.DataFrame:
     """Run a query against PostgreSQL using config + secrets files.
 
@@ -126,6 +127,9 @@ def fetch_from_postgres(
         query: SQL query to execute.
         output_filename: If set, also save the result to ``data/{output_filename}.parquet``.
         force_refresh: If True, ignore any cached result and re-query the database.
+        port: Override the port from config/database.toml - e.g. 5433 to reach
+            the "scrapping" Cloud SQL instance (court case data) instead of the
+            default "hidden-danger" instance on port 5432. See README.md.
 
     Returns:
         DataFrame with the query results.
@@ -138,6 +142,8 @@ def fetch_from_postgres(
         df = pd.read_parquet(cache_path)
     else:
         params = load_db_config()
+        if port is not None:
+            params["port"] = port
         url = URL.create(
             drivername="postgresql+psycopg",
             username=params["user"],

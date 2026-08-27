@@ -25,7 +25,6 @@ import argparse
 import logging
 import os
 import sys
-from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from pathlib import Path
 
@@ -37,19 +36,25 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from lawsuit_parser.event_extraction import EventExtractionPipeline
 
+# tqdm progress bars are pinned to the real terminal (not this stream), so
+# they stay visible even while it is redirected to the log file below.
+CONSOLE = sys.stderr
 
-def setup_logging_suppression(log_file: Path):
-    """Suppress noisy library output and redirect to log file."""
-    # Configure logging to suppress verbose libraries
+
+def setup_logging(log_file: Path) -> None:
+    """Route all pipeline logging (and captured stdlib warnings) to a log
+    file only, so the console stays free for the tqdm progress bar and the
+    handful of print() calls in this script.
+    """
     logging.basicConfig(
-        level=logging.WARNING,
+        level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-        ]
+        handlers=[logging.FileHandler(log_file)],
     )
+    logging.captureWarnings(True)
 
-    # Suppress specific noisy loggers
+    # Noisy third-party libraries: keep their routine chatter out of the
+    # log file too, only their errors are worth keeping.
     for logger_name in [
         'transformers',
         'torch',
@@ -67,47 +72,23 @@ def setup_logging_suppression(log_file: Path):
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 
-class LogFile:
-    """Context manager to redirect stdout/stderr to a log file while preserving console output."""
+class RedirectStderrToLog:
+    """Redirect raw (non-logging) stderr output - stray library prints,
+    C-extension warnings - into the log file for the duration of a run,
+    without touching stdout or the real terminal tqdm writes to."""
 
-    def __init__(self, log_path: Path, console_output=True):
+    def __init__(self, log_path: Path):
         self.log_path = log_path
-        self.console_output = console_output
         self.log_file = None
-        self.old_stdout = None
         self.old_stderr = None
 
     def __enter__(self):
         self.log_file = open(self.log_path, 'a')
-        self.old_stdout = sys.stdout
         self.old_stderr = sys.stderr
-
-        # Create a writer that writes to both log file and console
-        class TeeWriter:
-            def __init__(self, log_file, console, write_console):
-                self.log_file = log_file
-                self.console = console
-                self.write_console = write_console
-
-            def write(self, message):
-                self.log_file.write(message)
-                self.log_file.flush()
-                if self.write_console:
-                    self.console.write(message)
-                    self.console.flush()
-
-            def flush(self):
-                self.log_file.flush()
-                if self.write_console:
-                    self.console.flush()
-
-        # Redirect stderr to log file only (library warnings/errors)
-        sys.stderr = TeeWriter(self.log_file, self.old_stderr, False)
-
+        sys.stderr = self.log_file
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        sys.stdout = self.old_stdout
         sys.stderr = self.old_stderr
         if self.log_file:
             self.log_file.close()
@@ -201,21 +182,20 @@ Examples:
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / f"extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-    setup_logging_suppression(log_file)
+    setup_logging(log_file)
 
-    print(f"Library output will be logged to: {log_file}")
-    print()
+    print(f"Logging to: {log_file}", file=CONSOLE)
 
     # Initialize pipeline
     try:
-        with LogFile(log_file):
+        with RedirectStderrToLog(log_file):
             pipeline = EventExtractionPipeline(
                 config_path=args.config,
                 data_root=args.data_root,
                 output_root=args.output_root,
             )
     except Exception as e:
-        print(f"Error initializing pipeline: {e}")
+        print(f"Error initializing pipeline: {e}", file=CONSOLE)
         return 1
 
     # Determine which cases to process
@@ -228,25 +208,25 @@ Examples:
         cases_dir = data_root / "cases"
 
         if not cases_dir.exists():
-            print(f"Error: Cases directory not found: {cases_dir}")
+            print(f"Error: Cases directory not found: {cases_dir}", file=CONSOLE)
             return 1
 
         # Find all case directories
-        case_ids = [d.name for d in cases_dir.iterdir() if d.is_dir() and d.name.startswith("case_")]
+        case_ids = [d.name for d in cases_dir.iterdir() if d.is_dir()]
 
         if not case_ids:
-            print(f"No cases found in {cases_dir}")
+            print(f"No cases found in {cases_dir}", file=CONSOLE)
             return 1
 
         case_ids.sort()
-        print(f"Found {len(case_ids)} cases to process: {', '.join(case_ids)}\n")
+        print(f"Found {len(case_ids)} cases to process", file=CONSOLE)
 
     # Show status if requested
     if args.status:
         for case_id in case_ids:
-            print(f"\n{'='*60}")
-            print(f"Status for {case_id}")
-            print('='*60)
+            print(f"\n{'='*60}", file=CONSOLE)
+            print(f"Status for {case_id}", file=CONSOLE)
+            print('='*60, file=CONSOLE)
             pipeline.print_status(case_id)
         return 0
 
@@ -255,16 +235,13 @@ Examples:
     failures = []
 
     try:
-        # Use tqdm for progress bar when processing multiple cases
-        pbar = tqdm(case_ids, desc="Processing cases", unit="case") if len(case_ids) > 1 else case_ids
+        pbar = tqdm(case_ids, desc="Cases", unit="case", file=CONSOLE)
 
         for case_id in pbar:
-            if len(case_ids) > 1:
-                pbar.set_description(f"Processing {case_id}")
+            pbar.set_postfix_str(case_id)
 
             try:
-                # Redirect library output to log file
-                with LogFile(log_file):
+                with RedirectStderrToLog(log_file):
                     if args.stages:
                         success = pipeline.run_stages(
                             case_id,
@@ -279,51 +256,38 @@ Examples:
 
                 if success:
                     successes.append(case_id)
-                    msg = f"✓ {case_id} completed successfully"
-                    if len(case_ids) > 1:
-                        tqdm.write(msg)
-                    else:
-                        print(f"\n{msg}")
-                        print(f"Outputs saved to: {pipeline.config.paths.output_root}/{case_id}/events/")
+                    tqdm.write(
+                        f"✓ {case_id} completed successfully -> "
+                        f"{pipeline.config.paths.output_root}/{case_id}/events/",
+                        file=CONSOLE,
+                    )
                 else:
                     failures.append(case_id)
-                    msg = f"✗ {case_id} failed"
-                    if len(case_ids) > 1:
-                        tqdm.write(msg)
-                    else:
-                        print(f"\n{msg}")
+                    tqdm.write(f"✗ {case_id} failed - see {log_file}", file=CONSOLE)
 
             except Exception as e:
                 failures.append(case_id)
-                msg = f"✗ {case_id} error: {e}"
-                if len(case_ids) > 1:
-                    tqdm.write(msg)
-                else:
-                    print(f"\n{msg}")
-                    import traceback
-                    traceback.print_exc()
+                logging.getLogger(__name__).exception(f"{case_id} raised an unhandled exception")
+                tqdm.write(f"✗ {case_id} error: {e} - see {log_file}", file=CONSOLE)
 
-        # Close progress bar
-        if len(case_ids) > 1 and hasattr(pbar, 'close'):
-            pbar.close()
+        pbar.close()
 
-        # Print summary if processing multiple cases
-        if len(case_ids) > 1:
-            print(f"\n{'='*60}")
-            print("Summary")
-            print('='*60)
-            print(f"Successful: {len(successes)}/{len(case_ids)}")
-            if successes:
-                print(f"  {', '.join(successes)}")
-            print(f"Failed: {len(failures)}/{len(case_ids)}")
-            if failures:
-                print(f"  {', '.join(failures)}")
-            print(f"\nFull log available at: {log_file}")
+        # Print summary
+        print(f"\n{'='*60}", file=CONSOLE)
+        print("Summary", file=CONSOLE)
+        print('='*60, file=CONSOLE)
+        print(f"Successful: {len(successes)}/{len(case_ids)}", file=CONSOLE)
+        if successes:
+            print(f"  {', '.join(successes)}", file=CONSOLE)
+        print(f"Failed: {len(failures)}/{len(case_ids)}", file=CONSOLE)
+        if failures:
+            print(f"  {', '.join(failures)}", file=CONSOLE)
+        print(f"\nFull log available at: {log_file}", file=CONSOLE)
 
         return 0 if not failures else 1
 
     except KeyboardInterrupt:
-        print("\n\nPipeline interrupted by user.")
+        print("\n\nPipeline interrupted by user.", file=CONSOLE)
         return 130
 
 

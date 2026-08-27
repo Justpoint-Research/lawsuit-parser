@@ -232,8 +232,8 @@ def parse_pdf_document(
 
             # Extract tables if enabled
             if extract_tables and 'table' in item_type.lower():
-                if hasattr(item, 'to_dict'):
-                    tables.append(item.to_dict())
+                if hasattr(item, 'model_dump'):
+                    tables.append(item.model_dump(mode="json"))
 
         if first_title:
             parsed.title = first_title

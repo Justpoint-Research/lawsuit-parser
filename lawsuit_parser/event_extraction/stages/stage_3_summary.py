@@ -5,13 +5,19 @@ purpose - why it exists, what it accomplishes - via a local LLM. Produces
 summaries.json.
 """
 
+import logging
+import sys
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
 from ..llm_validation import summarize_document_with_llm, summarize_document_with_nuextract
 from ..models import DocumentSummary, FilesScan, SummariesArtifact
+
+logger = logging.getLogger(__name__)
 
 
 class Stage3Summary(BaseStage):
@@ -34,32 +40,34 @@ class Stage3Summary(BaseStage):
             case_id: Case identifier
             config: Stage-specific configuration
         """
-        print(f"\n{'='*60}")
-        print(f"Stage 3: Document Summary - {case_id}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Stage 3: Document Summary - {case_id}")
+        logger.info(f"{'='*60}\n")
 
         if not config.get("summarize_documents", True):
-            print("Document summarization disabled (summarize_documents=false), skipping.")
+            logger.info("Document summarization disabled (summarize_documents=false), skipping.")
             self.save_artifact(case_id, "summaries.json", SummariesArtifact(case_id=case_id))
             return
 
         files_scan = self.load_artifact(case_id, "files_scan.json", FilesScan)
 
         backend = config.get("llm_backend", "ollama")
-        llm_model = config.get("llm_model", "gemma4:e4b")
-        llm_base_url = config.get("llm_base_url", "http://localhost:11434")
+        llm_model = config["llm_model"]
+        llm_base_url = config["llm_base_url"]
         max_chars = config.get("max_chars", 8000)
         summarizer = summarize_document_with_nuextract if backend == "nuextract" else summarize_document_with_llm
 
         summaries: list[DocumentSummary] = []
         summarized_count = 0
 
-        for doc in files_scan.documents:
-            print(f"\n→ Summarizing {doc.file_name} (doc_id={doc.doc_id})...")
+        pbar = tqdm(files_scan.documents, desc="Stage 3: summary", unit="doc", file=sys.__stderr__)
+        for doc in pbar:
+            pbar.set_postfix_str(doc.file_name)
+            logger.info(f"\n→ Summarizing {doc.file_name} (doc_id={doc.doc_id})...")
 
             text = self._load_document_text(case_id, doc.doc_id, doc.file_name)
             if not text:
-                print(f"  Warning: No text found for {doc.doc_id}, skipping")
+                logger.warning(f"  Warning: No text found for {doc.doc_id}, skipping")
                 summaries.append(DocumentSummary(doc_id=doc.doc_id, file_name=doc.file_name))
                 continue
 
@@ -70,7 +78,7 @@ class Stage3Summary(BaseStage):
                 base_url=llm_base_url,
             )
             if summary:
-                print(f"  Summary: {summary}")
+                logger.info(f"  Summary: {summary}")
                 summarized_count += 1
 
             summaries.append(DocumentSummary(
@@ -80,14 +88,14 @@ class Stage3Summary(BaseStage):
                 model=llm_model if summary else None,
             ))
 
-        print(f"\n→ Summarized {summarized_count} of {len(files_scan.documents)} documents")
+        logger.info(f"\n→ Summarized {summarized_count} of {len(files_scan.documents)} documents")
 
         artifact = SummariesArtifact(case_id=case_id, documents=summaries)
         self.save_artifact(case_id, "summaries.json", artifact)
 
-        print(f"\n{'='*60}")
-        print(f"Stage 3 Complete!")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Stage 3 Complete!")
+        logger.info(f"{'='*60}\n")
 
     def validate_inputs(self, case_id: str) -> bool:
         """Check that Stage 1's files_scan.json exists.
@@ -99,7 +107,7 @@ class Stage3Summary(BaseStage):
             True if files_scan.json is available
         """
         if not self.artifact_exists(case_id, "files_scan.json"):
-            print(f"Error: files_scan.json not found for {case_id} - run Stage 1 first")
+            logger.error(f"Error: files_scan.json not found for {case_id} - run Stage 1 first")
             return False
         return True
 
@@ -142,7 +150,7 @@ class Stage3Summary(BaseStage):
                 if "paragraphs" in parsed_data:
                     return "\n\n".join(parsed_data["paragraphs"])
             except Exception as e:
-                print(f"  Warning: Failed to load parsed JSON: {e}")
+                logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
 
         docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
         if docling_path.exists():
@@ -152,6 +160,6 @@ class Stage3Summary(BaseStage):
                     texts = [item.get("text", "") for item in docling_data["texts"]]
                     return "\n".join(texts)
             except Exception as e:
-                print(f"  Warning: Failed to load Docling JSON: {e}")
+                logger.warning(f"  Warning: Failed to load Docling JSON: {e}")
 
         return ""

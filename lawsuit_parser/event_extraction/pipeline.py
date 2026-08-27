@@ -1,11 +1,15 @@
 """Event extraction pipeline orchestrator."""
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from .base import BaseStage
 from .config import EventExtractionConfig, get_config_dict, load_config
+from .gliner_runner import free_cuda_memory
 from .stages import STAGES
+
+logger = logging.getLogger(__name__)
 
 
 class EventExtractionPipeline:
@@ -51,10 +55,10 @@ class EventExtractionPipeline:
             stage = stage_class(data_root, output_root)
             self.stages[stage.stage_number] = stage
 
-        print(f"Registered {len(self.stages)} stages:")
+        logger.info(f"Registered {len(self.stages)} stages:")
         for stage_num in sorted(self.stages.keys()):
             stage = self.stages[stage_num]
-            print(f"  Stage {stage_num}: {stage.stage_name}")
+            logger.info(f"  Stage {stage_num}: {stage.stage_name}")
 
     def run_stage(self, case_id: str, stage_number: int, force: bool = False) -> bool:
         """Run a specific stage for a case.
@@ -79,13 +83,13 @@ class EventExtractionPipeline:
         if not force:
             outputs_exist = all(p.exists() for p in stage.get_outputs(case_id))
             if outputs_exist:
-                print(f"\nStage {stage_number} outputs already exist. Use --force to re-run.")
+                logger.info(f"\nStage {stage_number} outputs already exist. Use --force to re-run.")
                 return True
 
         # Validate inputs
-        print(f"\nValidating inputs for Stage {stage_number}...")
+        logger.info(f"\nValidating inputs for Stage {stage_number}...")
         if not stage.validate_inputs(case_id):
-            print(f"Stage {stage_number} validation failed!")
+            logger.error(f"Stage {stage_number} validation failed!")
             return False
 
         # Get stage-specific configuration
@@ -110,17 +114,19 @@ class EventExtractionPipeline:
             except ValueError:
                 pass
 
-        # Run the stage
+        # Run the stage. GPU memory is released unconditionally afterward
+        # (success or failure) so a stage that loaded a model (currently
+        # just Stage 2/GLiNER) never leaves it held into the next stage or
+        # the next case in a batch run - that's what was causing CUDA OOMs.
         try:
             stage.run(case_id, stage_config)
             return True
         except Exception as e:
-            print(f"\n{'='*60}")
-            print(f"Stage {stage_number} FAILED: {e}")
-            print(f"{'='*60}\n")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Stage {stage_number} FAILED: {e}")
+            logger.exception(f"Stage {stage_number} traceback")
             return False
+        finally:
+            free_cuda_memory()
 
     def run_all_stages(self, case_id: str, force: bool = False) -> bool:
         """Run all stages in sequence for a case.
@@ -132,23 +138,23 @@ class EventExtractionPipeline:
         Returns:
             True if all stages completed successfully
         """
-        print(f"\n{'='*60}")
-        print(f"Event Extraction Pipeline")
-        print(f"Case: {case_id}")
-        print(f"Data root: {self.config.paths.data_root}")
-        print(f"Output root: {self.config.paths.output_root}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Event Extraction Pipeline")
+        logger.info(f"Case: {case_id}")
+        logger.info(f"Data root: {self.config.paths.data_root}")
+        logger.info(f"Output root: {self.config.paths.output_root}")
+        logger.info(f"{'='*60}\n")
 
         for stage_num in sorted(self.stages.keys()):
             success = self.run_stage(case_id, stage_num, force=force)
             if not success:
-                print(f"\nPipeline stopped due to Stage {stage_num} failure.")
+                logger.error(f"\nPipeline stopped due to Stage {stage_num} failure.")
                 return False
 
-        print(f"\n{'='*60}")
-        print(f"Pipeline Complete!")
-        print(f"All stages executed successfully.")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Pipeline Complete!")
+        logger.info(f"All stages executed successfully.")
+        logger.info(f"{'='*60}\n")
         return True
 
     def run_stages(
@@ -170,27 +176,27 @@ class EventExtractionPipeline:
         if stages is None:
             return self.run_all_stages(case_id, force=force)
 
-        print(f"\n{'='*60}")
-        print(f"Event Extraction Pipeline")
-        print(f"Case: {case_id}")
-        print(f"Stages: {stages}")
-        print(f"Data root: {self.config.paths.data_root}")
-        print(f"Output root: {self.config.paths.output_root}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Event Extraction Pipeline")
+        logger.info(f"Case: {case_id}")
+        logger.info(f"Stages: {stages}")
+        logger.info(f"Data root: {self.config.paths.data_root}")
+        logger.info(f"Output root: {self.config.paths.output_root}")
+        logger.info(f"{'='*60}\n")
 
         for stage_num in sorted(stages):
             if stage_num not in self.stages:
-                print(f"Warning: Invalid stage number {stage_num}, skipping")
+                logger.warning(f"Warning: Invalid stage number {stage_num}, skipping")
                 continue
 
             success = self.run_stage(case_id, stage_num, force=force)
             if not success:
-                print(f"\nExecution stopped due to Stage {stage_num} failure.")
+                logger.error(f"\nExecution stopped due to Stage {stage_num} failure.")
                 return False
 
-        print(f"\n{'='*60}")
-        print(f"Requested Stages Complete!")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Requested Stages Complete!")
+        logger.info(f"{'='*60}\n")
         return True
 
     def get_stage_status(self, case_id: str) -> dict[int, dict[str, Any]]:
@@ -226,7 +232,8 @@ class EventExtractionPipeline:
         return status
 
     def print_status(self, case_id: str) -> None:
-        """Print pipeline status for a case.
+        """Print pipeline status for a case to the console (this is the
+        direct output of `--status`, not pipeline log noise).
 
         Args:
             case_id: Case identifier

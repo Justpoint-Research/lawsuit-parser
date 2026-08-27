@@ -1,0 +1,60 @@
+# Prompt wording for lawsuit_parser.event_extraction.llm_validation's
+# Ollama/NuExtract-backed calls. Templates are plain Python str.format()
+# strings - {placeholder} tokens are filled in by
+# lawsuit_parser.event_extraction.prompts, which also decides which of a
+# task's optional *_line templates actually get included (e.g. a
+# text_excerpt_line is only rendered when an excerpt was passed in).
+#
+# Edit wording here without touching code. Adding a new {placeholder} to a
+# template requires passing the matching keyword from prompts.py's
+# build_*_prompt function.
+
+[actor_validation]
+template = """
+You are validating a roster of people/roles extracted by regex from a lawsuit's court filings (case captions and e-filing confirmation notices).
+Case caption: {caption}
+Court: {court}
+
+For each candidate below, confirm or correct its role from this set: {valid_roles}.
+Set keep=false if the entry is clearly not a real person/organization name: a stray street address, page furniture, OCR garbage, or a single generic word/phrase that reads like a document title rather than a party (e.g. 'STIPULATION', 'ORDER', 'NOTICE', 'AFFIDAVIT') - court filings often place these right next to the party list.
+Propose a short GLiNER detection label: for a named actor use '<role> (<name>)' (e.g. 'plaintiff (Jane Doe)'); for a generic/unnamed placeholder use the bare role (e.g. 'witness').
+Return exactly one output entry per candidate, in the same order given.
+
+Candidates:
+{candidates}
+"""
+
+[product_identification]
+intro = """
+You are identifying the medical substance, drug, medical device, or cosmetic product that the plaintiff in this lawsuit accuses of causing harm, and the defendant(s) it is attributed to (its manufacturer, seller, or distributor).
+Case caption: {caption}
+Court: {court}
+Case type: {case_type}
+"""
+litigation_caption_line = "Coordinated-litigation captions found in this case's filings name the product directly: {candidates}"
+defendants_line = "Known defendants in this case - attribute the product to one or more of these by exact name where you can tell: {names}"
+text_sample_line = "Excerpt from a filing in this case, for context:\n{text_sample}"
+closing = """
+Return one entry per distinct accused product. If the pleading treats several defendants' branded products as one legally defined category (e.g. "the Cosmetic Products" or "the PRODUCTS"), name that category, not each individual brand. Return an empty products list if no product/substance is clearly the subject of the plaintiff's harm allegations - do not guess.
+"""
+
+[title_identification]
+intro = """
+You are identifying the formal name/type of a single legal document from its first page (e.g. "Summons", "Verified Complaint", "Notice of Motion", "Stipulation of Discontinuance", "Affidavit of Service", "Memorandum of Law in Support").
+"""
+docling_title_line = "A layout-detection pass found this as a likely title: {docling_title}"
+candidates_line = "Short, mostly-uppercase lines found on page 1 that may name the document (not necessarily the title - could be a party name or boilerplate): {candidates}"
+text_excerpt_line = "First-page text, for context:\n{text_excerpt}"
+closing = """
+Return the single best short title for this document, in normal title case (not all-caps) even if the source text is all-caps. Return an empty string if the text doesn't clearly name a specific document type - do not guess or invent one.
+"""
+
+[summary]
+intro = """
+You are summarizing a single legal document in 5-20 sentences. Focus on the document's core purpose: why it was filed or created, and what it accomplishes (e.g. who is asking a court for what, who is notifying whom of what, what fact or event it records) - not a restatement of its contents or boilerplate caption/header text. Use bullet points if needed to underline the events timeline or enumerate event that happened.
+"""
+title_line = "This document's identified title/type: {document_title}"
+text_excerpt_line = "Document text, for context:\n{text_excerpt}"
+closing = """
+Return a 1-3 sentence summary. Return an empty string if the text doesn't give you enough to summarize - do not guess or invent one.
+"""

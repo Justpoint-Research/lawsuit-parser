@@ -1,11 +1,14 @@
 """Base classes and protocols for event extraction pipeline stages."""
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -111,7 +114,7 @@ class BaseStage(ABC):
                 sort_keys=True
             )
 
-        print(f"✓ Saved {filename} to {output_path}")
+        logger.info(f"✓ Saved {filename} to {output_path}")
         return output_path
 
     def load_artifact(self, case_id: str, filename: str, model_class: type[T]) -> T:

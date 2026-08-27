@@ -6,17 +6,22 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
-def _free_cuda_memory() -> None:
-    """Release cached GPU memory after the model is dropped.
+def free_cuda_memory() -> None:
+    """Release cached GPU memory held by the current process.
 
-    Without this, PyTorch's caching allocator keeps holding the model's
-    memory and a later run in the same process can OOM even though the
-    model is no longer referenced.
+    Without this, PyTorch's caching allocator keeps holding a dropped
+    model's memory and a later run in the same process can OOM even though
+    the model is no longer referenced. Safe to call even if torch/CUDA
+    aren't available (e.g. Stage 1/3, which never load a GPU model) or if
+    nothing is currently loaded.
     """
     import gc
-    import torch
 
     gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -74,7 +79,7 @@ class GlinerRunner:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Unload the model and free its GPU memory."""
         self.model = None
-        _free_cuda_memory()
+        free_cuda_memory()
         return False
 
     def predict_batch(

@@ -5,10 +5,14 @@ Produces entities.json artifact.
 """
 
 import bisect
+import logging
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from ..gliner_runner import GlinerRunner
 from ...parsers.batch import get_docling_dir
@@ -22,6 +26,8 @@ from ..models import (
     ModelConfig,
 )
 from ..utils import split_sentences
+
+logger = logging.getLogger(__name__)
 
 
 class Stage2GLiNER(BaseStage):
@@ -52,12 +58,12 @@ class Stage2GLiNER(BaseStage):
             case_id: Case identifier
             config: Stage-specific configuration
         """
-        print(f"\n{'='*60}")
-        print(f"Stage 2: GLiNER Entity Detection - {case_id}")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Stage 2: GLiNER Entity Detection - {case_id}")
+        logger.info(f"{'='*60}\n")
 
         # Load Stage 1 outputs
-        print("→ Loading Stage 1 artifacts...")
+        logger.info("→ Loading Stage 1 artifacts...")
         gliner_config = self.load_artifact(case_id, "gliner_config.json", GLiNERConfig)
         files_scan = self.load_artifact(case_id, "files_scan.json", FilesScan)
 
@@ -68,12 +74,12 @@ class Stage2GLiNER(BaseStage):
         enable_gazetteer = config.get("enable_gazetteer", True)
         gazetteer_min_term_length = config.get("gazetteer_min_term_length", 3)
 
-        print(f"  GLiNER model: {gliner_config.model}")
-        print(f"  Threshold: {gliner_config.threshold}")
-        print(f"  Batch size: {gliner_config.batch_size}")
-        print(f"  Static labels: {len(gliner_config.labels.static)}")
-        print(f"  Dynamic labels: {len(gliner_config.labels.dynamic)}")
-        print(f"  GPU: {use_gpu}")
+        logger.info(f"  GLiNER model: {gliner_config.model}")
+        logger.info(f"  Threshold: {gliner_config.threshold}")
+        logger.info(f"  Batch size: {gliner_config.batch_size}")
+        logger.info(f"  Static labels: {len(gliner_config.labels.static)}")
+        logger.info(f"  Dynamic labels: {len(gliner_config.labels.dynamic)}")
+        logger.info(f"  GPU: {use_gpu}")
 
         # Initialize results
         all_entities = []
@@ -81,17 +87,19 @@ class Stage2GLiNER(BaseStage):
         entity_id_counter = 0
 
         # Process each document
-        for doc_metadata in files_scan.documents:
+        pbar = tqdm(files_scan.documents, desc="Stage 2: GLiNER", unit="doc", file=sys.__stderr__)
+        for doc_metadata in pbar:
             doc_id = doc_metadata.doc_id
-            print(f"\n→ Processing {doc_metadata.file_name} (doc_id={doc_id})...")
+            pbar.set_postfix_str(doc_metadata.file_name)
+            logger.info(f"\n→ Processing {doc_metadata.file_name} (doc_id={doc_id})...")
 
             # Load canonical text
             text = self._load_document_text(case_id, doc_id, doc_metadata.file_name)
             if not text:
-                print(f"  Warning: No text found for {doc_id}, skipping")
+                logger.warning(f"  Warning: No text found for {doc_id}, skipping")
                 continue
 
-            print(f"  Text length: {len(text)} characters")
+            logger.info(f"  Text length: {len(text)} characters")
 
             # Sentence spans for this document, so per-entity context can be
             # anchored to whole sentences rather than a fixed character window.
@@ -99,10 +107,10 @@ class Stage2GLiNER(BaseStage):
 
             # Segment text for batch processing
             segments = self._segment_text(text, max_length=1000, overlap=100)
-            print(f"  Created {len(segments)} segments")
+            logger.info(f"  Created {len(segments)} segments")
 
             # Run GLiNER on segments
-            print(f"  Running GLiNER...")
+            logger.info(f"  Running GLiNER...")
 
             with GlinerRunner(
                 gliner_config.model,
@@ -138,7 +146,7 @@ class Stage2GLiNER(BaseStage):
                                 text, pred.text, char_start, char_end
                             )
                             if char_start == -1:
-                                print(f"  Warning: Could not locate span '{pred.text}', skipping")
+                                logger.warning(f"  Warning: Could not locate span '{pred.text}', skipping")
                                 continue
 
                         # Create entity
@@ -178,7 +186,7 @@ class Stage2GLiNER(BaseStage):
                         entity_counts[pred.label] = entity_counts.get(pred.label, 0) + 1
 
             gliner_entity_count = len([e for e in all_entities if e.doc_id == doc_id])
-            print(f"  ✓ GLiNER extracted {gliner_entity_count} entities")
+            logger.info(f"  ✓ GLiNER extracted {gliner_entity_count} entities")
 
             # Gazetteer pass: catch exact named-actor mentions GLiNER's
             # threshold missed. Runs after GLiNER so it knows which spans
@@ -199,15 +207,15 @@ class Stage2GLiNER(BaseStage):
                     min_term_length=gazetteer_min_term_length,
                 )
                 if gazetteer_entities:
-                    print(f"  ✓ Gazetteer pass added {len(gazetteer_entities)} entities GLiNER missed")
+                    logger.info(f"  ✓ Gazetteer pass added {len(gazetteer_entities)} entities GLiNER missed")
                 all_entities.extend(gazetteer_entities)
                 for gazetteer_entity in gazetteer_entities:
                     entity_counts[gazetteer_entity.label] = entity_counts.get(gazetteer_entity.label, 0) + 1
 
-        print(f"\n→ Total entities extracted: {len(all_entities)}")
-        print(f"→ Entity breakdown:")
+        logger.info(f"\n→ Total entities extracted: {len(all_entities)}")
+        logger.info(f"→ Entity breakdown:")
         for label, count in sorted(entity_counts.items(), key=lambda x: -x[1])[:10]:
-            print(f"  {label}: {count}")
+            logger.info(f"  {label}: {count}")
 
         # Create entities artifact
         entities_artifact = EntitiesArtifact(
@@ -223,9 +231,9 @@ class Stage2GLiNER(BaseStage):
 
         self.save_artifact(case_id, "entities.json", entities_artifact)
 
-        print(f"\n{'='*60}")
-        print(f"Stage 2 Complete!")
-        print(f"{'='*60}\n")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Stage 2 Complete!")
+        logger.info(f"{'='*60}\n")
 
     def validate_inputs(self, case_id: str) -> bool:
         """Check if Stage 1 outputs are available.
@@ -240,8 +248,8 @@ class Stage2GLiNER(BaseStage):
 
         for filename in required_files:
             if not self.artifact_exists(case_id, filename):
-                print(f"Error: Required artifact not found: {filename}")
-                print(f"       Run Stage 1 first!")
+                logger.error(f"Error: Required artifact not found: {filename}")
+                logger.info(f"       Run Stage 1 first!")
                 return False
 
         return True
@@ -286,7 +294,7 @@ class Stage2GLiNER(BaseStage):
                 if "paragraphs" in parsed_data:
                     return "\n\n".join(parsed_data["paragraphs"])
             except Exception as e:
-                print(f"  Warning: Failed to load parsed JSON: {e}")
+                logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
 
         # Try Docling JSON, saved under docling/documents/ - see
         # lawsuit_parser.parsers.batch.get_docling_dir.
@@ -298,7 +306,7 @@ class Stage2GLiNER(BaseStage):
                     texts = [item.get("text", "") for item in docling_data["texts"]]
                     return "\n".join(texts)
             except Exception as e:
-                print(f"  Warning: Failed to load Docling JSON: {e}")
+                logger.warning(f"  Warning: Failed to load Docling JSON: {e}")
 
         return ""
 

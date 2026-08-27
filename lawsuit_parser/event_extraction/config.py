@@ -42,8 +42,8 @@ class Stage1Config(BaseModel):
                      "vLLM-served NuExtract client). Switching backend also requires setting "
                      "llm_model/llm_base_url to match - see config/event_extraction.toml.",
     )
-    llm_model: str = Field(default="gemma4:e4b", description="Model tag/name for the selected llm_backend")
-    llm_base_url: str = Field(default="http://localhost:11434", description="Server URL for the selected llm_backend")
+    llm_model: str = Field(description="Model tag/name for the selected llm_backend")
+    llm_base_url: str = Field(description="Server URL for the selected llm_backend")
     extract_products: bool = Field(
         default=True,
         description="Identify the medical substance/drug/medical device/cosmetic product the "
@@ -110,8 +110,8 @@ class Stage3Config(BaseModel):
                      "vLLM-served NuExtract client). Switching backend also requires setting "
                      "llm_model/llm_base_url to match - see config/event_extraction.toml.",
     )
-    llm_model: str = Field(default="gemma4:e4b", description="Model tag/name for the selected llm_backend")
-    llm_base_url: str = Field(default="http://localhost:11434", description="Server URL for the selected llm_backend")
+    llm_model: str = Field(description="Model tag/name for the selected llm_backend")
+    llm_base_url: str = Field(description="Server URL for the selected llm_backend")
     max_chars: int = Field(
         default=8000,
         gt=0,
@@ -148,9 +148,7 @@ def load_config(config_path: Path | None = None) -> EventExtractionConfig:
         config_path = repo_root / "config" / "event_extraction.toml"
 
     if not config_path.exists():
-        # Return default configuration if file doesn't exist
-        print(f"Config file not found at {config_path}, using defaults")
-        return EventExtractionConfig()
+        raise FileNotFoundError(f"Config file not found at {config_path}")
 
     with open(config_path, "rb") as f:
         config_data = tomllib.load(f)

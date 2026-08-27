@@ -29,10 +29,18 @@ summarize_document_with_llm/summarize_document_with_nuextract produce a
 accomplishes), given a longer text excerpt and the identified title as a
 hint. Runs in Stage 3.
 
+Prompt wording for all of the above lives in config/llm_prompts.toml,
+assembled by .prompts - edit that file to change what's asked, this one to
+change how it's asked (backend I/O) or how a response is turned into a
+result.
+
 Two backends are available for all of these, selected via each stage's
 own llm_backend config (Stage1Config.llm_backend, Stage3Config.llm_backend):
-- "ollama" (default): a locally running Ollama model, e.g. gemma4:e4b.
-  Verified working against this repo's local Ollama server.
+- "ollama" (default): a locally running Ollama model, e.g. qwen3:30b-a3b.
+  Verified working against this repo's local Ollama server. The model is
+  just a config value (Stage1Config.llm_model / Stage3Config.llm_model, or
+  config/event_extraction.toml) - swap it to any other pulled Ollama tag
+  without touching this module.
 - "nuextract": this module's NuExtractClient (see .nuextract_client) against
   a vLLM-served NuExtract3 endpoint. Not exercised against a live server as
   part of this change - the vLLM endpoint wasn't reachable in this
@@ -46,73 +54,154 @@ failing the pipeline - this is a refinement pass, not a required dependency.
 """
 
 import json
+import logging
+from typing import Any, Callable, TypeVar
 
 import requests
 
 from .models import Actor
+from .prompts import (
+    ACTOR_RESPONSE_SCHEMA,
+    PRODUCT_RESPONSE_SCHEMA,
+    PRODUCT_TYPES,
+    SUMMARY_RESPONSE_SCHEMA,
+    TITLE_RESPONSE_SCHEMA,
+    VALID_ROLES,
+    build_actor_prompt,
+    build_product_prompt,
+    build_summary_prompt,
+    build_title_prompt,
+)
 
-VALID_ROLES = {
-    "plaintiff", "defendant", "judge", "court_clerk", "counsel",
-    "witness", "attorney", "other",
-}
+logger = logging.getLogger(__name__)
 
-ACTOR_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "actors": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "canonical_name": {"type": "string"},
-                    "role": {"type": "string", "enum": sorted(VALID_ROLES)},
-                    "gliner_label": {"type": "string"},
-                    "keep": {"type": "boolean"},
-                },
-                "required": ["canonical_name", "role", "gliner_label", "keep"],
-            },
-        },
-    },
-    "required": ["actors"],
-}
+T = TypeVar("T")
 
 
-def _build_prompt(actors: list[Actor], caption: str | None, court: str | None) -> str:
-    lines = [
-        "You are validating a roster of people/roles extracted by regex from a "
-        "lawsuit's court filings (case captions and e-filing confirmation notices).",
-        f"Case caption: {caption or 'unknown'}",
-        f"Court: {court or 'unknown'}",
-        "",
-        "For each candidate below, confirm or correct its role from this set: "
-        f"{', '.join(sorted(VALID_ROLES))}.",
-        "Set keep=false if the entry is clearly not a real person/organization name: "
-        "a stray street address, page furniture, OCR garbage, or a single generic "
-        "word/phrase that reads like a document title rather than a party "
-        "(e.g. 'STIPULATION', 'ORDER', 'NOTICE', 'AFFIDAVIT') - court filings "
-        "often place these right next to the party list.",
-        "Propose a short GLiNER detection label: for a named actor use "
-        "'<role> (<name>)' (e.g. 'plaintiff (Jane Doe)'); for a generic/unnamed "
-        "placeholder use the bare role (e.g. 'witness').",
-        "Return exactly one output entry per candidate, in the same order given.",
-        "",
-        "Candidates:",
-    ]
-    for i, actor in enumerate(actors):
-        lines.append(
-            f"{i}. name={actor.canonical_name!r} current_role={actor.role} "
-            f"is_named={actor.is_named} source={actor.source} "
-            f"seen_in={len(actor.doc_ids)} document(s)"
+def unload_ollama_model(model: str, base_url: str, timeout: float = 30.0) -> None:
+    """Ask the Ollama server to immediately unload `model` from GPU memory.
+
+    Ollama keeps a model resident in VRAM for a keep_alive window (5 minutes
+    by default) after its last request, rather than releasing it as soon as
+    the caller is done. A later step in the same run that needs that VRAM
+    for its own model - e.g. Stage 2/GLiNER, which runs right after this
+    module's Stage 1 calls - can then hit a CUDA OOM even though nothing in
+    this process is still using it. Sending keep_alive=0 with no prompt is
+    Ollama's documented way to unload a model on demand.
+
+    Best-effort and non-fatal: a server that's already unloaded it,
+    unreachable, or running a version without this behavior shouldn't break
+    the pipeline over a memory optimization. Only meaningful for the
+    "ollama" backend - there's no equivalent call for "nuextract" (a
+    vLLM-served endpoint), so callers should skip this for that backend.
+    """
+    try:
+        requests.post(
+            f"{base_url}/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=timeout,
         )
-    return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"  Warning: couldn't unload Ollama model {model!r} ({e})")
+
+
+def _with_fallback(task: str, fallback: T, call: Callable[[], T]) -> T:
+    """Run `call`, logging and returning `fallback` on any failure.
+
+    Every LLM-assisted step in this module is a refinement pass over a
+    result that already exists without it (an unvalidated roster, no
+    title/summary) - so a network error, an unreachable server, a
+    schema-violating response, or a response with the wrong shape (e.g. one
+    actor entry per candidate) should degrade to that fallback rather than
+    fail the pipeline.
+    """
+    try:
+        return call()
+    except Exception as e:
+        logger.warning(f"  Warning: {task} unavailable ({e}), using fallback")
+        return fallback
+
+
+def _call_ollama(*, model: str, base_url: str, prompt: str, schema: dict, timeout: float) -> str:
+    """POST `prompt` to Ollama's /api/chat with a JSON-schema format
+    constraint, returning the raw response content string.
+
+    Returns the raw string rather than a parsed dict: despite the schema
+    constraint, some models sometimes return a bare value (e.g.
+    "Stipulation of Discontinuance") instead of the requested JSON object -
+    parsing is left to the caller so it can choose whether to salvage that
+    (see _parse_single_field_response) or treat it as a failure.
+    """
+    response = requests.post(
+        f"{base_url}/api/chat",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "format": schema,
+            "stream": False,
+            "options": {"temperature": 0},
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()["message"]["content"]
+
+
+def _call_nuextract(*, model: str, base_url: str, prompt: str, template: dict, timeout: float) -> dict[str, Any]:
+    """Extract structured data via NuExtractClient (see .nuextract_client),
+    against a vLLM-served NuExtract3 endpoint."""
+    from .nuextract_client import NuExtractClient
+
+    client = NuExtractClient(base_url=base_url, model=model, timeout_s=int(timeout))
+    return client.extract(prompt, template)
+
+
+def _parse_single_field_response(content: str, field: str) -> str | None:
+    """Pull a single string field out of an Ollama chat response's content.
+
+    Despite the JSON-schema `format` constraint, some models sometimes
+    return the value as a bare string (e.g. "Stipulation of Discontinuance")
+    instead of the requested {"<field>": "..."} object - salvage that
+    rather than discarding a perfectly good answer.
+    """
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    return parsed.get(field) if isinstance(parsed, dict) else parsed
+
+
+# ============================================================================
+# Actor roster validation
+# ============================================================================
+
+
+def _apply_actor_results(actors: list[Actor], results: list[dict]) -> list[Actor]:
+    if len(results) != len(actors):
+        raise ValueError(f"got {len(results)} actors for {len(actors)} candidates")
+
+    validated = []
+    for actor, result in zip(actors, results):
+        keep = str(result.get("keep", True)).strip().lower()
+        if keep in ("false", "no", "0", ""):
+            continue
+        role = str(result.get("role") or actor.role).strip().lower()
+        if role not in VALID_ROLES:
+            role = actor.role
+        validated.append(actor.model_copy(update={
+            "role": role,
+            "gliner_label": result.get("gliner_label") or actor.gliner_label,
+        }))
+    return validated
 
 
 def validate_actors_with_llm(
     actors: list[Actor],
+    *,
+    model: str,
+    base_url: str,
     caption: str | None = None,
     court: str | None = None,
-    model: str = "gemma4:e4b",
-    base_url: str = "http://localhost:11434",
     timeout: float = 60.0,
 ) -> list[Actor]:
     """Validate/refine an actor roster with a local Ollama model.
@@ -134,53 +223,23 @@ def validate_actors_with_llm(
     if not actors:
         return actors
 
-    try:
-        response = requests.post(
-            f"{base_url}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": _build_prompt(actors, caption, court)}],
-                "format": ACTOR_RESPONSE_SCHEMA,
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
+    def call() -> list[Actor]:
+        prompt = build_actor_prompt(actors, caption, court)
+        content = _call_ollama(model=model, base_url=base_url, prompt=prompt, schema=ACTOR_RESPONSE_SCHEMA, timeout=timeout)
         results = json.loads(content).get("actors", [])
-    except Exception as e:
-        print(f"  Warning: LLM actor validation unavailable ({e}), keeping unvalidated roster")
-        return actors
+        return _apply_actor_results(actors, results)
 
-    if len(results) != len(actors):
-        print(
-            f"  Warning: LLM returned {len(results)} actors for {len(actors)} "
-            f"candidates, keeping unvalidated roster"
-        )
-        return actors
-
-    validated = []
-    for actor, result in zip(actors, results):
-        if not result.get("keep", True):
-            continue
-        role = result.get("role")
-        if role not in VALID_ROLES:
-            role = actor.role
-        validated.append(actor.model_copy(update={
-            "role": role,
-            "gliner_label": result.get("gliner_label") or actor.gliner_label,
-        }))
-
-    return validated
+    return _with_fallback("LLM actor validation", actors, call)
 
 
 def validate_actors_with_nuextract(
     actors: list[Actor],
+    *,
+    model: str,
+    base_url: str,
     caption: str | None = None,
     court: str | None = None,
-    model: str = "numind/NuExtract3",
-    base_url: str = "http://localhost:8000/v1",
+    timeout: float = 60.0,
 ) -> list[Actor]:
     """Validate/refine an actor roster with NuExtract, served via vLLM.
 
@@ -195,18 +254,13 @@ def validate_actors_with_nuextract(
         court: Court name, for context
         model: vLLM-served model identifier (must match a running server)
         base_url: vLLM OpenAI-compatible API base URL
+        timeout: Request timeout in seconds
 
     Returns:
         A corrected roster, or the input roster unchanged if the vLLM
         server is unreachable or its response can't be used.
     """
     if not actors:
-        return actors
-
-    try:
-        from .nuextract_client import ExtractionError, NuExtractClient
-    except ImportError as e:
-        print(f"  Warning: NuExtract client unavailable ({e}), keeping unvalidated roster")
         return actors
 
     # NuExtract templates describe the desired output shape with
@@ -222,105 +276,17 @@ def validate_actors_with_nuextract(
         ]
     }
 
-    try:
-        client = NuExtractClient(base_url=base_url, model=model)
-        result = client.extract(_build_prompt(actors, caption, court), template)
-        results = result.get("actors", [])
-    except ExtractionError as e:
-        print(f"  Warning: NuExtract actor validation failed ({e}), keeping unvalidated roster")
-        return actors
-    except Exception as e:
-        print(f"  Warning: NuExtract actor validation unavailable ({e}), keeping unvalidated roster")
-        return actors
+    def call() -> list[Actor]:
+        prompt = build_actor_prompt(actors, caption, court)
+        result = _call_nuextract(model=model, base_url=base_url, prompt=prompt, template=template, timeout=timeout)
+        return _apply_actor_results(actors, result.get("actors", []))
 
-    if not isinstance(results, list) or len(results) != len(actors):
-        print(
-            f"  Warning: NuExtract returned {len(results) if isinstance(results, list) else 0} "
-            f"actors for {len(actors)} candidates, keeping unvalidated roster"
-        )
-        return actors
-
-    validated = []
-    for actor, result in zip(actors, results):
-        keep = str(result.get("keep", "true")).strip().lower()
-        if keep in ("false", "no", "0", ""):
-            continue
-        role = str(result.get("role") or actor.role).strip().lower()
-        if role not in VALID_ROLES:
-            role = actor.role
-        validated.append(actor.model_copy(update={
-            "role": role,
-            "gliner_label": result.get("gliner_label") or actor.gliner_label,
-        }))
-
-    return validated
+    return _with_fallback("NuExtract actor validation", actors, call)
 
 
 # ============================================================================
 # Accused-product identification
 # ============================================================================
-
-PRODUCT_TYPES = {
-    "drug", "medical_device", "cosmetic_product", "chemical_substance", "other_product",
-}
-
-PRODUCT_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "products": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "product_type": {"type": "string", "enum": sorted(PRODUCT_TYPES)},
-                    "attributed_to": {"type": "array", "items": {"type": "string"}},
-                    "aliases": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["name", "product_type", "attributed_to"],
-            },
-        },
-    },
-    "required": ["products"],
-}
-
-
-def _build_product_prompt(
-    caption: str | None,
-    court: str | None,
-    case_type: str | None,
-    litigation_caption_candidates: list[str],
-    defendant_names: list[str],
-    text_sample: str | None,
-) -> str:
-    lines = [
-        "You are identifying the medical substance, drug, medical device, or cosmetic "
-        "product that the plaintiff in this lawsuit accuses of causing harm, and the "
-        "defendant(s) it is attributed to (its manufacturer, seller, or distributor).",
-        f"Case caption: {caption or 'unknown'}",
-        f"Court: {court or 'unknown'}",
-        f"Case type: {case_type or 'unknown'}",
-    ]
-    if litigation_caption_candidates:
-        lines.append(
-            "Coordinated-litigation captions found in this case's filings name the "
-            f"product directly: {'; '.join(litigation_caption_candidates)}"
-        )
-    if defendant_names:
-        lines.append(
-            "Known defendants in this case - attribute the product to one or more of "
-            f"these by exact name where you can tell: {', '.join(defendant_names)}"
-        )
-    if text_sample:
-        lines.append("\nExcerpt from a filing in this case, for context:\n" + text_sample)
-    lines.append(
-        "\nReturn one entry per distinct accused product. If the pleading treats "
-        "several defendants' branded products as one legally defined category (e.g. "
-        "\"the Cosmetic Products\" or \"the PRODUCTS\"), name that category, not each "
-        "individual brand. Return an empty products list if no product/substance is "
-        "clearly the subject of the plaintiff's harm allegations - do not guess."
-    )
-    return "\n".join(lines)
 
 
 def _clean_product_results(raw_products: list[dict]) -> list[dict]:
@@ -340,14 +306,15 @@ def _clean_product_results(raw_products: list[dict]) -> list[dict]:
 
 
 def identify_products_with_llm(
+    *,
+    model: str,
+    base_url: str,
     caption: str | None = None,
     court: str | None = None,
     case_type: str | None = None,
     litigation_caption_candidates: list[str] | None = None,
     defendant_names: list[str] | None = None,
     text_sample: str | None = None,
-    model: str = "gemma4:e4b",
-    base_url: str = "http://localhost:11434",
     timeout: float = 90.0,
 ) -> list[dict]:
     """Identify the accused product(s) in a product-liability case with a
@@ -378,41 +345,29 @@ def identify_products_with_llm(
         "aliases" - empty if no product was identified or the model is
         unreachable/its response can't be used.
     """
-    prompt = _build_product_prompt(
-        caption, court, case_type, litigation_caption_candidates or [], defendant_names or [], text_sample,
-    )
-
-    try:
-        response = requests.post(
-            f"{base_url}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "format": PRODUCT_RESPONSE_SCHEMA,
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=timeout,
+    def call() -> list[dict]:
+        prompt = build_product_prompt(
+            caption, court, case_type, litigation_caption_candidates or [], defendant_names or [], text_sample,
         )
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
+        content = _call_ollama(
+            model=model, base_url=base_url, prompt=prompt, schema=PRODUCT_RESPONSE_SCHEMA, timeout=timeout
+        )
         raw_products = json.loads(content).get("products", [])
-    except Exception as e:
-        print(f"  Warning: LLM product identification unavailable ({e})")
-        return []
+        return _clean_product_results(raw_products)
 
-    return _clean_product_results(raw_products)
+    return _with_fallback("LLM product identification", [], call)
 
 
 def identify_products_with_nuextract(
+    *,
+    model: str,
+    base_url: str,
     caption: str | None = None,
     court: str | None = None,
     case_type: str | None = None,
     litigation_caption_candidates: list[str] | None = None,
     defendant_names: list[str] | None = None,
     text_sample: str | None = None,
-    model: str = "numind/NuExtract3",
-    base_url: str = "http://localhost:8000/v1",
     timeout: float = 90.0,
 ) -> list[dict]:
     """Identify the accused product(s) with NuExtract, served via vLLM.
@@ -426,12 +381,6 @@ def identify_products_with_nuextract(
         "aliases" - empty if no product was identified or the vLLM server
         is unreachable/its response can't be used.
     """
-    try:
-        from .nuextract_client import ExtractionError, NuExtractClient
-    except ImportError as e:
-        print(f"  Warning: NuExtract client unavailable ({e})")
-        return []
-
     template = {
         "products": [
             {
@@ -442,61 +391,20 @@ def identify_products_with_nuextract(
             }
         ]
     }
-    prompt = _build_product_prompt(
-        caption, court, case_type, litigation_caption_candidates or [], defendant_names or [], text_sample,
-    )
 
-    try:
-        client = NuExtractClient(base_url=base_url, model=model, timeout_s=int(timeout))
-        result = client.extract(prompt, template)
-        raw_products = result.get("products", [])
-    except ExtractionError as e:
-        print(f"  Warning: NuExtract product identification failed ({e})")
-        return []
-    except Exception as e:
-        print(f"  Warning: NuExtract product identification unavailable ({e})")
-        return []
+    def call() -> list[dict]:
+        prompt = build_product_prompt(
+            caption, court, case_type, litigation_caption_candidates or [], defendant_names or [], text_sample,
+        )
+        result = _call_nuextract(model=model, base_url=base_url, prompt=prompt, template=template, timeout=timeout)
+        return _clean_product_results(result.get("products", []))
 
-    return _clean_product_results(raw_products)
+    return _with_fallback("NuExtract product identification", [], call)
 
 
 # ============================================================================
 # Document title identification
 # ============================================================================
-
-TITLE_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title": {"type": "string"},
-    },
-    "required": ["title"],
-}
-
-
-def _build_title_prompt(text_excerpt: str, candidates: list[str], docling_title: str | None) -> str:
-    lines = [
-        "You are identifying the formal name/type of a single legal document "
-        "from its first page (e.g. \"Summons\", \"Verified Complaint\", "
-        "\"Notice of Motion\", \"Stipulation of Discontinuance\", \"Affidavit "
-        "of Service\", \"Memorandum of Law in Support\").",
-    ]
-    if docling_title:
-        lines.append(f"A layout-detection pass found this as a likely title: {docling_title!r}")
-    if candidates:
-        lines.append(
-            "Short, mostly-uppercase lines found on page 1 that may name the "
-            f"document (not necessarily the title - could be a party name or "
-            f"boilerplate): {', '.join(repr(c) for c in candidates)}"
-        )
-    if text_excerpt:
-        lines.append("\nFirst-page text, for context:\n" + text_excerpt)
-    lines.append(
-        "\nReturn the single best short title for this document, in normal "
-        "title case (not all-caps) even if the source text is all-caps. "
-        "Return an empty string if the text doesn't clearly name a specific "
-        "document type - do not guess or invent one."
-    )
-    return "\n".join(lines)
 
 
 def _clean_title_result(raw_title: str | None) -> str | None:
@@ -504,27 +412,13 @@ def _clean_title_result(raw_title: str | None) -> str | None:
     return title or None
 
 
-def _parse_single_field_response(content: str, field: str) -> str | None:
-    """Pull a single string field out of an Ollama chat response's content.
-
-    Despite the JSON-schema `format` constraint, gemma4 sometimes returns
-    the value as a bare string (e.g. "Stipulation of Discontinuance")
-    instead of the requested {"<field>": "..."} object - salvage that
-    rather than discarding a perfectly good answer.
-    """
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        return content
-    return parsed.get(field) if isinstance(parsed, dict) else parsed
-
-
 def identify_document_title_with_llm(
+    *,
+    model: str,
+    base_url: str,
     text_excerpt: str | None = None,
     candidates: list[str] | None = None,
     docling_title: str | None = None,
-    model: str = "gemma4:e4b",
-    base_url: str = "http://localhost:11434",
     timeout: float = 60.0,
 ) -> str | None:
     """Identify a document's formal title/type with a local Ollama model.
@@ -549,36 +443,23 @@ def identify_document_title_with_llm(
         The identified title, or None if undeterminable or the model is
         unreachable/its response can't be used.
     """
-    prompt = _build_title_prompt(text_excerpt or "", candidates or [], docling_title)
-
-    try:
-        response = requests.post(
-            f"{base_url}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "format": TITLE_RESPONSE_SCHEMA,
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=timeout,
+    def call() -> str | None:
+        prompt = build_title_prompt(text_excerpt or "", candidates or [], docling_title)
+        content = _call_ollama(
+            model=model, base_url=base_url, prompt=prompt, schema=TITLE_RESPONSE_SCHEMA, timeout=timeout
         )
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
-        raw_title = _parse_single_field_response(content, "title")
-    except Exception as e:
-        print(f"  Warning: LLM title identification unavailable ({e})")
-        return None
+        return _clean_title_result(_parse_single_field_response(content, "title"))
 
-    return _clean_title_result(raw_title)
+    return _with_fallback("LLM title identification", None, call)
 
 
 def identify_document_title_with_nuextract(
+    *,
+    model: str,
+    base_url: str,
     text_excerpt: str | None = None,
     candidates: list[str] | None = None,
     docling_title: str | None = None,
-    model: str = "numind/NuExtract3",
-    base_url: str = "http://localhost:8000/v1",
     timeout: float = 60.0,
 ) -> str | None:
     """Identify a document's formal title/type with NuExtract, served via
@@ -589,60 +470,17 @@ def identify_document_title_with_nuextract(
         The identified title, or None if undeterminable or the vLLM server
         is unreachable/its response can't be used.
     """
-    try:
-        from .nuextract_client import ExtractionError, NuExtractClient
-    except ImportError as e:
-        print(f"  Warning: NuExtract client unavailable ({e})")
-        return None
+    def call() -> str | None:
+        prompt = build_title_prompt(text_excerpt or "", candidates or [], docling_title)
+        result = _call_nuextract(model=model, base_url=base_url, prompt=prompt, template={"title": ""}, timeout=timeout)
+        return _clean_title_result(result.get("title"))
 
-    template = {"title": ""}
-    prompt = _build_title_prompt(text_excerpt or "", candidates or [], docling_title)
-
-    try:
-        client = NuExtractClient(base_url=base_url, model=model, timeout_s=int(timeout))
-        result = client.extract(prompt, template)
-        raw_title = result.get("title")
-    except ExtractionError as e:
-        print(f"  Warning: NuExtract title identification failed ({e})")
-        return None
-    except Exception as e:
-        print(f"  Warning: NuExtract title identification unavailable ({e})")
-        return None
-
-    return _clean_title_result(raw_title)
+    return _with_fallback("NuExtract title identification", None, call)
 
 
 # ============================================================================
 # Document summary (Stage 3)
 # ============================================================================
-
-SUMMARY_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-    },
-    "required": ["summary"],
-}
-
-
-def _build_summary_prompt(text_excerpt: str, document_title: str | None) -> str:
-    lines = [
-        "You are summarizing a single legal document in 1-3 sentences. "
-        "Focus on the document's core purpose: why it was filed or created, "
-        "and what it accomplishes (e.g. who is asking a court for what, who "
-        "is notifying whom of what, what fact or event it records) - not a "
-        "restatement of its contents or boilerplate caption/header text.",
-    ]
-    if document_title:
-        lines.append(f"This document's identified title/type: {document_title!r}")
-    if text_excerpt:
-        lines.append("\nDocument text, for context:\n" + text_excerpt)
-    lines.append(
-        "\nReturn a 1-3 sentence summary. Return an empty string if the "
-        "text doesn't give you enough to summarize - do not guess or "
-        "invent one."
-    )
-    return "\n".join(lines)
 
 
 def _clean_summary_result(raw_summary: str | None) -> str | None:
@@ -651,13 +489,14 @@ def _clean_summary_result(raw_summary: str | None) -> str | None:
 
 
 def summarize_document_with_llm(
+    *,
+    model: str,
+    base_url: str,
     text_excerpt: str | None = None,
     document_title: str | None = None,
-    model: str = "gemma4:e4b",
-    base_url: str = "http://localhost:11434",
     timeout: float = 60.0,
 ) -> str | None:
-    """Summarize a document's core purpose in 1-3 sentences with a local
+    """Summarize a document's core purpose in 5-15 sentences with a local
     Ollama model.
 
     Args:
@@ -673,35 +512,22 @@ def summarize_document_with_llm(
         The summary, or None if undeterminable or the model is
         unreachable/its response can't be used.
     """
-    prompt = _build_summary_prompt(text_excerpt or "", document_title)
-
-    try:
-        response = requests.post(
-            f"{base_url}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "format": SUMMARY_RESPONSE_SCHEMA,
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=timeout,
+    def call() -> str | None:
+        prompt = build_summary_prompt(text_excerpt or "", document_title)
+        content = _call_ollama(
+            model=model, base_url=base_url, prompt=prompt, schema=SUMMARY_RESPONSE_SCHEMA, timeout=timeout
         )
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
-        raw_summary = _parse_single_field_response(content, "summary")
-    except Exception as e:
-        print(f"  Warning: LLM document summarization unavailable ({e})")
-        return None
+        return _clean_summary_result(_parse_single_field_response(content, "summary"))
 
-    return _clean_summary_result(raw_summary)
+    return _with_fallback("LLM document summarization", None, call)
 
 
 def summarize_document_with_nuextract(
+    *,
+    model: str,
+    base_url: str,
     text_excerpt: str | None = None,
     document_title: str | None = None,
-    model: str = "numind/NuExtract3",
-    base_url: str = "http://localhost:8000/v1",
     timeout: float = 60.0,
 ) -> str | None:
     """Summarize a document's core purpose in 1-3 sentences with NuExtract,
@@ -712,24 +538,11 @@ def summarize_document_with_nuextract(
         The summary, or None if undeterminable or the vLLM server is
         unreachable/its response can't be used.
     """
-    try:
-        from .nuextract_client import ExtractionError, NuExtractClient
-    except ImportError as e:
-        print(f"  Warning: NuExtract client unavailable ({e})")
-        return None
+    def call() -> str | None:
+        prompt = build_summary_prompt(text_excerpt or "", document_title)
+        result = _call_nuextract(
+            model=model, base_url=base_url, prompt=prompt, template={"summary": ""}, timeout=timeout
+        )
+        return _clean_summary_result(result.get("summary"))
 
-    template = {"summary": ""}
-    prompt = _build_summary_prompt(text_excerpt or "", document_title)
-
-    try:
-        client = NuExtractClient(base_url=base_url, model=model, timeout_s=int(timeout))
-        result = client.extract(prompt, template)
-        raw_summary = result.get("summary")
-    except ExtractionError as e:
-        print(f"  Warning: NuExtract document summarization failed ({e})")
-        return None
-    except Exception as e:
-        print(f"  Warning: NuExtract document summarization unavailable ({e})")
-        return None
-
-    return _clean_summary_result(raw_summary)
+    return _with_fallback("NuExtract document summarization", None, call)
