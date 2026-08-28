@@ -190,6 +190,27 @@ class Actor(BaseModel):
                      "assigned when building gliner_config.json",
     )
 
+    # Extended fields for comprehensive LLM extraction
+    title: str | None = Field(
+        default=None,
+        description="Professional title or designation (e.g., 'Esquire', 'J.S.C.', 'Hon.', 'Dr.')",
+    )
+    organization: str | None = Field(
+        default=None,
+        description="Affiliated organization or law firm",
+    )
+    email: str | None = Field(default=None, description="Email address")
+    phone: str | None = Field(default=None, description="Phone number")
+    address: str | None = Field(default=None, description="Physical address")
+    location: str | None = Field(
+        default=None,
+        description="Location for courts (e.g., 'Bergen County Courthouse, Hackensack, NJ')",
+    )
+    case_number: str | None = Field(
+        default=None,
+        description="Case number for courts (e.g., 'Case No. 284 (MT)', 'MDL No. 1964')",
+    )
+
 
 class ActorsArtifact(BaseModel):
     """Stage 1 output: every actor identified in the case from the

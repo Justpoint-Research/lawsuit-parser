@@ -81,3 +81,42 @@ passage_header = "=== Passage {key} ==="
 closing = """
 For each passage above, apply the same rule to every date it contains: return one event per date that corresponds to an actual event in this case's own history - not a citation to unrelated case law, a form's boilerplate date range, or garbled OCR text - giving a short event_type (e.g. "filing", "hearing", "service of process", "deposition", "order issued", "settlement"), a 1-2 sentence description of what happened, the outcome if that passage states one (omit it otherwise), which of that passage's own listed people/organizations/products were involved (never one listed only under a different passage), and which of that passage's own listed dates it corresponds to. Assign a confidence from 0 to 1. Return an empty events list for a passage if none of its dates correspond to an identifiable case event - you must still return a result for every passage key.
 """
+
+[comprehensive_actor_extraction]
+template = """
+You are extracting ALL parties, roles, and entities from a legal document for comprehensive case analysis.
+
+Case context:
+Caption: {caption}
+Court: {court}
+Case type: {case_type}
+
+Document excerpt (first {page_count} page(s)):
+{text_excerpt}
+
+Extract the following categories exhaustively. Include ALL mentioned entities with as much detail as possible:
+
+1. COURTS: Court names, case numbers, locations (address/county/courthouse)
+2. JUDGES: All judges/justices mentioned with titles (Hon., J.S.C., etc.)
+3. PLAINTIFFS: Named plaintiffs (individuals or organizations)
+4. DEFENDANTS: Named defendants (individuals or organizations)
+5. PLAINTIFFS' COUNSEL: Attorneys/firms representing plaintiffs with contact info (email, phone, address)
+6. DEFENDANTS' COUNSEL: Attorneys/firms representing defendants with contact info
+7. PRODUCTS/DEVICES/DRUGS: Accused medical products, devices, drugs, or chemicals
+8. OTHER ENTITIES: Court reporters, mediators, special masters, expert witnesses, etc.
+
+For EACH entity, extract:
+- canonical_name: Full name exactly as written
+- role: One of (court, judge, plaintiff, defendant, plaintiff_counsel, defendant_counsel, product, court_reporter, mediator, special_master, expert_witness, other)
+- title: Professional title if mentioned (Hon., Esquire, J.S.C., Dr., etc.)
+- organization: Law firm or organization affiliation
+- email: Email address if mentioned
+- phone: Phone number if mentioned
+- address: Physical address if mentioned
+- location: For courts - courthouse location/address
+- case_number: For courts - case number or MDL number
+- aliases: List any alternate forms of the name
+
+Be thorough - extract from headers, body text, signatures, and contact blocks. Include attorneys even if only email/phone is given.
+Return empty list if no entities can be extracted.
+"""

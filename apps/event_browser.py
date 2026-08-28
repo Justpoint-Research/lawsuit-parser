@@ -29,6 +29,8 @@ Usage:
 import sys
 from pathlib import Path
 
+# Note: transformers __path__ access warnings (triggered by GLiNER dependency)
+# are suppressed via TRANSFORMERS_VERBOSITY=error environment variable in Makefile
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st

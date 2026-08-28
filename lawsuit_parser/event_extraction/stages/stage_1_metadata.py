@@ -16,6 +16,8 @@ from tqdm import tqdm
 from ...parsers.batch import get_docling_dir
 from ..base import BaseStage
 from ..llm_validation import (
+    extract_actors_from_document_with_llm,
+    extract_actors_from_document_with_nuextract,
     identify_document_title_with_llm,
     identify_document_title_with_nuextract,
     identify_products_with_llm,
@@ -418,6 +420,111 @@ class Stage1Metadata(BaseStage):
         logger.info(f"  Resolved {resolved_count} references to documents in this case")
 
         caption, court, case_type = self._load_case_context(case_id)
+
+        # 3.75. Comprehensive LLM extraction (mandatory pass)
+        # This extracts all parties, counsel, judges, products, etc. from
+        # the first document's text with full contact information. This is
+        # particularly important for MDL/coordinated cases where caption
+        # parsing may not find individual parties.
+        if config.get("comprehensive_llm_extraction", True) and documents:
+            logger.info(f"\n→ Running comprehensive LLM actor extraction (backend={backend})...")
+
+            # Determine which document(s) to extract from
+            doc_count = config.get("llm_extraction_doc_count", 1)
+            docs_to_extract = documents[:doc_count]
+
+            # Get text from selected documents
+            extraction_text_parts = []
+            for doc in docs_to_extract:
+                doc_text = doc_texts.get(doc.doc_id)
+                if not doc_text:
+                    # Try to load from file
+                    text_path = self.get_documents_dir(case_id) / f"{doc.doc_id}.txt"
+                    if text_path.exists():
+                        doc_text = self.load_text(text_path)
+                    else:
+                        doc_text = self._get_document_text(
+                            self.get_documents_dir(case_id) / doc.file_name,
+                            doc.doc_id
+                        )
+
+                if doc_text:
+                    # Extract first N pages (estimate ~3000 chars per page)
+                    max_pages = config.get("llm_extraction_page_count", 2)
+                    max_chars = max_pages * 3000
+                    extraction_text_parts.append(doc_text[:max_chars])
+
+            if extraction_text_parts:
+                extraction_text = "\n\n---DOCUMENT BREAK---\n\n".join(extraction_text_parts)
+
+                # Call comprehensive extraction
+                extractor = (
+                    extract_actors_from_document_with_nuextract
+                    if backend == "nuextract"
+                    else extract_actors_from_document_with_llm
+                )
+                llm_actors = extractor(
+                    extraction_text,
+                    model=llm_model,
+                    base_url=llm_base_url,
+                    caption=caption,
+                    court=court,
+                    case_type=case_type,
+                    page_count=len(extraction_text_parts) * config.get("llm_extraction_page_count", 2),
+                )
+
+                logger.info(f"  LLM extracted {len(llm_actors)} actors")
+
+                # Merge LLM-extracted actors with existing roster
+                # Use _add_actor to handle deduplication
+                for llm_actor in llm_actors:
+                    # Map counsel roles back to standard roles
+                    if llm_actor.role == "counsel":
+                        # Try to infer if plaintiff or defendant counsel
+                        # For now, just use "counsel"
+                        role = "counsel"
+                    else:
+                        role = llm_actor.role
+
+                    # Find first doc_id where this actor might appear
+                    # (LLM extraction doesn't track per-doc)
+                    first_doc_id = docs_to_extract[0].doc_id if docs_to_extract else None
+
+                    # Check if already exists
+                    existing_actor = None
+                    normalized = normalize_party_name(llm_actor.canonical_name)
+                    for actor in actors:
+                        if (actor.role == role and
+                            normalize_party_name(actor.canonical_name) == normalized):
+                            existing_actor = actor
+                            break
+
+                    if existing_actor:
+                        # Merge: add doc_id, enrich with LLM data
+                        if first_doc_id and first_doc_id not in existing_actor.doc_ids:
+                            existing_actor.doc_ids.append(first_doc_id)
+                        # Enrich with LLM-extracted details
+                        if llm_actor.email and not existing_actor.email:
+                            existing_actor.email = llm_actor.email
+                        if llm_actor.phone and not existing_actor.phone:
+                            existing_actor.phone = llm_actor.phone
+                        if llm_actor.address and not existing_actor.address:
+                            existing_actor.address = llm_actor.address
+                        if llm_actor.title and not existing_actor.title:
+                            existing_actor.title = llm_actor.title
+                        if llm_actor.organization and not existing_actor.organization:
+                            existing_actor.organization = llm_actor.organization
+                        if llm_actor.location and not existing_actor.location:
+                            existing_actor.location = llm_actor.location
+                        if llm_actor.case_number and not existing_actor.case_number:
+                            existing_actor.case_number = llm_actor.case_number
+                    else:
+                        # New actor: add to roster
+                        if first_doc_id:
+                            llm_actor.doc_ids = [first_doc_id]
+                        actors.append(llm_actor)
+
+                logger.info(f"  Total roster after LLM extraction: {len(actors)} actors")
 
         # 4. Validate the discovered actor roster with an LLM (optional)
         if config.get("validate_actors_with_llm", True) and actors:

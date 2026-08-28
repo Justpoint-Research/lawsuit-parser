@@ -124,7 +124,7 @@ case-browser: ensure-venv
 event-browser: ensure-venv
 	@echo "Starting Event Browser app..."
 	@echo "Opening app at http://localhost:8501"
-	uv run streamlit run apps/event_browser.py
+	TRANSFORMERS_VERBOSITY=error PYTHONWARNINGS=ignore uv run streamlit run apps/event_browser.py
 
 test-pdf-parser: ensure-venv
 	@echo "Testing PDF parser on sample document..."

@@ -73,6 +73,7 @@ import requests
 from .models import Actor
 from .prompts import (
     ACTOR_RESPONSE_SCHEMA,
+    COMPREHENSIVE_ACTOR_RESPONSE_SCHEMA,
     PRODUCT_RESPONSE_SCHEMA,
     PRODUCT_TYPES,
     SUMMARY_RESPONSE_SCHEMA,
@@ -81,6 +82,7 @@ from .prompts import (
     build_actor_prompt,
     build_batch_event_prompt,
     build_batch_event_response_schema,
+    build_comprehensive_actor_extraction_prompt,
     build_event_prompt,
     build_event_response_schema,
     build_product_prompt,
@@ -750,3 +752,181 @@ def synthesize_events_with_nuextract(
         return _clean_event_results(result.get("events", []), candidate_actors, dates)
 
     return _with_fallback("NuExtract event synthesis", [], call)
+
+
+# ============================================================================
+# Comprehensive actor extraction from document (Stage 1 mandatory LLM pass)
+# ============================================================================
+
+
+def _clean_comprehensive_actor_results(raw_actors: list[dict]) -> list[Actor]:
+    """Convert LLM comprehensive extraction response to Actor objects.
+
+    Maps LLM role names to standard role values and creates Actor instances
+    with all available contact information.
+    """
+    # Map LLM roles to standard Actor roles
+    role_mapping = {
+        "court": "court",
+        "judge": "judge",
+        "plaintiff": "plaintiff",
+        "defendant": "defendant",
+        "plaintiff_counsel": "counsel",
+        "defendant_counsel": "counsel",
+        "product": "drug",  # Will be refined by product_type if available
+        "court_reporter": "court_reporter",
+        "mediator": "mediator",
+        "special_master": "special_master",
+        "expert_witness": "witness",
+        "other": "other",
+    }
+
+    actors = []
+    for raw in raw_actors:
+        name = str(raw.get("canonical_name") or "").strip()
+        if not name:
+            continue
+
+        llm_role = str(raw.get("role") or "").strip().lower()
+        role = role_mapping.get(llm_role, "other")
+
+        # Handle product types
+        if llm_role == "product":
+            # Default to 'drug', could be refined with product_type field
+            role = "drug"
+
+        actors.append(Actor(
+            canonical_name=name,
+            role=role,
+            is_named=True,
+            source="llm",
+            aliases=[str(a).strip() for a in raw.get("aliases", []) if str(a).strip()],
+            title=raw.get("title") or None,
+            organization=raw.get("organization") or None,
+            email=raw.get("email") or None,
+            phone=raw.get("phone") or None,
+            address=raw.get("address") or None,
+            location=raw.get("location") or None,
+            case_number=raw.get("case_number") or None,
+        ))
+
+    return actors
+
+
+def extract_actors_from_document_with_llm(
+    text_excerpt: str,
+    *,
+    model: str,
+    base_url: str,
+    caption: str | None = None,
+    court: str | None = None,
+    case_type: str | None = None,
+    page_count: int = 1,
+    timeout: float = 120.0,
+) -> list[Actor]:
+    """Extract comprehensive actor information from document text using LLM.
+
+    This is a mandatory extraction pass that runs on every document, extracting
+    all parties, counsel, judges, products, and other entities with full
+    contact information. Unlike validate_actors_with_llm which only validates
+    existing candidates, this extracts actors from scratch.
+
+    Args:
+        text_excerpt: Document text to extract from (typically first page(s))
+        model: Ollama model tag (must already be pulled)
+        base_url: Ollama server URL
+        caption: Case caption if known
+        court: Court name if known
+        case_type: Case type if known
+        page_count: Number of pages in excerpt (for prompt context)
+        timeout: Request timeout in seconds
+
+    Returns:
+        List of Actor objects with full details, or empty list if extraction
+        fails or LLM is unreachable.
+    """
+    def call() -> list[Actor]:
+        prompt = build_comprehensive_actor_extraction_prompt(
+            text_excerpt=text_excerpt,
+            caption=caption,
+            court=court,
+            case_type=case_type,
+            page_count=page_count,
+        )
+        content = _call_ollama(
+            model=model,
+            base_url=base_url,
+            prompt=prompt,
+            schema=COMPREHENSIVE_ACTOR_RESPONSE_SCHEMA,
+            timeout=timeout,
+        )
+        results = json.loads(content).get("actors", [])
+        return _clean_comprehensive_actor_results(results)
+
+    return _with_fallback("LLM comprehensive actor extraction", [], call)
+
+
+def extract_actors_from_document_with_nuextract(
+    text_excerpt: str,
+    *,
+    model: str,
+    base_url: str,
+    caption: str | None = None,
+    court: str | None = None,
+    case_type: str | None = None,
+    page_count: int = 1,
+    timeout: float = 120.0,
+) -> list[Actor]:
+    """Extract comprehensive actor information from document text using NuExtract.
+
+    Same contract as extract_actors_from_document_with_llm but uses NuExtract
+    served via vLLM instead of Ollama.
+
+    Args:
+        text_excerpt: Document text to extract from
+        model: vLLM-served model identifier
+        base_url: vLLM OpenAI-compatible API base URL
+        caption: Case caption if known
+        court: Court name if known
+        case_type: Case type if known
+        page_count: Number of pages in excerpt
+        timeout: Request timeout in seconds
+
+    Returns:
+        List of Actor objects with full details, or empty list if extraction fails.
+    """
+    template = {
+        "actors": [
+            {
+                "canonical_name": "",
+                "role": "court|judge|plaintiff|defendant|plaintiff_counsel|defendant_counsel|product|court_reporter|mediator|special_master|expert_witness|other",
+                "title": "",
+                "organization": "",
+                "email": "",
+                "phone": "",
+                "address": "",
+                "location": "",
+                "case_number": "",
+                "aliases": [""],
+            }
+        ]
+    }
+
+    def call() -> list[Actor]:
+        prompt = build_comprehensive_actor_extraction_prompt(
+            text_excerpt=text_excerpt,
+            caption=caption,
+            court=court,
+            case_type=case_type,
+            page_count=page_count,
+        )
+        result = _call_nuextract(
+            model=model,
+            base_url=base_url,
+            prompt=prompt,
+            template=template,
+            timeout=timeout,
+        )
+        return _clean_comprehensive_actor_results(result.get("actors", []))
+
+    return _with_fallback("NuExtract comprehensive actor extraction", [], call)

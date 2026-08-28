@@ -132,6 +132,74 @@ def build_batch_event_response_schema(items: list[dict]) -> dict:
     return {"type": "object", "properties": properties, "required": list(properties.keys())}
 
 
+# ============================================================================
+# Comprehensive actor extraction (Stage 1 LLM pass)
+# ============================================================================
+
+COMPREHENSIVE_ACTOR_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "actors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "canonical_name": {"type": "string"},
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "court", "judge", "plaintiff", "defendant",
+                            "plaintiff_counsel", "defendant_counsel",
+                            "product", "court_reporter", "mediator",
+                            "special_master", "expert_witness", "other"
+                        ]
+                    },
+                    "title": {"type": "string"},
+                    "organization": {"type": "string"},
+                    "email": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "address": {"type": "string"},
+                    "location": {"type": "string"},
+                    "case_number": {"type": "string"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["canonical_name", "role"],
+            },
+        },
+    },
+    "required": ["actors"],
+}
+
+
+def build_comprehensive_actor_extraction_prompt(
+    text_excerpt: str,
+    caption: str | None = None,
+    court: str | None = None,
+    case_type: str | None = None,
+    page_count: int = 1,
+) -> str:
+    """Build prompt for comprehensive actor extraction from document text.
+
+    Args:
+        text_excerpt: Document text (typically first page or first N pages)
+        caption: Case caption if known
+        court: Court name if known
+        case_type: Case type if known
+        page_count: Number of pages in the excerpt
+
+    Returns:
+        Formatted prompt string
+    """
+    t = _templates()["comprehensive_actor_extraction"]
+    return t["template"].format(
+        caption=caption or "Unknown",
+        court=court or "Unknown",
+        case_type=case_type or "Unknown",
+        page_count=page_count,
+        text_excerpt=text_excerpt[:20000],  # Limit to prevent token overflow
+    )
+
+
 @lru_cache(maxsize=1)
 def _templates() -> dict:
     path = Path(__file__).resolve().parent.parent.parent / "config" / "llm_prompts.toml"

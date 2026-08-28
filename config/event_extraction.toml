@@ -24,6 +24,16 @@ extract_from_docling = true
 # in Stage 2.
 extract_from_confirmations = true
 
+# Run a comprehensive LLM extraction pass on the first document(s) to extract
+# ALL parties, counsel, judges, products, and other entities with full contact
+# information (email, phone, address). This is especially important for MDL/
+# coordinated cases where caption parsing may not find individual parties.
+# Extracts from the first N pages of the first M documents to balance speed
+# vs completeness.
+comprehensive_llm_extraction = true
+llm_extraction_doc_count = 1      # Extract from first N documents
+llm_extraction_page_count = 2     # Extract from first N pages per document
+
 # Sanity-check the regex-discovered actor roster with an LLM before writing
 # actors.json - corrects mis-assigned roles, drops obvious junk (e.g. a
 # stray address line), and phrases the GLiNER labels. Falls back to the
