@@ -4,10 +4,18 @@ Batch process all PDF documents in the data directory.
 
 This script:
 1. Finds all PDF files in data/cases/
-2. Parses each PDF using Docling for structured extraction
-3. Saves results to JSON files alongside the PDFs
-4. Shows progress with tqdm
-5. Handles errors gracefully and logs failures
+2. Parses each PDF using Docling for structured extraction, saving
+   .docling.json/.md next to each PDF's case-level docling/ directory
+   (a case's own documents/ files) - plus a parsed-JSON sidecar for
+   confirmations/ PDFs only (e-filing confirmation notices), which Stage 1
+   of the event extraction pipeline still reads for filer/judge/timestamp
+   metadata. A case's main documents/ files do NOT get that sidecar - the
+   pipeline reads those via Docling only (see
+   BaseStage.load_document_text's docstring for why: the sidecar's
+   paragraph reconstruction can silently drop entire pages Docling's own
+   flat text export still captures).
+3. Shows progress with tqdm
+4. Handles errors gracefully and logs failures
 
 All log output (ours and the noisy third-party libraries Docling pulls in,
 e.g. torch/transformers) is written to pdf_parsing.log. The console only
@@ -16,7 +24,6 @@ shows the tqdm progress bar and a final success/failure summary.
 Usage:
     python scripts/parse_all_pdfs.py
     python scripts/parse_all_pdfs.py --case-id 104
-    python scripts/parse_all_pdfs.py --output-dir data/parsed
     python scripts/parse_all_pdfs.py --skip-existing
 """
 
@@ -87,12 +94,6 @@ def quiet_console(log_path: Path):
     help='Root data directory (default: data)'
 )
 @click.option(
-    '--output-dir',
-    type=str,
-    default=None,
-    help='Output directory for parsed JSONs (default: save alongside PDFs)'
-)
-@click.option(
     '--case-id',
     type=str,
     default=None,
@@ -115,7 +116,7 @@ def quiet_console(log_path: Path):
     default=8,
     help='Number of PDFs to parse concurrently (default: 8)'
 )
-def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existing: bool, no_gpu: bool, workers: int):
+def main(data_dir: str, case_id: str | None, skip_existing: bool, no_gpu: bool, workers: int):
     """Parse all PDF documents and extract structured content.
 
     Examples:
@@ -127,10 +128,6 @@ def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existi
       # Parse only case 104
 
       python scripts/parse_all_pdfs.py --case-id 104
-
-      # Save to separate output directory
-
-      python scripts/parse_all_pdfs.py --output-dir data/parsed
 
       # Skip already processed files
 
@@ -146,14 +143,12 @@ def main(data_dir: str, output_dir: str | None, case_id: str | None, skip_existi
     """
     # Convert to Path objects
     data_dir_path = Path(data_dir)
-    output_dir_path = Path(output_dir) if output_dir else None
 
     configure_logging(LOG_FILE)
 
     with quiet_console(LOG_FILE) as console:
         stats = parse_all_pdfs(
             data_dir=data_dir_path,
-            output_dir=output_dir_path,
             case_id=case_id,
             skip_existing=skip_existing,
             use_gpu=not no_gpu,

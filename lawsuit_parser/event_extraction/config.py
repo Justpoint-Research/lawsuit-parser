@@ -29,6 +29,24 @@ class Stage1Config(BaseModel):
         default=True,
         description="Extract filer/judge/timestamp metadata from matching confirmations/ notices",
     )
+    comprehensive_llm_extraction: bool = Field(
+        default=True,
+        description="Run a comprehensive LLM extraction pass to extract ALL parties, counsel, "
+                     "judges, products, and other entities with full contact information. One "
+                     "LLM call per document, each attributed to the document it came from.",
+    )
+    llm_extraction_doc_count: int = Field(
+        default=-1,
+        description="How many documents to run comprehensive_llm_extraction over. -1 = all "
+                     "documents in the case; a positive N caps it to the first N documents.",
+    )
+    llm_extraction_page_count: int = Field(
+        default=15,
+        gt=0,
+        description="Extract from the first N pages (~3000 chars/page) of each document in "
+                     "comprehensive_llm_extraction, to bound cost against outlier documents "
+                     "running to hundreds of pages.",
+    )
     validate_actors_with_llm: bool = Field(
         default=True,
         description="Sanity-check the regex-discovered actor roster with an LLM before "

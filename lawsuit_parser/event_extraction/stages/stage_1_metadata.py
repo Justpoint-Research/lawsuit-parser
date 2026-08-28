@@ -42,6 +42,7 @@ from ..models import (
     PDFMetadata,
 )
 from ..utils import (
+    extract_appearances_block,
     extract_cm_ecf_header,
     extract_confirmation_details,
     extract_dates_from_text,
@@ -51,7 +52,7 @@ from ..utils import (
     find_litigation_captions,
     find_party_aliases,
     find_title_candidates,
-    normalize_party_name,
+    names_match,
     parse_caption_block,
     parse_date_loosely,
 )
@@ -278,26 +279,6 @@ class Stage1Metadata(BaseStage):
                     for defendant in caption_parties["defendants"]:
                         self._add_actor(actors, defendant, "defendant", "caption", doc_id)
 
-                # Try to load parsed JSON for additional metadata
-                parsed_path = pdf_path.with_suffix(".json")
-
-                if parsed_path.exists():
-                    try:
-                        parsed_data = self.load_json(parsed_path)
-                        legacy_title = parsed_data.get("title")
-                        # Some upstream parsers default "title" to the input
-                        # filename when they found no real title - that's not
-                        # a title, it's the file_name field again under a
-                        # different name. Only trust it if it isn't that.
-                        if (
-                            legacy_title
-                            and legacy_title != pdf_path.stem
-                            and not doc_metadata.document_title
-                        ):
-                            doc_metadata.document_title = legacy_title
-                    except Exception as e:
-                        logger.warning(f"  Warning: Failed to load parsed JSON: {e}")
-
             # Extract metadata from the matching e-filing confirmation notice
             # (same file name under confirmations/ - see get_confirmations_dir).
             # The confirmation is only ever a metadata source here: entity
@@ -352,6 +333,13 @@ class Stage1Metadata(BaseStage):
                 text = self._get_document_text(pdf_path, doc_id)
             if text:
                 doc_texts[doc_id] = text
+
+                # Deterministic backstop for a transcript's "APPEARANCES"
+                # block (see utils.extract_appearances_block) - the LLM
+                # comprehensive extraction pass below tends to under-
+                # enumerate this dense, repeating list.
+                for entry in extract_appearances_block(text):
+                    self._add_appearances_actor(actors, entry, doc_id)
 
             # Extract dates from document
             if date_patterns and text:
@@ -429,12 +417,23 @@ class Stage1Metadata(BaseStage):
         if config.get("comprehensive_llm_extraction", True) and documents:
             logger.info(f"\n→ Running comprehensive LLM actor extraction (backend={backend})...")
 
-            # Determine which document(s) to extract from
+            # Determine which document(s) to extract from. -1 means "all
+            # documents in the case" rather than capping to the first N -
+            # each document gets its own LLM call below (not concatenated),
+            # so cost scales with the docs actually present.
             doc_count = config.get("llm_extraction_doc_count", 1)
-            docs_to_extract = documents[:doc_count]
+            docs_to_extract = documents if doc_count < 0 else documents[:doc_count]
 
-            # Get text from selected documents
-            extraction_text_parts = []
+            max_pages = config.get("llm_extraction_page_count", 2)
+            max_chars = max_pages * 3000
+
+            extractor = (
+                extract_actors_from_document_with_nuextract
+                if backend == "nuextract"
+                else extract_actors_from_document_with_llm
+            )
+
+            total_llm_actors = 0
             for doc in docs_to_extract:
                 doc_text = doc_texts.get(doc.doc_id)
                 if not doc_text:
@@ -448,35 +447,24 @@ class Stage1Metadata(BaseStage):
                             doc.doc_id
                         )
 
-                if doc_text:
-                    # Extract first N pages (estimate ~3000 chars per page)
-                    max_pages = config.get("llm_extraction_page_count", 2)
-                    max_chars = max_pages * 3000
-                    extraction_text_parts.append(doc_text[:max_chars])
+                if not doc_text:
+                    continue
 
-            if extraction_text_parts:
-                extraction_text = "\n\n---DOCUMENT BREAK---\n\n".join(extraction_text_parts)
-
-                # Call comprehensive extraction
-                extractor = (
-                    extract_actors_from_document_with_nuextract
-                    if backend == "nuextract"
-                    else extract_actors_from_document_with_llm
-                )
+                # One call per document (not concatenated), so each actor
+                # found can be attributed to the document it actually came
+                # from instead of always the first document.
                 llm_actors = extractor(
-                    extraction_text,
+                    doc_text[:max_chars],
                     model=llm_model,
                     base_url=llm_base_url,
                     caption=caption,
                     court=court,
                     case_type=case_type,
-                    page_count=len(extraction_text_parts) * config.get("llm_extraction_page_count", 2),
+                    page_count=max_pages,
                 )
-
-                logger.info(f"  LLM extracted {len(llm_actors)} actors")
+                total_llm_actors += len(llm_actors)
 
                 # Merge LLM-extracted actors with existing roster
-                # Use _add_actor to handle deduplication
                 for llm_actor in llm_actors:
                     # Map counsel roles back to standard roles
                     if llm_actor.role == "counsel":
@@ -486,23 +474,17 @@ class Stage1Metadata(BaseStage):
                     else:
                         role = llm_actor.role
 
-                    # Find first doc_id where this actor might appear
-                    # (LLM extraction doesn't track per-doc)
-                    first_doc_id = docs_to_extract[0].doc_id if docs_to_extract else None
-
                     # Check if already exists
                     existing_actor = None
-                    normalized = normalize_party_name(llm_actor.canonical_name)
                     for actor in actors:
-                        if (actor.role == role and
-                            normalize_party_name(actor.canonical_name) == normalized):
+                        if actor.role == role and names_match(actor.canonical_name, llm_actor.canonical_name):
                             existing_actor = actor
                             break
 
                     if existing_actor:
-                        # Merge: add doc_id, enrich with LLM data
-                        if first_doc_id and first_doc_id not in existing_actor.doc_ids:
-                            existing_actor.doc_ids.append(first_doc_id)
+                        # Merge: add this document's doc_id, enrich with LLM data
+                        if doc.doc_id not in existing_actor.doc_ids:
+                            existing_actor.doc_ids.append(doc.doc_id)
                         # Enrich with LLM-extracted details
                         if llm_actor.email and not existing_actor.email:
                             existing_actor.email = llm_actor.email
@@ -519,12 +501,12 @@ class Stage1Metadata(BaseStage):
                         if llm_actor.case_number and not existing_actor.case_number:
                             existing_actor.case_number = llm_actor.case_number
                     else:
-                        # New actor: add to roster
-                        if first_doc_id:
-                            llm_actor.doc_ids = [first_doc_id]
+                        # New actor: add to roster, attributed to this document
+                        llm_actor.doc_ids = [doc.doc_id]
                         actors.append(llm_actor)
 
-                logger.info(f"  Total roster after LLM extraction: {len(actors)} actors")
+            logger.info(f"  LLM extracted {total_llm_actors} actor mention(s) across {len(docs_to_extract)} document(s)")
+            logger.info(f"  Total roster after LLM extraction: {len(actors)} actors")
 
         # 4. Validate the discovered actor roster with an LLM (optional)
         if config.get("validate_actors_with_llm", True) and actors:
@@ -683,9 +665,8 @@ class Stage1Metadata(BaseStage):
         if not name:
             return
 
-        normalized = normalize_party_name(name)
         for actor in actors:
-            if actor.role == role and normalize_party_name(actor.canonical_name) == normalized:
+            if actor.role == role and names_match(actor.canonical_name, name):
                 if doc_id and doc_id not in actor.doc_ids:
                     actor.doc_ids.append(doc_id)
                 return
@@ -698,6 +679,55 @@ class Stage1Metadata(BaseStage):
             aliases=find_party_aliases(name),
             doc_ids=[doc_id] if doc_id else [],
         ))
+
+    def _add_appearances_actor(self, actors: list[Actor], entry: dict, doc_id: str) -> None:
+        """Merge one attorney parsed from a transcript's APPEARANCES block
+        (see utils.extract_appearances_block) into the roster, enriching an
+        existing same-person entry (e.g. one the LLM pass already found)
+        rather than duplicating it.
+
+        Args:
+            actors: Roster to add to (mutated in place)
+            entry: One dict from extract_appearances_block
+            doc_id: Document this attorney was found in
+        """
+        name = (entry.get("canonical_name") or "").strip()
+        if not name:
+            return
+
+        existing_actor = None
+        for actor in actors:
+            if actor.role == "counsel" and names_match(actor.canonical_name, name):
+                existing_actor = actor
+                break
+
+        if existing_actor:
+            if doc_id not in existing_actor.doc_ids:
+                existing_actor.doc_ids.append(doc_id)
+            if entry.get("email") and not existing_actor.email:
+                existing_actor.email = entry["email"]
+            if entry.get("phone") and not existing_actor.phone:
+                existing_actor.phone = entry["phone"]
+            if entry.get("address") and not existing_actor.address:
+                existing_actor.address = entry["address"]
+            if entry.get("organization") and not existing_actor.organization:
+                existing_actor.organization = entry["organization"]
+            if entry.get("title") and not existing_actor.title:
+                existing_actor.title = entry["title"]
+        else:
+            actors.append(Actor(
+                canonical_name=name,
+                role="counsel",
+                is_named=True,
+                source="appearances_block",
+                aliases=find_party_aliases(name),
+                doc_ids=[doc_id],
+                organization=entry.get("organization"),
+                title=entry.get("title"),
+                email=entry.get("email"),
+                phone=entry.get("phone"),
+                address=entry.get("address"),
+            ))
 
     def _load_case_context(self, case_id: str) -> tuple[str | None, str | None, str | None]:
         """Load case-level caption/court/case_type strings, for LLM context
@@ -1004,6 +1034,10 @@ class Stage1Metadata(BaseStage):
     def _get_document_text(self, pdf_path: Path, doc_id: str) -> str:
         """Get document text for date extraction.
 
+        Docling-only, not the legacy parsed JSON sidecar (see
+        BaseStage.load_document_text's docstring for why: it can silently
+        drop entire pages from a multi-page PDF).
+
         Args:
             pdf_path: Path to PDF file
             doc_id: Document ID
@@ -1011,27 +1045,12 @@ class Stage1Metadata(BaseStage):
         Returns:
             Document text
         """
-        # Try parsed JSON first
-        parsed_path = pdf_path.with_suffix(".json")
-
-        if parsed_path.exists():
-            try:
-                parsed_data = self.load_json(parsed_path)
-                if "raw_text" in parsed_data:
-                    return parsed_data["raw_text"]
-                if "paragraphs" in parsed_data:
-                    return "\n\n".join(parsed_data["paragraphs"])
-            except Exception:
-                pass
-
-        # Try Docling JSON
         docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
         if docling_path.exists():
             try:
                 docling_data = self.load_json(docling_path)
                 if "texts" in docling_data:
-                    texts = [item.get("text", "") for item in docling_data["texts"]]
-                    return "\n".join(texts)
+                    return "\n".join(item.get("text", "") for item in docling_data["texts"])
             except Exception:
                 pass
 

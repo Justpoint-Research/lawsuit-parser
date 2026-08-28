@@ -24,15 +24,23 @@ extract_from_docling = true
 # in Stage 2.
 extract_from_confirmations = true
 
-# Run a comprehensive LLM extraction pass on the first document(s) to extract
-# ALL parties, counsel, judges, products, and other entities with full contact
-# information (email, phone, address). This is especially important for MDL/
-# coordinated cases where caption parsing may not find individual parties.
-# Extracts from the first N pages of the first M documents to balance speed
-# vs completeness.
+# Run a comprehensive LLM extraction pass to extract ALL parties, counsel,
+# judges, products, and other entities with full contact information (email,
+# phone, address). This is especially important for MDL/coordinated cases
+# where caption parsing may not find individual parties.
+# One LLM call per document (not concatenated), each reading only its first
+# N pages to balance speed vs completeness; each actor found is attributed
+# to the document it actually came from.
 comprehensive_llm_extraction = true
-llm_extraction_doc_count = 1      # Extract from first N documents
-llm_extraction_page_count = 2     # Extract from first N pages per document
+llm_extraction_doc_count = -1     # -1 = all documents in the case; or cap to first N
+# 15 pages (~45,000 chars) - confirmed against mdl-1954's actual documents
+# to comfortably cover appearance pages and settlement-order sections that
+# sit past the old 2-page cap (e.g. a Special Master appointment ~char 6900
+# into a document, or co-counsel listed ~char 6100 in). Some documents in
+# this dataset run to 300K+ chars (e.g. mdl-1358), so this stays a bounded
+# cap rather than the full document, to avoid one outlier document turning
+# into a single enormous LLM call.
+llm_extraction_page_count = 15    # Extract from first N pages per document
 
 # Sanity-check the regex-discovered actor roster with an LLM before writing
 # actors.json - corrects mis-assigned roles, drops obvious junk (e.g. a

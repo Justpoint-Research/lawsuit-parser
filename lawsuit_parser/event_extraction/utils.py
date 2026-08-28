@@ -9,8 +9,17 @@ from typing import Any
 import pandas as pd
 import pypdfium2 as pdfium
 from nltk.tokenize.punkt import PunktParameters, PunktSentenceTokenizer
+from rapidfuzz import fuzz
 
 logger = logging.getLogger(__name__)
+
+# Minimum rapidfuzz token_set_ratio (0-100) for two actor names to be
+# considered the same person/entity in names_match - same approach and
+# threshold as Stage 2's GLiNER entity-to-actor linking
+# (stage_2_gliner.py's _FUZZY_MATCH_THRESHOLD), reused here so a missing
+# middle name/initial (e.g. "Melissa Geist" vs "MELISSA A. GEIST") doesn't
+# create a duplicate actor.
+NAME_FUZZY_MATCH_THRESHOLD = 85.0
 
 
 def parse_date_loosely(text: str) -> datetime | None:
@@ -393,6 +402,23 @@ def normalize_party_name(name: str) -> str:
     return name.strip()
 
 
+def names_match(name_a: str, name_b: str, threshold: float = NAME_FUZZY_MATCH_THRESHOLD) -> bool:
+    """Fuzzy-compare two party/actor names for actor-roster dedup, tolerant
+    of a missing middle name/initial, minor typos, or word-order
+    differences that exact normalize_party_name equality would treat as
+    two different people.
+
+    Args:
+        name_a: First name to compare
+        name_b: Second name to compare
+        threshold: Minimum rapidfuzz token_set_ratio (0-100) to count as a match
+
+    Returns:
+        True if the two names are fuzzy-equivalent
+    """
+    return fuzz.token_set_ratio(normalize_party_name(name_a), normalize_party_name(name_b)) >= threshold
+
+
 def find_party_aliases(party_name: str) -> list[str]:
     """Generate common aliases for a party name.
 
@@ -725,3 +751,112 @@ def find_litigation_captions(text: str) -> list[str]:
             seen.add(key)
             names.append(name)
     return names
+
+
+# ============================================================================
+# Deposition/hearing transcript "APPEARANCES" block (deterministic backstop
+# for Stage 1's comprehensive LLM actor extraction - see
+# Stage1Metadata._extract_appearances_actors)
+# ============================================================================
+
+# Court-reporter transcripts (e.g. a deposition or hearing cover page) list
+# every appearing firm/attorney in a fixed, repeating shape:
+#   FIRM NAME BY:  ATTORNEY, ESQUIRE [(via telephone)] ... address ...
+#   phone ... email ... Representing the Plaintiffs/Defendants
+# The transcript's own line numbers get flattened into this text by Docling
+# (no page/column structure survives), landing mid-field (e.g. inside a
+# street address) rather than at clean boundaries - a general-purpose LLM
+# extraction pass tends to under-enumerate this dense block, so this is a
+# from-scratch deterministic parse instead of a validated-name gazetteer
+# lookup. Firm name allows lowercase (e.g. "McCARTNEY") since not every firm
+# name is purely uppercase; boilerplate cleanup below strips what a
+# character class alone can't (page headers landing on the same text line).
+_APPEARANCES_BLOCK_PATTERN = re.compile(
+    r"(?P<firm>[A-Z][A-Za-z0-9&,.'\- ]{2,120}?)\s*(?:\d{1,3}\s+)?BY:\s*"
+    r"(?P<body>.*?)"
+    r"Representing the (?P<side>Plaintiffs|Defendants)",
+    re.DOTALL,
+)
+_APPEARANCES_ATTORNEY_PATTERN = re.compile(
+    r"(?:BY:\s*)?([A-Z][A-Za-z.' ]+?),\s*ESQUIRE(?:\s*\(via telephone\))?"
+)
+_APPEARANCES_EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+\.\w+")
+_APPEARANCES_PHONE_PATTERN = re.compile(r"\(\d{3}\)\s*\d{3}-\d{4}")
+_APPEARANCES_STRAY_LINE_NUMBER_PATTERN = re.compile(r"(?<=\s)\d{1,2}(?=\s)")
+
+
+def _clean_appearances_firm_name(raw: str) -> str:
+    """Strip court-reporter page-header boilerplate that can land on the
+    same flattened text line as a firm name (see module docstring above),
+    which _APPEARANCES_BLOCK_PATTERN's character class alone can't exclude.
+    """
+    raw = re.sub(r"[A-Za-z ]+Technologies,?\s+Inc\.[^\n]*", " ", raw)
+    raw = re.sub(r"\d{1,2}\.\d{3}\.\d{3}\.[A-Za-z0-9]{3,4}", " ", raw)
+    raw = re.sub(r"\S+@\S+\.\S+", " ", raw)
+    raw = re.sub(
+        r"(?:January|February|March|April|May|June|July|August|September|"
+        r"October|November|December)\s+\d{1,2},\s+\d{4}",
+        " ",
+        raw,
+    )
+    raw = re.sub(r"Page\s+\d+", " ", raw)
+    raw = re.sub(r"^\s*\d{1,3}\s+", "", raw.strip())
+    return re.sub(r"\s+", " ", raw).strip(" -\n\t")
+
+
+def extract_appearances_block(text: str) -> list[dict[str, str | None]]:
+    """Deterministically parse every attorney out of a transcript's
+    "APPEARANCES" block (see module comment above for the shape and why
+    this exists as a backstop alongside the LLM comprehensive extraction
+    pass).
+
+    Args:
+        text: Document text to search (typically a deposition/hearing
+              transcript's cover pages)
+
+    Returns:
+        List of dicts, one per attorney, with keys: canonical_name,
+        organization (firm name), title ("Esquire"), email, phone, address,
+        side ("Plaintiffs" or "Defendants" - the caller maps this to a
+        standard role). Empty list if no APPEARANCES-style block is found.
+    """
+    results: list[dict[str, str | None]] = []
+
+    for block in _APPEARANCES_BLOCK_PATTERN.finditer(text):
+        firm = _clean_appearances_firm_name(block.group("firm"))
+        side = block.group("side")
+        body = block.group("body")
+        if not firm:
+            continue
+
+        attorneys = [m.strip() for m in _APPEARANCES_ATTORNEY_PATTERN.findall(body)]
+        if not attorneys:
+            continue
+        emails = _APPEARANCES_EMAIL_PATTERN.findall(body)
+        phones = _APPEARANCES_PHONE_PATTERN.findall(body)
+        phone = phones[0] if phones else None
+
+        # Address: whatever's left in the block after removing the
+        # attorney/telephone segments, phone, and email - then a best-effort
+        # strip of stray transcript line numbers. This can occasionally eat
+        # a genuine 1-2 digit street number along with a line number (the
+        # two are indistinguishable from text alone), so treat this field
+        # as a helpful approximation, not guaranteed-exact.
+        address = _APPEARANCES_ATTORNEY_PATTERN.sub(" ", body)
+        address = _APPEARANCES_EMAIL_PATTERN.sub(" ", address)
+        address = _APPEARANCES_PHONE_PATTERN.sub(" ", address)
+        address = _APPEARANCES_STRAY_LINE_NUMBER_PATTERN.sub(" ", address)
+        address = re.sub(r"\s+", " ", address).strip(" ,\n\t") or None
+
+        for i, name in enumerate(attorneys):
+            results.append({
+                "canonical_name": name,
+                "organization": firm,
+                "title": "Esquire",
+                "email": emails[i] if i < len(emails) else None,
+                "phone": phone,
+                "address": address,
+                "side": side,
+            })
+
+    return results
