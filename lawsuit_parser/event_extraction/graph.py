@@ -149,6 +149,13 @@ def build_case_graph(artifacts: CaseArtifacts, include_events: bool = False) -> 
                 if actor_name in g:
                     g.add_edge(node_id, actor_name, kind="involves")
 
+    # Drop nodes with no edges at all (e.g. an LLM-discovered actor Stage 2
+    # never actually linked to any document, or a document Docling found no
+    # text for) - a node with zero relationships adds visual clutter, not
+    # information, to a graph whose whole point is showing who/what is
+    # connected to what.
+    g.remove_nodes_from(list(nx.isolates(g)))
+
     return g
 
 
@@ -172,5 +179,37 @@ def render_pyvis_html(g: nx.DiGraph, height: str = "750px") -> str:
     st.dataframe/st.table - see this module's and browse.py's docstrings."""
     net = Network(height=height, width="100%", directed=True, cdn_resources="in_line", notebook=False)
     net.from_nx(g)
-    net.show_buttons(filter_=["physics"])
+    # Default spacing/font left labels overlapping into unreadable text
+    # wherever a document has many one-off actor connections (confirmed on
+    # mdl-1954: an 18-attorney "APPEARANCES" block all radiating off one
+    # document rendered as a solid smear of overlapping names at pyvis's
+    # defaults). avoidOverlap pushes nodes apart based on their own size
+    # instead of treating them as points; a stronger negative
+    # gravitationalConstant and longer springLength spread the whole graph
+    # out further; a white stroke behind each label keeps it legible over
+    # crossing edges and nearby nodes. More stabilization iterations so it
+    # settles into that layout before physics "cools", instead of still
+    # visibly drifting/overlapping when the page finishes loading.
+    net.set_options("""
+    var options = {
+      "nodes": {
+        "font": { "size": 16, "strokeWidth": 3, "strokeColor": "#ffffff" }
+      },
+      "edges": {
+        "smooth": false,
+        "arrows": { "to": { "enabled": true, "scaleFactor": 0.5 } }
+      },
+      "physics": {
+        "barnesHut": {
+          "gravitationalConstant": -12000,
+          "centralGravity": 0.3,
+          "springLength": 180,
+          "springConstant": 0.03,
+          "avoidOverlap": 1
+        },
+        "minVelocity": 0.75,
+        "stabilization": { "iterations": 400 }
+      }
+    }
+    """)
     return net.generate_html(notebook=False)

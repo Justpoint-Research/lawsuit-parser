@@ -55,20 +55,40 @@ st.set_page_config(
 )
 
 
+def _artifacts_signature(case_id: str, output_root: str) -> float:
+    """Latest mtime across a case's events/*.json artifacts - included in
+    the cache key below so re-running extraction (which overwrites those
+    files) invalidates the cache on the next script rerun, without needing
+    a full Streamlit process restart. A plain st.cache_data key of just
+    (case_id, data_root, output_root) never changes across an extraction
+    re-run, so it kept serving stale actors/entities from before a fix
+    (confirmed: a case re-extracted mid-session still showed pre-fix
+    plaintiff/defendant/judge data until the server process was restarted)."""
+    events_dir = Path(output_root) / case_id / "events"
+    if not events_dir.exists():
+        return 0.0
+    return max((p.stat().st_mtime for p in events_dir.glob("*.json")), default=0.0)
+
+
 @st.cache_data(show_spinner=False)
-def _load_artifacts(case_id: str, data_root: str, output_root: str):
+def _load_artifacts(case_id: str, data_root: str, output_root: str, _signature: float):
     """Cached so switching filters doesn't re-read artifacts from disk.
-    Cache key is (case_id, data_root, output_root); re-run extraction and
-    rerun the app to pick up fresh output for a case."""
+    `_signature` (see _artifacts_signature) makes the cache key change
+    whenever the underlying files do, so a script rerun after re-running
+    extraction picks up fresh output automatically."""
     return load_case_artifacts(case_id, Path(data_root), Path(output_root))
 
 
 @st.cache_data(show_spinner=False)
-def _render_graph_html(case_id: str, data_root: str, output_root: str, include_events: bool, actor_filter: tuple[str, ...]) -> str:
+def _render_graph_html(
+    case_id: str, data_root: str, output_root: str, _signature: float, include_events: bool, actor_filter: tuple[str, ...]
+) -> str:
     """Cached on every input that changes the rendered graph, so toggling
     something unrelated (e.g. the document-list actor filter, which is a
-    separate control) doesn't re-run pyvis's layout/HTML generation."""
-    artifacts = _load_artifacts(case_id, data_root, output_root)
+    separate control) doesn't re-run pyvis's layout/HTML generation.
+    `_signature` - see _load_artifacts - so this doesn't keep serving a
+    stale rendered graph after re-extraction either."""
+    artifacts = _load_artifacts(case_id, data_root, output_root, _signature)
     g = build_case_graph(artifacts, include_events=include_events)
     if actor_filter:
         g = filter_to_actors(g, set(actor_filter))
@@ -184,7 +204,10 @@ def render_graph(case_id: str, data_root: str, output_root: str, has_events: boo
     if selected_actors:
         st.caption(f"Graph scoped to {len(selected_actors)} selected actor(s) via the filter above.")
 
-    html = _render_graph_html(case_id, data_root, output_root, include_events, tuple(sorted(selected_actors)))
+    html = _render_graph_html(
+        case_id, data_root, output_root, _artifacts_signature(case_id, output_root),
+        include_events, tuple(sorted(selected_actors)),
+    )
     st.iframe(html, height=780)
 
 
@@ -207,7 +230,7 @@ def main():
         case_id = st.selectbox("Case ID", cases)
 
     try:
-        artifacts = _load_artifacts(case_id, data_root, output_root)
+        artifacts = _load_artifacts(case_id, data_root, output_root, _artifacts_signature(case_id, output_root))
     except FileNotFoundError as e:
         st.error(f"Missing extraction artifact for {case_id}: {e}")
         st.stop()
