@@ -227,9 +227,34 @@ def compute_case_summary(artifacts: CaseArtifacts) -> CaseSummary:
             if name not in existing:
                 existing.insert(0, name)
 
+    # database_metadata only exists for cases scraped from a case-tracking
+    # DB (case_* NYSCEF exports) - an MDL docket like mdl-1954 never has
+    # one, so falling back to it alone left "Court" blank for every MDL
+    # case even though Stage 1's comprehensive LLM extraction pass already
+    # found the court venue name(s). Those venue actors get normalized to
+    # role="court_clerk" by the roster-validation pass (VALID_ROLES has no
+    # bare "court" role to map the LLM's own "court" role onto - see
+    # prompts.VALID_ROLES / llm_validation._clean_comprehensive_actor_results)
+    # - source="llm" tells them apart from a genuine named court clerk
+    # (a person, discovered from a confirmation notice, source="confirmation").
+    court = None
+    if artifacts.files_scan.database_metadata:
+        court = artifacts.files_scan.database_metadata.court
+    stage_courts: set[str] = set()
+    if not court:
+        stage_courts = {
+            a.canonical_name for a in artifacts.actors.actors
+            if a.role == "court_clerk" and a.source == "llm"
+        }
+        if stage_courts:
+            court = "; ".join(sorted(stage_courts))
+
     other_roles = {
-        role: sorted(set(names)) for role, names in parties_by_role.items()
+        role: sorted(names) for role, raw_names in parties_by_role.items()
         if role not in ("plaintiff", "defendant")
+        # Drop whichever court_clerk entries are already shown as `court`
+        # above, so they're not also duplicated under "Other parties".
+        and (names := sorted(set(raw_names) - stage_courts))
     }
 
     # Only "filing_date"-type entries (CM/ECF-style header stamps, e-filing
@@ -243,10 +268,6 @@ def compute_case_summary(artifacts: CaseArtifacts) -> CaseSummary:
     filing_date_texts = [d.text for d in artifacts.files_scan.all_dates if d.type == "filing_date"]
     years = sorted({int(m.group(1)) for t in filing_date_texts for m in YEAR_RE.finditer(t)})
     year_range = (years[0], years[-1]) if years else None
-
-    court = None
-    if artifacts.files_scan.database_metadata:
-        court = artifacts.files_scan.database_metadata.court
 
     num_linked = sum(1 for e in artifacts.entities.entities if e.linked_actor)
 
