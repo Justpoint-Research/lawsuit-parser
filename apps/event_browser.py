@@ -71,9 +71,9 @@ def _artifacts_signature(case_id: str, output_root: str) -> float:
 
 
 @st.cache_data(show_spinner=False)
-def _load_artifacts(case_id: str, data_root: str, output_root: str, _signature: float):
+def _load_artifacts(case_id: str, data_root: str, output_root: str, signature: float):
     """Cached so switching filters doesn't re-read artifacts from disk.
-    `_signature` (see _artifacts_signature) makes the cache key change
+    `signature` (see _artifacts_signature) makes the cache key change
     whenever the underlying files do, so a script rerun after re-running
     extraction picks up fresh output automatically."""
     return load_case_artifacts(case_id, Path(data_root), Path(output_root))
@@ -81,14 +81,14 @@ def _load_artifacts(case_id: str, data_root: str, output_root: str, _signature: 
 
 @st.cache_data(show_spinner=False)
 def _render_graph_html(
-    case_id: str, data_root: str, output_root: str, _signature: float, include_events: bool, actor_filter: tuple[str, ...]
+    case_id: str, data_root: str, output_root: str, signature: float, include_events: bool, actor_filter: tuple[str, ...]
 ) -> str:
     """Cached on every input that changes the rendered graph, so toggling
     something unrelated (e.g. the document-list actor filter, which is a
     separate control) doesn't re-run pyvis's layout/HTML generation.
-    `_signature` - see _load_artifacts - so this doesn't keep serving a
+    `signature` - see _load_artifacts - so this doesn't keep serving a
     stale rendered graph after re-extraction either."""
-    artifacts = _load_artifacts(case_id, data_root, output_root, _signature)
+    artifacts = _load_artifacts(case_id, data_root, output_root, signature)
     g = build_case_graph(artifacts, include_events=include_events)
     if actor_filter:
         g = filter_to_actors(g, set(actor_filter))
