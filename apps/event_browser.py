@@ -41,6 +41,7 @@ from lawsuit_parser.event_extraction.browse import (
     collect_actor_tags,
     compute_case_summary,
     document_rows_to_table_dicts,
+    format_name_list,
     list_browsable_cases,
     load_case_artifacts,
     render_html_table,
@@ -112,17 +113,19 @@ def render_summary(summary) -> None:
     info_cols = st.columns(3)
     with info_cols[0]:
         st.markdown("**Plaintiff(s)**")
-        st.write(", ".join(summary.plaintiffs) if summary.plaintiffs else "–")
+        st.markdown(format_name_list(summary.plaintiffs))
     with info_cols[1]:
         st.markdown("**Defendant(s)**")
-        st.write(", ".join(summary.defendants) if summary.defendants else "–")
+        st.markdown(format_name_list(summary.defendants))
     with info_cols[2]:
         st.markdown("**Court**")
-        st.write(summary.court or "–")
+        st.markdown(format_name_list(summary.court))
 
     if summary.other_roles:
-        other_str = "; ".join(f"{role}: {', '.join(names)}" for role, names in summary.other_roles.items())
-        st.caption(f"Other parties: {other_str}")
+        with st.expander(f"Other parties ({sum(len(names) for names in summary.other_roles.values())} total)"):
+            for role, names in summary.other_roles.items():
+                st.markdown(f"**{role}**")
+                st.markdown(format_name_list(names))
 
     if summary.products:
         st.caption(f"Accused products: {', '.join(summary.products)}")

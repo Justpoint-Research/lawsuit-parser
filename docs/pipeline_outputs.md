@@ -28,13 +28,13 @@ All outputs are JSON files in `data/extraction/<case_id>/events/`
 **Contains:**
 - `case_id` - Case identifier
 - `scan_timestamp` - When this scan was performed
-- `database_metadata` - Case info from PostgreSQL (case number, court, status, filed date)
 - `documents[]` - Array of document metadata:
   - `doc_id` - Sequential ID (doc_000, doc_001, ...)
   - `file_name` - Original PDF filename
   - `document_number` - Filing number from CM/ECF or NYSCEF
   - `document_title` - Identified title (LLM-determined)
-  - `filing_date` - When filed (from header or confirmation)
+  - `filing_date` - When filed (from CM/ECF header, header/last-page date
+    scan, confirmation notice, or - last resort - PDF creation time)
   - `filed_by` - Filer name (from confirmation)
   - `pdf_metadata` - Creation/modification dates, page count
   - `docling_metadata` - Title, header, CM/ECF data, signature
@@ -48,8 +48,7 @@ All outputs are JSON files in `data/extraction/<case_id>/events/`
 
 | Element | Tool | Details |
 |---------|------|---------|
-| `database_metadata` | **PostgreSQL query** | Direct SQL query to `public.court_cases` table (port 5433) |
-| `pdf_metadata.created` | **pypdfium2** | PDF file property extraction (`extract_pdf_metadata()`) |
+| `pdf_metadata.created` | **pypdfium2** | PDF file property extraction (`extract_pdf_metadata()`); also the last-resort `filing_date` fallback |
 | `pdf_metadata.modified` | **pypdfium2** | PDF file property extraction |
 | `pdf_metadata.pages` | **pypdfium2** | PDF file property extraction |
 | `docling_metadata.title` | **Docling parser** | First "title" labeled item on page 1 |
@@ -423,7 +422,6 @@ All extraction behavior is controlled by `config/event_extraction.toml`:
 
 ```toml
 [stage_1]
-extract_from_database = true
 extract_from_pdfs = true
 extract_from_docling = true
 extract_from_confirmations = true

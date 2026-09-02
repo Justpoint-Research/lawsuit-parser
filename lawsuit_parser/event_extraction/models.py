@@ -127,29 +127,21 @@ class DocumentMetadata(BaseModel):
     )
 
 
-class DatabaseMetadata(BaseModel):
-    """Metadata extracted from the database."""
-
-    case_number: str | None = None
-    court: str | None = None
-    plaintiff: list[str] = Field(default_factory=list)
-    defendant: list[str] = Field(default_factory=list)
-    case_filed_date: str | None = None
-    status: str | None = None
-
-
 class FilesScan(BaseModel):
     """Complete output of Stage 1 metadata extraction.
 
-    This artifact contains all metadata gathered from database, PDFs, and
-    Docling files, plus all dates extracted from any source. Actor/party
+    This artifact contains all metadata gathered from PDFs and Docling
+    files, plus all dates extracted from any source. Actor/party
     identification lives in the separate actors.json artifact (see Actor,
-    ActorsArtifact below).
+    ActorsArtifact below). There is no case-level database metadata here -
+    a per-case DB lookup used to seed this but was removed as a dead end
+    (see Stage1Metadata's class docstring); per-document signals (PDF
+    metadata, Docling header/last-page scans, confirmation notices, LLM
+    extraction) are the only sources now.
     """
 
     case_id: str
     scan_timestamp: datetime = Field(default_factory=datetime.now)
-    database_metadata: DatabaseMetadata | None = None
     documents: list[DocumentMetadata] = Field(default_factory=list)
     all_dates: list[ExtractedDate] = Field(default_factory=list, description="All dates from all sources")
 

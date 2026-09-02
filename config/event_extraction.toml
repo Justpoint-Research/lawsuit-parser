@@ -9,9 +9,6 @@ output_root = "data/extraction"
 events_dir = "events"
 
 [stage_1]
-# Extract metadata from database
-extract_from_database = true
-
 # Extract metadata from PDF files
 extract_from_pdfs = true
 

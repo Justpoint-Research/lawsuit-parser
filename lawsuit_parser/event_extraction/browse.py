@@ -76,7 +76,7 @@ def parse_case_caption(caption: str) -> tuple[str, str] | None:
 class CaseSummary:
     case_id: str
     caption: str | None
-    court: str | None
+    court: list[str]
     num_documents: int
     plaintiffs: list[str]
     defendants: list[str]
@@ -227,27 +227,27 @@ def compute_case_summary(artifacts: CaseArtifacts) -> CaseSummary:
             if name not in existing:
                 existing.insert(0, name)
 
-    # database_metadata only exists for cases scraped from a case-tracking
-    # DB (case_* NYSCEF exports) - an MDL docket like mdl-1954 never has
-    # one, so falling back to it alone left "Court" blank for every MDL
-    # case even though Stage 1's comprehensive LLM extraction pass already
-    # found the court venue name(s). Those venue actors get normalized to
-    # role="court_clerk" by the roster-validation pass (VALID_ROLES has no
-    # bare "court" role to map the LLM's own "court" role onto - see
-    # prompts.VALID_ROLES / llm_validation._clean_comprehensive_actor_results)
-    # - source="llm" tells them apart from a genuine named court clerk
-    # (a person, discovered from a confirmation notice, source="confirmation").
-    court = None
-    if artifacts.files_scan.database_metadata:
-        court = artifacts.files_scan.database_metadata.court
-    stage_courts: set[str] = set()
-    if not court:
-        stage_courts = {
-            a.canonical_name for a in artifacts.actors.actors
-            if a.role == "court_clerk" and a.source == "llm"
-        }
-        if stage_courts:
-            court = "; ".join(sorted(stage_courts))
+    # Court venue name(s) come from per-document signals - there's no
+    # case-level database lookup to fall back to (removed as a dead end:
+    # it only ever covered case_<numeric> ids scraped from that DB, never
+    # MDL dockets like mdl-1954, and even then had no reliable court
+    # field). Two sources feed role="court_clerk" venue actors:
+    # - source="llm": Stage 1's comprehensive LLM extraction pass reading
+    #   each document's own text (VALID_ROLES has no bare "court" role to
+    #   map the LLM's own "court" role onto, so it's normalized to
+    #   court_clerk - see prompts.VALID_ROLES /
+    #   llm_validation._clean_comprehensive_actor_results)
+    # - source="caption": utils.extract_court_venue's deterministic regex
+    #   match on a NYSCEF-style caption line (e.g. "SUPREME COURT OF THE
+    #   STATE OF NEW YORK COUNTY OF NASSAU") or filing stamp
+    # Both are tagged role="court_clerk" the same way, but neither is a
+    # genuine named court clerk (a person, discovered from a confirmation
+    # notice, source="confirmation") - only "llm"/"caption" belong here.
+    stage_courts: set[str] = {
+        a.canonical_name for a in artifacts.actors.actors
+        if a.role == "court_clerk" and a.source in ("llm", "caption")
+    }
+    court = sorted(stage_courts)
 
     other_roles = {
         role: sorted(names) for role, raw_names in parties_by_role.items()
@@ -342,6 +342,18 @@ def build_document_rows(artifacts: CaseArtifacts) -> list[DocumentRow]:
             ),
         ))
     return rows
+
+
+def format_name_list(names: list[str]) -> str:
+    """Render a list of names as one bullet per line ("- X") instead of
+    joining into a single comma/semicolon-separated line, which gets hard
+    to scan once there's more than a couple of names (case summary's
+    plaintiffs/defendants/court/other-role lists). Doubles as plain text
+    (CLI, printed as-is) and Markdown (Streamlit's st.markdown renders
+    "- " lines as a bullet list)."""
+    if not names:
+        return "-"
+    return "\n".join(f"- {name}" for name in names)
 
 
 def collect_actor_tags(rows: list[DocumentRow]) -> list[str]:

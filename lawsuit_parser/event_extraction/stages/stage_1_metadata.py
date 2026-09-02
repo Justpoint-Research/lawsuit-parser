@@ -1,8 +1,8 @@
 """Stage 1: Metadata Extraction.
 
-Extracts metadata from database, PDF files, Docling parsed documents, and
-e-filing confirmation notices. Produces actors.json, products.json,
-files_scan.json, and gliner_config.json artifacts.
+Extracts metadata from PDF files, Docling parsed documents, and e-filing
+confirmation notices. Produces actors.json, products.json, files_scan.json,
+and gliner_config.json artifacts.
 """
 
 import logging
@@ -31,7 +31,6 @@ from ..models import (
     ActorsArtifact,
     CMECFMetadata,
     ConfirmationMetadata,
-    DatabaseMetadata,
     DoclingMetadata,
     DocumentMetadata,
     DocumentReference,
@@ -45,6 +44,7 @@ from ..utils import (
     extract_appearances_block,
     extract_cm_ecf_header,
     extract_confirmation_details,
+    extract_court_venue,
     extract_dates_from_text,
     extract_document_signature,
     extract_pdf_metadata,
@@ -84,22 +84,22 @@ class Stage1Metadata(BaseStage):
     """Stage 1: Extract metadata from all available sources.
 
     This stage scans:
-    1. Database (if available) for plaintiff/defendant parties
-    2. PDF files for file metadata
-    3. Docling parsed files for headers, document structure, each document's
+    1. PDF files for file metadata (creation/modification timestamps -
+       also a last-resort filing-date fallback, see step 3 below)
+    2. Docling parsed files for headers, document structure, each document's
        case-caption block (plaintiff/defendant names), and its own filing
        number/"signature" (a CM/ECF document number, or an e-filing
        system's own document-number stamp - not tied to any one state)
-    4. Matching e-filing confirmation notices (confirmations/) for filer,
+    3. Matching e-filing confirmation notices (confirmations/) for filer,
        assigned judge, court clerk, and filing timestamp - metadata only;
        entity detection in Stage 2 still runs on documents/ alone
-    5. Every document's own text for citations of other documents by
+    4. Every document's own text for citations of other documents by
        filing number (e.g. "Doc. No. 7"), resolved against every
-       document's signature from step 3 to link doc_id <-> doc_id
+       document's signature from step 2 to link doc_id <-> doc_id
        cross-references in both directions (see referenced_documents /
        referenced_by on DocumentMetadata)
-    6. All sources for dates using regex patterns
-    7. Case context (caption, court, case type) and litigation-caption hints
+    5. All sources for dates using regex patterns
+    6. Case context (caption, court, case type) and litigation-caption hints
        (e.g. "In Re Depo-Provera Litigation") for an LLM identification of
        the accused medical substance/drug/medical device/cosmetic product
        and the defendant(s) it's attributed to - a reading-comprehension
@@ -107,10 +107,19 @@ class Stage1Metadata(BaseStage):
        than validating a regex-built candidate list (see
        llm_validation.identify_products_with_llm)
 
-    The actor roster assembled from 1, 3, and 4 is optionally sanity-checked
+    A per-case database lookup (the scraping DB's court_cases table) used
+    to seed plaintiff/defendant/court here too, but was removed - it's a
+    dead end for most cases (only populated for case_<numeric> ids scraped
+    from that DB; an MDL docket like mdl-1954 never has one, and even when
+    present the table has no plaintiff/defendant columns at all). Party/
+    court discovery now relies entirely on per-document signals: caption
+    parsing (step 2), confirmation notices (step 3), and the comprehensive
+    LLM extraction pass below.
+
+    The actor roster assembled from 2 and 3 is optionally sanity-checked
     by a local Ollama model (see llm_validation.validate_actors_with_llm)
     before being written out and turned into GLiNER labels; the product
-    roster from step 7 joins it there.
+    roster from step 6 joins it there.
 
     Outputs:
     - actors.json: Every actor identified in the case (name/designation + role)
@@ -136,7 +145,6 @@ class Stage1Metadata(BaseStage):
         logger.info(f"{'='*60}\n")
 
         # Extract configuration
-        extract_from_database = config.get("extract_from_database", True)
         extract_from_pdfs = config.get("extract_from_pdfs", True)
         extract_from_docling = config.get("extract_from_docling", True)
         extract_from_confirmations = config.get("extract_from_confirmations", True)
@@ -152,24 +160,21 @@ class Stage1Metadata(BaseStage):
         )
 
         # Initialize results
-        database_metadata = None
         documents = []
         actors: list[Actor] = []
         all_dates = []
         doc_texts: dict[str, str] = {}  # doc_id -> canonical text, reused for product identification below
         litigation_caption_hits: dict[str, list[str]] = {}  # subject name -> doc_ids it was found in
+        # (venue name, doc_id) pairs from utils.extract_court_venue - held
+        # back from `actors` until after LLM roster validation below (see
+        # where this is merged in) rather than added inline like the
+        # plaintiff/defendant caption actors are, because a venue caption
+        # ("SUPREME COURT OF THE STATE OF NEW YORK COUNTY OF NASSAU")
+        # doesn't read like a person/party name and got silently dropped
+        # by that validation pass when added the same way they are.
+        court_venues: list[tuple[str, str]] = []
 
-        # 1. Extract from database (if enabled)
-        if extract_from_database:
-            logger.info("→ Extracting metadata from database...")
-            database_metadata = self._extract_from_database(case_id)
-            if database_metadata:
-                for plaintiff in database_metadata.plaintiff:
-                    self._add_actor(actors, plaintiff, "plaintiff", "database")
-                for defendant in database_metadata.defendant:
-                    self._add_actor(actors, defendant, "defendant", "database")
-
-        # 2. Find all case documents, oldest filing first (see
+        # 1. Find all case documents, oldest filing first (see
         # _document_sort_key) - this is also the order doc_id numbers
         # (doc_000, doc_001, ...) get assigned in below, so doc_id order
         # is a chronological reading order, not arbitrary filesystem order.
@@ -192,7 +197,7 @@ class Stage1Metadata(BaseStage):
         logger.info(f"  Found {len(parsed_files)} parsed JSON files")
         logger.info(f"  Found {len(confirmation_files)} confirmation files")
 
-        # 3. Extract metadata for each document
+        # 2. Extract metadata for each document
         doc_id_counter = 0
         pbar = tqdm(pdf_files, desc="Stage 1: metadata", unit="doc", file=sys.__stderr__)
         for pdf_path in pbar:
@@ -264,6 +269,18 @@ class Stage1Metadata(BaseStage):
                         if not doc_metadata.document_number and docling_meta.document_signature:
                             doc_metadata.document_number = docling_meta.document_signature
 
+                        # Court venue (e.g. "SUPREME COURT OF THE STATE OF
+                        # NEW YORK COUNTY OF NASSAU") - a per-document
+                        # signal used instead of the removed database
+                        # lookup (see this stage's class docstring). Held
+                        # in court_venues, merged into the roster after
+                        # validation below - see that comment.
+                        court_venue = extract_court_venue(
+                            "\n".join(filter(None, [docling_meta.header, first_page_text]))
+                        )
+                        if court_venue:
+                            court_venues.append((court_venue, doc_id))
+
                     # Timestamps found in the header and first page
                     for extracted_date in docling_dates:
                         extracted_date.doc_id = doc_id
@@ -320,6 +337,47 @@ class Stage1Metadata(BaseStage):
                             )
                             doc_metadata.extracted_dates.append(extracted_date)
                             all_dates.append(extracted_date)
+
+            # Last-resort fallback: the PDF's own embedded creation
+            # timestamp. Least authoritative of all the filing_date signals
+            # here (it's when the PDF file was generated/scanned, not
+            # necessarily when it was filed with the court) but it's a
+            # per-document signal that's virtually always present, unlike
+            # a case-level database lookup (removed - see this stage's
+            # class docstring: a dead end for most cases). Appended last so
+            # the fallback below only reaches it once every other
+            # filing_date-typed source (CM/ECF, header, last page,
+            # confirmation notice) has already had a chance.
+            if doc_metadata.pdf_metadata and doc_metadata.pdf_metadata.created:
+                extracted_date = ExtractedDate(
+                    text=doc_metadata.pdf_metadata.created.strftime("%B %d, %Y"),
+                    source="pdf_metadata",
+                    type="filing_date",
+                    doc_id=doc_id,
+                )
+                doc_metadata.extracted_dates.append(extracted_date)
+                all_dates.append(extracted_date)
+
+            # Fall back to whichever date got typed "filing_date" above when
+            # there's no CM/ECF stamp to set doc_metadata.filing_date
+            # directly (line ~254) - e.g. a court-reporter transcript or an
+            # e-filing confirmation notice, neither of which extract_cm_ecf_
+            # header recognizes. Without this, a document can carry a
+            # filing_date-typed entry in extracted_dates (so it shows up
+            # under "Dates found") while doc_metadata.filing_date - what the
+            # browsers' "Filed"/"filing date" fields actually read - stays
+            # None, reporting "no filing date" for the same document.
+            # Confirmed on mdl-1954 doc_003: a settlement-statement
+            # transcript headed "February 7, 2014" with no CM/ECF block.
+            # Priority follows append order above: docling_header,
+            # docling_last_page, confirmation, then pdf_metadata last.
+            if not doc_metadata.filing_date:
+                fallback_filing_date = next(
+                    (d.text for d in doc_metadata.extracted_dates if d.type == "filing_date"),
+                    None,
+                )
+                if fallback_filing_date:
+                    doc_metadata.filing_date = fallback_filing_date
 
             # Load canonical text once, reused for date extraction (below,
             # gated on date_patterns), cross-document reference detection,
@@ -387,7 +445,7 @@ class Stage1Metadata(BaseStage):
         logger.info(f"→ Discovered {len(actors)} actors")
         logger.info(f"→ Found {len(all_dates)} dates")
 
-        # 3.5. Resolve cross-document references now that every document's
+        # 2.5. Resolve cross-document references now that every document's
         # own document_number (its "signature") is known, and build the
         # reverse index (referenced_by) so a document can be looked up by
         # what cites it, not just what it cites.
@@ -409,7 +467,7 @@ class Stage1Metadata(BaseStage):
 
         caption, court, case_type = self._load_case_context(case_id)
 
-        # 3.75. Comprehensive LLM extraction (mandatory pass)
+        # 2.75. Comprehensive LLM extraction (mandatory pass)
         # This extracts all parties, counsel, judges, products, etc. from
         # the first document's text with full contact information. This is
         # particularly important for MDL/coordinated cases where caption
@@ -508,7 +566,7 @@ class Stage1Metadata(BaseStage):
             logger.info(f"  LLM extracted {total_llm_actors} actor mention(s) across {len(docs_to_extract)} document(s)")
             logger.info(f"  Total roster after LLM extraction: {len(actors)} actors")
 
-        # 4. Validate the discovered actor roster with an LLM (optional)
+        # 3. Validate the discovered actor roster with an LLM (optional)
         if config.get("validate_actors_with_llm", True) and actors:
             logger.info(f"\n→ Validating actor roster with LLM (backend={backend})...")
             validator = validate_actors_with_nuextract if backend == "nuextract" else validate_actors_with_llm
@@ -521,7 +579,14 @@ class Stage1Metadata(BaseStage):
             )
             logger.info(f"  Roster after validation: {len(actors)} actors")
 
-        # 4.5. Identify the accused product(s) - the medical substance/drug/
+        # Merge in court venues discovered above (see court_venues) now
+        # that validation has run - added after, not before, so the
+        # validator's actor-vs-noise judgment (tuned for person/party
+        # names) doesn't drop a venue caption for not reading like one.
+        for court_venue, doc_id in court_venues:
+            self._add_actor(actors, court_venue, "court_clerk", "caption", doc_id)
+
+        # 3.5. Identify the accused product(s) - the medical substance/drug/
         # medical device/cosmetic product the plaintiff blames for harm,
         # attributed to a defendant, if determinable. No fixed textual
         # format to regex an arbitrary product name from (unlike a caption
@@ -569,7 +634,7 @@ class Stage1Metadata(BaseStage):
         products_artifact = ActorsArtifact(case_id=case_id, actors=products)
         self.save_artifact(case_id, "products.json", products_artifact)
 
-        # 5. Fill in generic role placeholders for roles with no named
+        # 4. Fill in generic role placeholders for roles with no named
         # individual, so GLiNER still has a label to search for.
         for role, designation in GENERIC_ACTOR_ROLES.items():
             if not any(a.role == role for a in actors):
@@ -583,18 +648,17 @@ class Stage1Metadata(BaseStage):
         actors_artifact = ActorsArtifact(case_id=case_id, actors=actors)
         self.save_artifact(case_id, "actors.json", actors_artifact)
 
-        # 6. Create files_scan artifact
+        # 5. Create files_scan artifact
         files_scan = FilesScan(
             case_id=case_id,
             scan_timestamp=datetime.now(),
-            database_metadata=database_metadata,
             documents=documents,
             all_dates=all_dates,
         )
 
         self.save_artifact(case_id, "files_scan.json", files_scan)
 
-        # 7. Generate GLiNER config from the combined actor + product roster
+        # 6. Generate GLiNER config from the combined actor + product roster
         logger.info("\n→ Generating GLiNER configuration...")
         combined_roster = ActorsArtifact(case_id=case_id, actors=actors + products)
         gliner_config = self._generate_gliner_config(combined_roster, config)
@@ -658,7 +722,7 @@ class Stage1Metadata(BaseStage):
             actors: Roster to add to (mutated in place)
             name: Actor's name as discovered
             role: e.g. 'plaintiff', 'defendant', 'judge', 'court_clerk', 'counsel'
-            source: Where this was discovered ('database', 'caption', 'confirmation')
+            source: Where this was discovered ('caption', 'confirmation', 'llm', ...)
             doc_id: Document this instance was found in, if any
         """
         name = name.strip()
@@ -792,71 +856,6 @@ class Stage1Metadata(BaseStage):
         start = max(0, best_offset - 500)
         return best_doc_id, text[start:start + max_chars]
 
-    def _extract_from_database(self, case_id: str) -> DatabaseMetadata | None:
-        """Extract case-level metadata from the "scrapping" Cloud SQL
-        instance's public.court_cases table (port 5433 - see README.md;
-        config/database.toml's default port 5432 reaches an unrelated
-        "hidden-danger" database with no court tables at all).
-
-        court_cases has no plaintiff/defendant columns and there is no
-        separate "parties" table in this schema (see
-        docs/court_tables_relationships.md) - party names come from caption
-        parsing elsewhere in this stage, not the database.
-
-        Args:
-            case_id: Case identifier, e.g. "case_227" - the numeric suffix
-                is court_cases.id (its integer primary key), not the same
-                as court_cases.case_id (the court's own text docket number).
-
-        Returns:
-            Database metadata, or None if undeterminable/unavailable
-        """
-        prefix = "case_"
-        if not case_id.startswith(prefix) or not case_id[len(prefix):].isdigit():
-            logger.info(f"  Skipping database lookup: {case_id!r} doesn't match the expected 'case_<id>' form")
-            return None
-        numeric_id = int(case_id[len(prefix):])
-
-        try:
-            from ...utils.db import fetch_from_postgres
-
-            query = f"""
-                SELECT
-                    case_id,
-                    court,
-                    case_status,
-                    case_received_date
-                FROM public.court_cases
-                WHERE id = {numeric_id}
-                LIMIT 1
-            """
-
-            try:
-                df = fetch_from_postgres(query, port=5433)
-                if df.empty:
-                    logger.info(f"  No database record found for case {case_id}")
-                    return None
-
-                row = df.iloc[0]
-                metadata = DatabaseMetadata(
-                    case_number=row.get("case_id"),
-                    court=row.get("court"),
-                    status=row.get("case_status"),
-                    case_filed_date=str(row.get("case_received_date")) if row.get("case_received_date") else None,
-                )
-
-                logger.info(f"  ✓ Loaded database metadata for {case_id}")
-                return metadata
-
-            except Exception as e:
-                logger.error(f"  Database query failed: {e}")
-                logger.info(f"  (This is OK if database is not set up or schema differs)")
-                return None
-
-        except ImportError:
-            logger.info(f"  Database module not available")
-            return None
-
     def _document_sort_key(self, pdf_path: Path) -> tuple[bool, datetime, str]:
         """Sort key for ordering documents oldest-to-newest, then by
         filename - this determines the doc_id (doc_000, doc_001, ...) each
@@ -911,14 +910,14 @@ class Stage1Metadata(BaseStage):
         Args:
             docling_data: Parsed .docling.json contents
             date_patterns: Regex patterns used to find timestamps in the
-                header and first page text
+                header, first page, and last page text
 
         Returns:
-            Tuple of (Docling metadata, timestamps found in the header/first
-            page, first-page text) - the text is returned separately since
-            callers also use it as LLM context for title identification
-            (see identify_document_title_with_llm), not just for date/
-            signature extraction.
+            Tuple of (Docling metadata, timestamps found in the header/
+            first page/last page, first-page text) - the text is returned
+            separately since callers also use it as LLM context for title
+            identification (see identify_document_title_with_llm), not
+            just for date/signature extraction.
         """
         try:
             texts = docling_data.get("texts", [])
@@ -928,6 +927,18 @@ class Stage1Metadata(BaseStage):
                 return prov[0].get("page_no") if prov else None
 
             first_page_items = [item for item in texts if item_page_no(item) == 1]
+
+            # A filing/signing/certificate-of-service date can land on the
+            # last page instead of (or in addition to) the header - e.g. a
+            # closing signature block. Skip re-scanning page 1 as "last
+            # page" too on a single-page document.
+            page_numbers = [n for item in texts if (n := item_page_no(item)) is not None]
+            last_page_no = max(page_numbers) if page_numbers else None
+            last_page_items = (
+                [item for item in texts if item_page_no(item) == last_page_no]
+                if last_page_no is not None and last_page_no != 1
+                else []
+            )
 
             # Title: first "title" labeled item on the first page
             title = None
@@ -964,6 +975,12 @@ class Stage1Metadata(BaseStage):
                 if item.get("label") != "page_header" and (item.get("text") or "").strip()
             )
 
+            last_page_text = "\n".join(
+                (item.get("text") or "").strip()
+                for item in last_page_items
+                if (item.get("text") or "").strip()
+            )
+
             # This document's own filing-system stamp (e.g. "NYSCEF DOC.
             # NO. 11") - its "signature", used to resolve other documents'
             # citations of it. Not tied to any one state/system - see
@@ -989,6 +1006,19 @@ class Stage1Metadata(BaseStage):
                             text=date_text,
                             source="docling_first_page",
                             type="event_date",
+                            char_start=start,
+                            char_end=end,
+                        ))
+
+                # Lower priority than the header (appended above) in the
+                # filing_date fallback below - only used when the header
+                # itself carried no dated stamp.
+                if last_page_text:
+                    for date_text, start, end in extract_dates_from_text(last_page_text, date_patterns):
+                        extracted_dates.append(ExtractedDate(
+                            text=date_text,
+                            source="docling_last_page",
+                            type="filing_date",
                             char_start=start,
                             char_end=end,
                         ))

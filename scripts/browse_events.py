@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import sys
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -30,6 +31,7 @@ from lawsuit_parser.event_extraction.browse import (
     build_document_rows,
     compute_case_summary,
     document_rows_to_table_dicts,
+    format_name_list,
     load_case_artifacts,
     render_ascii_table,
 )
@@ -44,17 +46,22 @@ def print_case_summary(artifacts: CaseArtifacts) -> None:
     if summary.caption:
         print(f"Caption:           {summary.caption}")
     if summary.court:
-        print(f"Court:             {summary.court}")
+        print("Court:")
+        print(textwrap.indent(format_name_list(summary.court), "  "))
     print(f"Documents:         {summary.num_documents}")
 
     if summary.plaintiffs:
-        print(f"{'Plaintiff:':<19}{', '.join(summary.plaintiffs)}")
+        print("Plaintiff(s):")
+        print(textwrap.indent(format_name_list(summary.plaintiffs), "  "))
     if summary.defendants:
-        print(f"{'Defendant:':<19}{', '.join(summary.defendants)}")
+        print("Defendant(s):")
+        print(textwrap.indent(format_name_list(summary.defendants), "  "))
 
     if summary.other_roles:
-        other_str = "; ".join(f"{role}: {', '.join(names)}" for role, names in summary.other_roles.items())
-        print(f"Other parties:     {other_str}")
+        print("Other parties:")
+        for role, names in summary.other_roles.items():
+            print(f"  {role}:")
+            print(textwrap.indent(format_name_list(names), "    "))
 
     if summary.products:
         print(f"Accused products:  {', '.join(summary.products)}")

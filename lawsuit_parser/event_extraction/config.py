@@ -22,7 +22,6 @@ class PathsConfig(BaseModel):
 class Stage1Config(BaseModel):
     """Stage 1 (Metadata Extraction) configuration."""
 
-    extract_from_database: bool = Field(default=True)
     extract_from_pdfs: bool = Field(default=True)
     extract_from_docling: bool = Field(default=True)
     extract_from_confirmations: bool = Field(

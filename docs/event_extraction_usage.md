@@ -71,7 +71,6 @@ output_root = "data/extraction"  # pipeline-generated artifacts, wipeable indepe
 events_dir = "events"
 
 [stage_1]
-extract_from_database = true
 extract_from_pdfs = true
 extract_from_docling = true
 extract_from_confirmations = true  # filer/judge/timestamp from confirmations/ notices
@@ -168,13 +167,6 @@ data/extraction/<case_id>/                  # output_root - generated, safe to w
 {
   "case_id": "case_67",
   "scan_timestamp": "2026-08-20T10:00:00Z",
-  "database_metadata": {
-    "case_number": "3:24-cv-12345",
-    "court": "Northern District of California",
-    "plaintiff": ["Jane Doe"],
-    "defendant": ["ACME Inc."],
-    "case_filed_date": "2024-01-15"
-  },
   "documents": [
     {
       "doc_id": "doc_000",

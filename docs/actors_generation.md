@@ -71,7 +71,7 @@ Complete explanation of the actor roster generation process in Stage 1.
 }
 ```
 
-**Why the difference?** mdl-1954 had no database metadata, no readable captions, and no confirmation notices, so only generic placeholders were added.
+**Why the difference?** mdl-1954 had no readable captions and no confirmation notices, so only generic placeholders were added.
 
 ---
 
@@ -79,38 +79,13 @@ Complete explanation of the actor roster generation process in Stage 1.
 
 ### Phase 1: Multi-Source Extraction
 
-The roster is built by scanning **4 different sources** in this order:
+The roster is built by scanning **3 different sources** in this order (a
+per-case PostgreSQL lookup used to be a fourth, first source, but was
+removed - it only ever covered `case_<numeric>` ids scraped from that DB,
+never MDL dockets, and even then had no reliable plaintiff/defendant
+columns to draw on):
 
-#### Source 1: Database (PostgreSQL)
-
-**Location:** `lawsuit_parser/event_extraction/stages/stage_1_metadata.py:658-721`
-
-**Process:**
-1. Parse case_id (e.g., "case_95" → numeric ID 95)
-2. Query `public.court_cases` on port 5433:
-   ```sql
-   SELECT case_id, court, case_status, case_received_date
-   FROM public.court_cases
-   WHERE id = 95
-   ```
-3. Parse caption field (not a direct plaintiff/defendant column)
-4. Add discovered parties via `_add_actor()`
-
-**Tool:** PostgreSQL query
-
-**Yields:**
-- Plaintiffs from database caption
-- Defendants from database caption
-- Case metadata (court, status, filed date)
-
-**Note:** This source often yields nothing because:
-- MDL cases use different ID schemes (e.g., "mdl-1954" doesn't match "case_95" pattern)
-- Database may be unavailable or unconfigured
-- Caption field may be truncated ("... et al.")
-
----
-
-#### Source 2: Document Captions
+#### Source 1: Document Captions
 
 **Location:** `lawsuit_parser/event_extraction/stages/stage_1_metadata.py:273-277`, `utils.py:224-288`
 
@@ -188,7 +163,7 @@ defendants = ["L'ORÉAL USA, INC.", "GOLDWELL"]
 
 ---
 
-#### Source 3: E-Filing Confirmation Notices
+#### Source 2: E-Filing Confirmation Notices
 
 **Location:** `lawsuit_parser/event_extraction/stages/stage_1_metadata.py:303-330`, `utils.py:114-162`
 
@@ -248,7 +223,7 @@ Hon. Milton A. Tingling, New York County Clerk
 
 ---
 
-#### Source 4: LLM Validation (Optional)
+#### Source 3: LLM Validation (Optional)
 
 **Location:** `lawsuit_parser/event_extraction/stages/stage_1_metadata.py:422-433`, `llm_validation.py:194-230`
 
@@ -492,7 +467,6 @@ Each actor gets a `gliner_label` field for Stage 2:
 - **false:** Generic placeholder (e.g., "Judge")
 
 ### `source`
-- **database:** From PostgreSQL query
 - **caption:** From document caption block
 - **confirmation:** From e-filing confirmation notice
 - **llm:** Added/corrected by LLM (rare)
@@ -526,7 +500,6 @@ Each actor gets a `gliner_label` field for Stage 2:
 ```toml
 [stage_1]
 # Which sources to scan
-extract_from_database = true      # PostgreSQL lookup
 extract_from_pdfs = true           # PDF metadata
 extract_from_docling = true        # Caption parsing
 extract_from_confirmations = true  # E-filing notices
@@ -665,13 +638,11 @@ normalize_party_name("Bonnie Darling, et al.") → "bonnie darling"
 - No actual party names
 
 **Causes:**
-1. Database lookup failed (MDL case IDs don't match "case_<id>" pattern)
-2. No readable caption blocks (poor OCR, non-standard format)
-3. No confirmation notices available
-4. LLM validation dropped all candidates (too aggressive filtering)
+1. No readable caption blocks (poor OCR, non-standard format)
+2. No confirmation notices available
+3. LLM validation dropped all candidates (too aggressive filtering)
 
 **Debug:**
-- Check logs for "Skipping database lookup"
 - Check files_scan.json → documents[].docling_metadata.title
 - Look for caption text in raw Docling JSON
 - Disable LLM validation: `validate_actors_with_llm = false`

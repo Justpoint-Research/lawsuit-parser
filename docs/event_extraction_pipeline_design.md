@@ -56,14 +56,6 @@ data/cases/<case_id>/events/
 {
   "case_id": "case_67",
   "scan_timestamp": "2026-08-20T10:00:00Z",
-  "database_metadata": {
-    "case_number": "3:24-cv-12345",
-    "court": "Northern District of California",
-    "plaintiff": ["Jane Doe"],
-    "defendant": ["ACME Inc.", "John Smith"],
-    "case_filed_date": "2024-01-15",
-    "status": "Active"
-  },
   "documents": [
     {
       "doc_id": "doc_000",
@@ -297,7 +289,6 @@ data_root = "data/cases"
 events_dir = "events"
 
 [stage_1]
-extract_from_database = true
 extract_from_pdfs = true
 extract_from_docling = true
 date_patterns = [

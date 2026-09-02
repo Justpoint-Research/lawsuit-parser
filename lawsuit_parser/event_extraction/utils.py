@@ -105,6 +105,60 @@ def extract_cm_ecf_header(text: str) -> dict[str, str] | None:
     return None
 
 
+_COURT_VENUE_LINE_PATTERN = re.compile(
+    r"SUPREME\s+COURT\s+OF\s+THE\s+STATE\s+OF\s+NEW\s+YORK.*?COUNTY\s+OF\s+[A-Z][A-Za-z]*",
+    re.IGNORECASE,
+)
+
+# NYSCEF's own e-filing stamp ("FILED: NASSAU COUNTY CLERK <date>") -
+# gives only the county, not the court's full caption wording, but is
+# present on every NYSCEF-filed document regardless of whether the fuller
+# caption pattern above matched (e.g. a document type whose caption block
+# didn't make it into this page's text).
+_NYSCEF_FILED_STAMP_PATTERN = re.compile(
+    r"FILED:\s*([A-Z][A-Za-z\s]*?)\s+COUNTY\s+CLERK",
+    re.IGNORECASE,
+)
+
+
+def extract_court_venue(text: str) -> str | None:
+    """Extract a NY state court's own venue caption from a NYSCEF-filed
+    document's text, e.g. "SUPREME COURT OF THE STATE OF NEW YORK COUNTY
+    OF NASSAU" - the same information a per-case database lookup used to
+    supply (as e.g. "Nassau County Supreme Court") before that lookup was
+    removed as a dead end for most cases (see Stage1Metadata's class
+    docstring); this reads it straight from the document instead.
+
+    Matched per physical line, not against the whole block with DOTALL -
+    a greedy match spanning newlines could run from one document's
+    caption straight into the next line's party names ("...COUNTY OF
+    NASSAU\\nESTELA CEBALLOS,").
+
+    Args:
+        text: Document text to search - typically the Docling header plus
+            first-page text (see Stage1Metadata._extract_from_docling).
+
+    Returns:
+        The matched venue caption (whitespace-normalized, original
+        casing), the county name alone from a bare NYSCEF filing stamp if
+        the fuller caption wasn't found, or None if neither matched.
+    """
+    for line in text.splitlines():
+        match = _COURT_VENUE_LINE_PATTERN.search(line)
+        if match:
+            return " ".join(match.group(0).split())
+
+    match = _NYSCEF_FILED_STAMP_PATTERN.search(text)
+    if match:
+        # Unlike the caption line above (quoted verbatim), this is a
+        # string we're building ourselves - title-case it so "KINGS
+        # COUNTY CLERK" doesn't become the shouty "KINGS County".
+        county = " ".join(match.group(1).split()).title()
+        return f"{county} County"
+
+    return None
+
+
 CONFIRMATION_TIMESTAMP_PATTERN = re.compile(
     r"received an electronic filing on\s+(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)",
     re.IGNORECASE,
