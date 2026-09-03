@@ -31,6 +31,13 @@ import traceback
 
 from lawsuit_parser.utils import try_download_from_buckets, get_storage_client
 
+# Postgres schema/table-prefix the crawl tables live under (see
+# lawsuit_parser.utils.case_exporter.CaseExporter for the same convention).
+# Configurable from the sidebar so this browser can point at another
+# state's tables (e.g. "fl_") without a code change.
+DEFAULT_SCHEMA = "courts_final"
+DEFAULT_TABLE_PREFIX = "ny_"
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -144,12 +151,12 @@ def get_gcs_client_cached():
 
 
 @st.cache_data(ttl=300)
-def get_case_count():
+def get_case_count(schema: str = DEFAULT_SCHEMA, table_prefix: str = DEFAULT_TABLE_PREFIX):
     """Get total number of cases."""
     try:
         logger.info("Getting case count")
         engine = get_database_engine()
-        query = text("SELECT COUNT(*) FROM public.court_cases")
+        query = text(f"SELECT COUNT(*) FROM {schema}.{table_prefix}cases_after_search")
         with engine.connect() as conn:
             count = conn.execute(query).scalar()
         logger.info(f"Total cases: {count}")
@@ -163,12 +170,12 @@ def get_case_count():
 
 
 @st.cache_data(ttl=60)
-def get_case_by_id(case_id: int):
+def get_case_by_id(case_id: int, schema: str = DEFAULT_SCHEMA, table_prefix: str = DEFAULT_TABLE_PREFIX):
     """Get case information by ID."""
     try:
         logger.info(f"Fetching case ID: {case_id}")
         engine = get_database_engine()
-        query = text("SELECT * FROM public.court_cases WHERE id = :id")
+        query = text(f"SELECT * FROM {schema}.{table_prefix}cases_after_search WHERE id = :id")
         with engine.connect() as conn:
             logger.debug(f"Executing query for case {case_id}")
             result = conn.execute(query, {"id": case_id})
@@ -187,12 +194,12 @@ def get_case_by_id(case_id: int):
 
 
 @st.cache_data(ttl=60)
-def get_case_documents(docket_id: str):
+def get_case_documents(docket_id: str, schema: str = DEFAULT_SCHEMA, table_prefix: str = DEFAULT_TABLE_PREFIX):
     """Get all documents for a case."""
     try:
         logger.info(f"Fetching documents for docket_id: {docket_id}")
         engine = get_database_engine()
-        query = text("""
+        query = text(f"""
             SELECT
                 id,
                 document_doc_index,
@@ -206,7 +213,7 @@ def get_case_documents(docket_id: str):
                 document_status,
                 document_confirmation_link,
                 document_confirmation_bucket_link
-            FROM public.court_documents
+            FROM {schema}.{table_prefix}docket_documents
             WHERE docket_id = :docket_id
             ORDER BY filed_create, id
         """)
@@ -228,12 +235,12 @@ def get_case_documents(docket_id: str):
         return pd.DataFrame()
 
 
-def get_next_case_id(current_id: int):
+def get_next_case_id(current_id: int, schema: str = DEFAULT_SCHEMA, table_prefix: str = DEFAULT_TABLE_PREFIX):
     """Get the next case ID."""
     try:
         logger.info(f"Getting next case after ID: {current_id}")
         engine = get_database_engine()
-        query = text("SELECT MIN(id) FROM public.court_cases WHERE id > :current_id")
+        query = text(f"SELECT MIN(id) FROM {schema}.{table_prefix}cases_after_search WHERE id > :current_id")
         logger.debug("Executing next case query")
         with engine.connect() as conn:
             next_id = conn.execute(query, {"current_id": current_id}).scalar()
@@ -246,12 +253,12 @@ def get_next_case_id(current_id: int):
         return current_id
 
 
-def get_prev_case_id(current_id: int):
+def get_prev_case_id(current_id: int, schema: str = DEFAULT_SCHEMA, table_prefix: str = DEFAULT_TABLE_PREFIX):
     """Get the previous case ID."""
     try:
         logger.info(f"Getting previous case before ID: {current_id}")
         engine = get_database_engine()
-        query = text("SELECT MAX(id) FROM public.court_cases WHERE id < :current_id")
+        query = text(f"SELECT MAX(id) FROM {schema}.{table_prefix}cases_after_search WHERE id < :current_id")
         logger.debug("Executing previous case query")
         with engine.connect() as conn:
             prev_id = conn.execute(query, {"current_id": current_id}).scalar()
@@ -471,8 +478,16 @@ def main():
 
         st.markdown("---")
 
+        # Schema / table-prefix the crawl tables live under (e.g.
+        # courts_final.ny_cases_after_search) - configurable so this
+        # browser can point at another state's tables (e.g. "fl_").
+        schema = st.text_input("Schema", value=DEFAULT_SCHEMA, key="schema")
+        table_prefix = st.text_input("Table prefix", value=DEFAULT_TABLE_PREFIX, key="table_prefix")
+
+        st.markdown("---")
+
         # Get total cases
-        total_cases = get_case_count()
+        total_cases = get_case_count(schema, table_prefix)
         st.metric("Total Cases", f"{total_cases:,}")
 
         # Case ID input
@@ -504,7 +519,7 @@ def main():
                     del st.session_state[key]
                 get_case_by_id.clear()
                 get_case_documents.clear()
-                prev_id = get_prev_case_id(st.session_state.current_case_id)
+                prev_id = get_prev_case_id(st.session_state.current_case_id, schema, table_prefix)
                 st.session_state.current_case_id = prev_id
                 logger.info(f"Navigating to previous case (ID: {prev_id})")
                 st.rerun()
@@ -518,7 +533,7 @@ def main():
                     del st.session_state[key]
                 get_case_by_id.clear()
                 get_case_documents.clear()
-                next_id = get_next_case_id(st.session_state.current_case_id)
+                next_id = get_next_case_id(st.session_state.current_case_id, schema, table_prefix)
                 st.session_state.current_case_id = next_id
                 logger.info(f"Navigating to next case (ID: {next_id})")
                 st.rerun()
@@ -542,7 +557,7 @@ def main():
         st.caption("💡 Tip: Use the number input to jump to a specific case, or use the navigation buttons to browse.")
 
     # Main content
-    case = get_case_by_id(st.session_state.current_case_id)
+    case = get_case_by_id(st.session_state.current_case_id, schema, table_prefix)
 
     if case is None:
         st.error(f"Case with ID {st.session_state.current_case_id} not found.")
@@ -552,12 +567,15 @@ def main():
     display_case_info(case)
 
     # Get and display documents
-    documents_df = get_case_documents(case['docket_id'])
+    documents_df = get_case_documents(case['docket_id'], schema, table_prefix)
     display_documents(documents_df)
 
     # Footer
     st.markdown("---")
-    st.caption(f"Viewing Case ID: {st.session_state.current_case_id} | Database: scrapping (localhost:5433)")
+    st.caption(
+        f"Viewing Case ID: {st.session_state.current_case_id} | "
+        f"Database: scrapping (localhost:5433) | Table: {schema}.{table_prefix}cases_after_search"
+    )
 
     # Debug panel
     with st.expander("🐛 Debug Logs", expanded=False):

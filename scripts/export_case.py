@@ -70,6 +70,29 @@ def main():
         default="court-docs",
         help="GCS bucket name (default: court-docs)",
     )
+    parser.add_argument(
+        "--schema",
+        type=str,
+        default="courts_final",
+        help="Postgres schema holding the crawl tables (default: courts_final)",
+    )
+    parser.add_argument(
+        "--table-prefix",
+        type=str,
+        default="ny_",
+        help="Per-state table prefix, e.g. 'ny_' or 'fl_' (default: ny_)",
+    )
+    parser.add_argument(
+        "--extract-text",
+        action="store_true",
+        help="Also run Docling over every downloaded PDF and save a .txt "
+        "counterpart (slow, GPU/CPU-heavy - off by default)",
+    )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Disable GPU acceleration for --extract-text",
+    )
 
     args = parser.parse_args()
 
@@ -88,6 +111,10 @@ def main():
             engine=engine,
             output_dir=args.output_dir,
             gcs_bucket_name=args.bucket,
+            schema=args.schema,
+            table_prefix=args.table_prefix,
+            extract_text=args.extract_text,
+            use_gpu=not args.no_gpu,
         )
 
         # Export the case

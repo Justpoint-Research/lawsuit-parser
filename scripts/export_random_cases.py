@@ -48,22 +48,31 @@ def create_scrapping_engine():
     return create_engine(url)
 
 
-def get_random_case_ids(engine, count: int = 100) -> list[int]:
-    """Get random case IDs from the court_cases table.
+def get_random_case_ids(
+    engine,
+    count: int = 100,
+    schema: str = "courts_final",
+    table_prefix: str = "ny_",
+) -> list[int]:
+    """Get random case IDs from the cases table.
 
     Args:
         engine: SQLAlchemy engine.
         count: Number of random cases to sample.
+        schema: Postgres schema holding the crawl tables.
+        table_prefix: Per-state table prefix, e.g. "ny_" or "fl_".
 
     Returns:
         List of case IDs.
     """
-    query = text("""
+    cases_table = f"{schema}.{table_prefix}cases_after_search"
+    documents_table = f"{schema}.{table_prefix}docket_documents"
+    query = text(f"""
         SELECT id
-        FROM public.court_cases cc
+        FROM {cases_table} cc
         WHERE cc.case_id IS NOT NULL  -- Filter out cases without case_id
           AND EXISTS (
-              SELECT 1 FROM public.court_documents cd
+              SELECT 1 FROM {documents_table} cd
               WHERE cd.case_id = cc.case_id
           )  -- Filter out cases without documents
         ORDER BY RANDOM()
@@ -81,6 +90,10 @@ def export_cases(
     case_ids: list[int],
     output_dir: Path,
     bucket_name: str = "court-docs",
+    schema: str = "courts_final",
+    table_prefix: str = "ny_",
+    extract_text: bool = False,
+    use_gpu: bool = True,
 ):
     """Export multiple cases.
 
@@ -88,6 +101,12 @@ def export_cases(
         case_ids: List of case IDs to export.
         output_dir: Output directory for exported cases.
         bucket_name: GCS bucket name where documents are stored.
+        schema: Postgres schema holding the crawl tables.
+        table_prefix: Per-state table prefix, e.g. "ny_" or "fl_".
+        extract_text: Also run Docling over every downloaded PDF and save
+            a .txt counterpart (slow, GPU/CPU-heavy - off by default).
+        use_gpu: Whether Docling should use GPU acceleration when
+            extract_text=True.
     """
     engine = create_scrapping_engine()
 
@@ -96,6 +115,10 @@ def export_cases(
             engine=engine,
             output_dir=output_dir,
             gcs_bucket_name=bucket_name,
+            schema=schema,
+            table_prefix=table_prefix,
+            extract_text=extract_text,
+            use_gpu=use_gpu,
         )
 
         total = len(case_ids)
@@ -151,6 +174,29 @@ def main():
         type=str,
         help="Comma-separated list of specific case IDs to export (skips random sampling)",
     )
+    parser.add_argument(
+        "--schema",
+        type=str,
+        default="courts_final",
+        help="Postgres schema holding the crawl tables (default: courts_final)",
+    )
+    parser.add_argument(
+        "--table-prefix",
+        type=str,
+        default="ny_",
+        help="Per-state table prefix, e.g. 'ny_' or 'fl_' (default: ny_)",
+    )
+    parser.add_argument(
+        "--extract-text",
+        action="store_true",
+        help="Also run Docling over every downloaded PDF and save a .txt "
+        "counterpart (slow, GPU/CPU-heavy - off by default)",
+    )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Disable GPU acceleration for --extract-text",
+    )
 
     args = parser.parse_args()
 
@@ -171,7 +217,9 @@ def main():
         print(f"Sampling {args.count} random cases from the database...")
         engine = create_scrapping_engine()
         try:
-            case_ids = get_random_case_ids(engine, args.count)
+            case_ids = get_random_case_ids(
+                engine, args.count, schema=args.schema, table_prefix=args.table_prefix
+            )
         finally:
             engine.dispose()
 
@@ -182,7 +230,15 @@ def main():
         print(f"Selected {len(case_ids)} cases for export.")
 
     # Export cases
-    export_cases(case_ids, args.output_dir, args.bucket)
+    export_cases(
+        case_ids,
+        args.output_dir,
+        args.bucket,
+        schema=args.schema,
+        table_prefix=args.table_prefix,
+        extract_text=args.extract_text,
+        use_gpu=not args.no_gpu,
+    )
 
 
 if __name__ == "__main__":
