@@ -31,6 +31,7 @@ from .models import (
     EventTimeline,
     ExtractedDate,
     FilesScan,
+    RelationsArtifact,
     SummariesArtifact,
 )
 
@@ -122,6 +123,7 @@ class CaseArtifacts:
         summaries: SummariesArtifact | None = None,
         dates: DatesArtifact | None = None,
         events: EventTimeline | None = None,
+        relations: RelationsArtifact | None = None,
     ):
         self.case_id = case_id
         self.caption = caption
@@ -139,6 +141,9 @@ class CaseArtifacts:
         # without event nodes in the graph view.
         self.dates = dates
         self.events = events
+        # Stage 6 (relation extraction) is optional - shows lawyer-client
+        # representation relationships in the graph view when available.
+        self.relations = relations
 
 
 def _events_dir(case_id: str, output_root: Path) -> Path:
@@ -188,6 +193,7 @@ def load_case_artifacts(case_id: str, data_root: Path, output_root: Path) -> Cas
         summaries=_optional("summaries.json", SummariesArtifact),
         dates=_optional("dates.json", DatesArtifact),
         events=_optional("events.json", EventTimeline),
+        relations=_optional("relations.json", RelationsArtifact),
     )
 
 

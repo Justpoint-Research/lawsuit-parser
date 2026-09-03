@@ -26,26 +26,32 @@ Edge types:
   = false, the current default - see stage_5_events.py), this is every
   candidate actor near the date, not curated to who the event is actually
   about - so it reads noisier than the LLM-curated mode would.
+- actor --represents--> actor: from relations.json (Stage 6), showing
+  lawyer-client representation relationships (e.g., counsel representing
+  plaintiffs or defendants).
+- date --associated_with--> document: filing dates and extracted dates linked
+  to the documents where they appear.
+- date --occurs_in--> event: dates associated with specific events.
 """
 
 import networkx as nx
+from datetime import datetime
 from pyvis.network import Network
 
 from .browse import CaseArtifacts, _entities_by_doc
 from .models import DocumentMetadata, Event
 
 ROLE_COLORS = {
-    "plaintiff": "#2ca02c",
-    "defendant": "#d62728",
-    "judge": "#9467bd",
-    "court_clerk": "#8c564b",
-    "counsel": "#1f77b4",
-    "attorney": "#1f77b4",
-    "witness": "#ff7f0e",
+    "plaintiff": "#28a745",      # Green for plaintiffs
+    "defendant": "#dc3545",      # Red for defendants
+    "judge": "#000000",          # Black for judges
+    "court_clerk": "#6c757d",    # Gray for court clerks
+    "counsel": "#007bff",        # Blue for attorneys/counsel
+    "attorney": "#007bff",       # Blue for attorneys
+    "witness": "#ffc107",        # Yellow for witnesses
 }
-DEFAULT_ACTOR_COLOR = "#7f7f7f"
-PRODUCT_COLOR = "#17becf"
-DOCUMENT_COLOR = "#c7c7c7"
+DEFAULT_ACTOR_COLOR = "#6c757d"  # Gray for others
+DOCUMENT_COLOR = "#d3d3d3"       # Light gray for documents
 EVENT_COLOR = "#e7ba52"
 
 EVENT_NODE_PREFIX = "event:"
@@ -74,6 +80,61 @@ def _event_tooltip(event: Event) -> str:
     return "\n".join(parts)
 
 
+def _parse_date_for_display(date_text: str, parsed_date: str | None) -> tuple[str, str | None]:
+    """Parse date for display, returning (display_label, parsed_datetime).
+
+    Args:
+        date_text: Raw date text
+        parsed_date: ISO format parsed date string or None
+
+    Returns:
+        (label for node, parsed datetime string or None)
+    """
+    # Try to parse the parsed_date if available
+    if parsed_date:
+        try:
+            dt = datetime.fromisoformat(parsed_date.replace('Z', '+00:00'))
+            return dt.strftime("%Y-%m-%d"), parsed_date
+        except:
+            pass
+
+    # Fall back to just using the text
+    return date_text, parsed_date
+
+
+def _get_date_color(parsed_date: str | None, year_min: int | None, year_max: int | None) -> str:
+    """Get color for a date node based on its year (gradient from early to recent).
+
+    Args:
+        parsed_date: ISO format parsed date string or None
+        year_min: Minimum year in the case (for color scaling)
+        year_max: Maximum year in the case (for color scaling)
+
+    Returns:
+        Hex color string
+    """
+    if not parsed_date or not year_min or not year_max:
+        return DATE_COLOR
+
+    try:
+        dt = datetime.fromisoformat(parsed_date.replace('Z', '+00:00'))
+        year = dt.year
+
+        # If only one year, use default color
+        if year_max == year_min:
+            return DATE_COLOR
+
+        # Gradient from darker pink (older) to lighter pink (newer)
+        ratio = (year - year_min) / (year_max - year_min)
+        # Start: #C41E3A (darker pink), End: #FFB6C1 (lighter pink)
+        r = int(196 + (255 - 196) * ratio)
+        g = int(30 + (182 - 30) * ratio)
+        b = int(58 + (193 - 58) * ratio)
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except:
+        return DATE_COLOR
+
+
 def build_case_graph(artifacts: CaseArtifacts, include_events: bool = False) -> nx.DiGraph:
     """Build the full case graph. Event nodes (from artifacts.events, Stage
     5's output) are only included if `include_events` is True AND the case
@@ -94,44 +155,56 @@ def build_case_graph(artifacts: CaseArtifacts, include_events: bool = False) -> 
             title=_document_tooltip(doc),
             color=DOCUMENT_COLOR,
             shape="box",
+            size=25,  # Make documents larger and more prominent
+            font={"size": 14},
         )
 
+    # Helper function to determine if an actor is a legal entity (organization) vs individual
+    def is_legal_entity(actor):
+        """Check if actor is a company/organization (square) vs individual person (dot)."""
+        # Check if it's a defendant organization (usually companies)
+        if actor.role == 'defendant':
+            # Common indicators of corporate entities
+            corp_indicators = ['inc', 'llc', 'corp', 'ltd', 'l.l.c', 'company', 'corporation',
+                             'pharmaceutical', 'laboratories', 'usa', 'america']
+            name_lower = actor.canonical_name.lower()
+            if any(ind in name_lower for ind in corp_indicators):
+                return True
+        return False
+
     for actor in artifacts.actors.actors:
+        # Determine shape: square for legal entities, dot for individuals
+        shape = "square" if is_legal_entity(actor) else "dot"
+        size = 20 if is_legal_entity(actor) else 15
+
         g.add_node(
             actor.canonical_name,
             kind="actor",
             label=actor.canonical_name,
             title=f"{actor.role} ({'named' if actor.is_named else 'generic'}, source={actor.source})",
             color=ROLE_COLORS.get(actor.role, DEFAULT_ACTOR_COLOR),
-            shape="dot",
+            shape=shape,
+            size=size,
         )
 
-    for product in artifacts.products.actors:
-        title = product.role
-        if product.attributed_to:
-            title += f" | attributed to: {', '.join(product.attributed_to)}"
-        g.add_node(
-            product.canonical_name,
-            kind="product",
-            label=product.canonical_name,
-            title=title,
-            color=PRODUCT_COLOR,
-            shape="diamond",
-        )
-
+    # Add document-to-actor edges (who is present in which document)
     for doc_id, doc_entities in entities_by_doc.items():
         if doc_id not in g:
             continue
         for entity in doc_entities:
             actor_name = entity.linked_actor
-            if actor_name and (actor_name in role_by_actor or actor_name in product_names) and actor_name in g:
-                g.add_edge(doc_id, actor_name, kind="mentions")
+            if actor_name and actor_name in role_by_actor and actor_name in g:
+                # Document mentions actor
+                g.add_edge(
+                    doc_id,
+                    actor_name,
+                    kind="present_in",
+                    color="#6c757d",  # Gray
+                    width=1.5,
+                    title="Is present in document"
+                )
 
-    for doc in artifacts.files_scan.documents:
-        for ref in doc.referenced_documents:
-            if ref.doc_id and ref.doc_id != doc.doc_id and ref.doc_id in g:
-                g.add_edge(doc.doc_id, ref.doc_id, kind="cites")
-
+    # Events are not shown by default - the graph focuses on actors and documents
     if include_events and artifacts.events is not None:
         for event in artifacts.events.events:
             node_id = f"{EVENT_NODE_PREFIX}{event.event_id}"
@@ -144,10 +217,60 @@ def build_case_graph(artifacts: CaseArtifacts, include_events: bool = False) -> 
                 shape="star",
             )
             if event.source_doc_id in g:
-                g.add_edge(node_id, event.source_doc_id, kind="from")
+                # Event from document - purple
+                g.add_edge(
+                    node_id,
+                    event.source_doc_id,
+                    kind="from",
+                    color="#9467bd",
+                    width=1.5,
+                    title="Event from document"
+                )
             for actor_name in event.actors:
                 if actor_name in g:
-                    g.add_edge(node_id, actor_name, kind="involves")
+                    # Event involves actor - purple, dashed
+                    g.add_edge(
+                        node_id,
+                        actor_name,
+                        kind="involves",
+                        color="#9467bd",
+                        width=1.5,
+                        dashes=[3, 3],
+                        title="Event involves actor"
+                    )
+
+            # Connect dates to this event
+            for date_text in event.dates:
+                date_node_id = f"{DATE_NODE_PREFIX}{date_text}"
+                if date_node_id in g:
+                    g.add_edge(
+                        date_node_id,
+                        node_id,
+                        kind="occurs_in",
+                        color="#FF69B4",  # Hot pink
+                        width=1.5,
+                        dashes=[3, 2],
+                        title="Date occurs in event"
+                    )
+
+    # Stage 6: Add representation relationship edges (lawyer --> client)
+    if artifacts.relations is not None:
+        for relation in artifacts.relations.relations:
+            source = relation.source_entity
+            target = relation.target_entity
+            # Only add edge if both nodes exist in the graph
+            if source in g and target in g:
+                # Add representation edge (lawyer --> client)
+                g.add_edge(
+                    source,
+                    target,
+                    kind="represents",
+                    relation_type=relation.relation_type,
+                    confidence=relation.confidence,
+                    title=f"Represents (confidence: {relation.confidence:.2f})",
+                    color="#ffc107",  # Yellow/amber for representation relationships
+                    width=2,
+                )
 
     # Drop nodes with no edges at all (e.g. an LLM-discovered actor Stage 2
     # never actually linked to any document, or a document Docling found no
@@ -196,20 +319,64 @@ def render_pyvis_html(g: nx.DiGraph, height: str = "750px") -> str:
         "font": { "size": 16, "strokeWidth": 3, "strokeColor": "#ffffff" }
       },
       "edges": {
-        "smooth": false,
+        "smooth": {
+          "enabled": true,
+          "type": "continuous"
+        },
         "arrows": { "to": { "enabled": true, "scaleFactor": 0.5 } }
       },
       "physics": {
-        "barnesHut": {
-          "gravitationalConstant": -12000,
-          "centralGravity": 0.3,
-          "springLength": 180,
-          "springConstant": 0.03,
-          "avoidOverlap": 1
+        "enabled": true,
+        "stabilization": {
+          "enabled": true,
+          "iterations": 1000,
+          "updateInterval": 25
         },
-        "minVelocity": 0.75,
-        "stabilization": { "iterations": 400 }
+        "barnesHut": {
+          "gravitationalConstant": -15000,
+          "centralGravity": 0.2,
+          "springLength": 200,
+          "springConstant": 0.02,
+          "avoidOverlap": 0.8
+        }
+      },
+      "interaction": {
+        "dragNodes": true,
+        "dragView": true,
+        "zoomView": true
+      },
+      "layout": {
+        "improvedLayout": true
       }
     }
     """)
+
+    # Add event listener to disable physics after stabilization
+    # This stops the constant movement and makes the graph static
+    html = net.generate_html(notebook=False)
+
+    # Inject script to disable physics after initial stabilization
+    physics_disable_script = """
+    <script type="text/javascript">
+      // Wait for the network to be created
+      setTimeout(function() {
+        if (typeof network !== 'undefined') {
+          // Disable physics after stabilization completes
+          network.on('stabilizationIterationsDone', function() {
+            network.setOptions({ physics: { enabled: false } });
+          });
+
+          // Fallback: disable physics after 5 seconds regardless
+          setTimeout(function() {
+            network.setOptions({ physics: { enabled: false } });
+          }, 5000);
+        }
+      }, 100);
+    </script>
+    """
+
+    # Insert the script before the closing body tag
+    html = html.replace('</body>', physics_disable_script + '</body>')
+
+    return html
     return net.generate_html(notebook=False)

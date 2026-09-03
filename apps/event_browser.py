@@ -36,17 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 from lawsuit_parser.event_extraction.browse import (
-    EVENT_TABLE_COLUMNS,
     build_document_rows,
-    collect_actor_tags,
     compute_case_summary,
-    document_rows_to_table_dicts,
     format_name_list,
     list_browsable_cases,
     load_case_artifacts,
     render_html_table,
 )
-from lawsuit_parser.event_extraction.graph import build_case_graph, filter_to_actors, render_pyvis_html
+from lawsuit_parser.event_extraction.graph import build_case_graph, render_pyvis_html
 
 st.set_page_config(
     page_title="Event Browser",
@@ -141,57 +138,41 @@ def render_summary(summary) -> None:
             st.caption(f"GLiNER model: {summary.gliner_model} (threshold={summary.gliner_threshold})")
 
 
-def render_documents(rows, selected_actors: list[str], match_all: bool) -> None:
-    if selected_actors:
-        wanted = set(selected_actors)
-        if match_all:
-            filtered = [r for r in rows if wanted <= set(r.actors)]
-        else:
-            filtered = [r for r in rows if wanted & set(r.actors)]
-    else:
-        filtered = rows
-
-    if not rows:
-        st.info("No documents found for this case.")
-        return
-
-    st.write(f"**{len(filtered)} of {len(rows)} documents shown**")
-
-    if not filtered:
-        st.info("No documents match the selected actor filter.")
-        return
-
-    st.markdown(
-        render_html_table(EVENT_TABLE_COLUMNS, document_rows_to_table_dicts(filtered)),
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("#### Document detail")
-    for row in filtered:
-        header = f"#{row.seq} — {row.doc_id} — {row.filing_date or 'no filing date'}"
-        with st.expander(header):
-            if row.document_title:
-                st.write(row.document_title)
-            if row.summary:
-                st.markdown(f"**Summary:** {row.summary}")
-            if row.actors:
-                st.markdown("**Actors:** " + ", ".join(f"`{a}`" for a in row.actors))
-            if row.dates:
-                st.markdown(
-                    "**Dates found:** " + ", ".join(f"{text} ({dtype})" for dtype, text in row.dates)
-                )
-            if row.entities:
-                st.markdown("**Entities:**")
-                for label, text, score in row.entities:
-                    st.write(f"- [{label}] {text!r} (score={score:.2f})")
-
-
-def render_graph(case_id: str, data_root: str, output_root: str, has_events: bool, selected_actors: list[str]) -> None:
+def render_graph(case_id: str, data_root: str, output_root: str, has_events: bool) -> None:
     st.markdown("### Case graph")
+
+    # Load artifacts to show graph statistics
+    artifacts = _load_artifacts(case_id, data_root, output_root, _artifacts_signature(case_id, output_root))
+
+    # Count nodes and edges
+    from lawsuit_parser.event_extraction.graph import build_case_graph
+    g = build_case_graph(artifacts, include_events=False)
+
+    # Count by type
+    node_counts = {"document": 0, "actor": 0}
+    for node, data in g.nodes(data=True):
+        kind = data.get('kind', 'unknown')
+        if kind in node_counts:
+            node_counts[kind] += 1
+
+    edge_counts = {}
+    for u, v, data in g.edges(data=True):
+        kind = data.get('kind', 'unknown')
+        edge_counts[kind] = edge_counts.get(kind, 0) + 1
+
+    # Display stats
+    cols = st.columns(4)
+    cols[0].metric("Documents", node_counts['document'])
+    cols[1].metric("Actors", node_counts['actor'])
+    cols[2].metric("Represents", edge_counts.get('represents', 0))
+    cols[3].metric("Present In", edge_counts.get('present_in', 0))
+
     st.caption(
-        "Documents (boxes), actors (dots, colored by role), and products (diamonds), linked by "
-        "who's mentioned in which document and which document cites which. Drag nodes, "
-        "scroll to zoom, hover for details."
+        "**Nodes:** Gray rectangles = documents, Colored dots/squares = actors. "
+        "**Actors:** 🟢 Green dots = plaintiffs, 🔴 Red dots/squares = defendants, "
+        "🔵 Blue dots = attorneys/counsel, ⚫ Black dots = judges, Squares = legal entities (companies). "
+        "**Edges:** Yellow = represents relationship, Gray = present in document. "
+        "Drag nodes, scroll to zoom, hover for details."
     )
 
     include_events = False
@@ -204,12 +185,9 @@ def render_graph(case_id: str, data_root: str, output_root: str, has_events: boo
     else:
         st.caption("No events.json for this case yet (Stage 5 hasn't run) - showing documents/actors/products only.")
 
-    if selected_actors:
-        st.caption(f"Graph scoped to {len(selected_actors)} selected actor(s) via the filter above.")
-
     html = _render_graph_html(
         case_id, data_root, output_root, _artifacts_signature(case_id, output_root),
-        include_events, tuple(sorted(selected_actors)),
+        include_events, tuple(),
     )
     st.iframe(html, height=780)
 
@@ -243,25 +221,61 @@ def main():
     render_summary(summary)
     st.divider()
 
-    st.markdown("### Filter by actor")
-    tags = collect_actor_tags(rows)
-    selected_actors = st.multiselect(
-        "Show only documents mentioning these actors (tag-style filter)",
-        options=tags,
-        default=[],
-    )
-    match_all = False
-    if len(selected_actors) > 1:
-        match_all = st.checkbox(
-            "Require ALL selected actors in the same document (default: ANY)",
-            value=False,
-        )
+    # Documents table
+    st.markdown("### Documents")
+    docs_data = []
+    for row in rows:
+        docs_data.append({
+            "document": row.doc_id,
+            "filename": row.file_name,
+            "filed": row.filing_date or "—",
+            "title": row.document_title or "—",
+            "summary": row.summary or "—",
+        })
+
+    DOCS_COLUMNS = [
+        ("Document", "document", 10),
+        ("Filename", "filename", 30),
+        ("Filed", "filed", 12),
+        ("Title", "title", 28),
+        ("Summary", "summary", 50),
+    ]
+    st.markdown(render_html_table(DOCS_COLUMNS, docs_data), unsafe_allow_html=True)
 
     st.divider()
-    render_documents(rows, selected_actors, match_all)
+
+    # Events table
+    st.markdown("### Events")
+    if artifacts.events is not None and artifacts.events.events:
+        # Deduplicate events by cluster_id - take first event from each cluster
+        seen_clusters = set()
+        unique_events = []
+        for event in sorted(artifacts.events.events, key=lambda e: e.date_parsed if e.date_parsed else ""):
+            if event.cluster_id not in seen_clusters:
+                seen_clusters.add(event.cluster_id)
+                unique_events.append(event)
+
+        events_data = []
+        for event in unique_events:
+            events_data.append({
+                "date": event.dates[0] if event.dates else "—",
+                "actors": ", ".join(event.actors),
+                "document": event.source_doc_id,
+                "summary": event.description,
+            })
+
+        EVENTS_COLUMNS = [
+            ("Date", "date", 15),
+            ("Actors", "actors", 30),
+            ("Document", "document", 10),
+            ("Summary", "summary", 55),
+        ]
+        st.markdown(render_html_table(EVENTS_COLUMNS, events_data), unsafe_allow_html=True)
+    else:
+        st.info("No events extracted for this case yet (Stage 5 hasn't run).")
 
     st.divider()
-    render_graph(case_id, data_root, output_root, has_events=artifacts.events is not None, selected_actors=selected_actors)
+    render_graph(case_id, data_root, output_root, has_events=artifacts.events is not None)
 
 
 if __name__ == "__main__":

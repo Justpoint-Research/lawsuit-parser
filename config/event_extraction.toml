@@ -178,3 +178,11 @@ llm_base_url = "http://localhost:11434"
 # one-call-per-cluster behavior (still deduped first, see Stage 5's own
 # cache_hits logging).
 batch_size = 6
+
+[stage_6]
+# Extract relationships between entities, focusing on lawyer-client
+# representation relationships (who represents whom).
+extract_relations = true
+
+# Minimum confidence threshold for including a relation (0.0-1.0)
+min_confidence = 0.7

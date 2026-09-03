@@ -454,3 +454,73 @@ class StampDatesArtifact(BaseModel):
     case_id: str
     extraction_timestamp: datetime = Field(default_factory=datetime.now)
     dates: list[StampDate] = Field(default_factory=list)
+
+
+# ============================================================================
+# Stage 6: Relation Extraction Models
+# ============================================================================
+
+class Relation(BaseModel):
+    """A relationship between two entities extracted from the case documents.
+
+    Currently focused on representation relationships (lawyers representing
+    plaintiffs/defendants), but designed to be extensible to other relation
+    types in the future.
+    """
+
+    relation_id: str
+    relation_type: str = Field(
+        description="Type of relationship (e.g., 'represents', 'employed_by', 'affiliated_with')"
+    )
+    source_entity: str = Field(
+        description="Canonical name of the source entity (typically the lawyer/counsel)"
+    )
+    source_role: str = Field(
+        description="Role of the source entity (e.g., 'counsel', 'attorney')"
+    )
+    target_entity: str = Field(
+        description="Canonical name of the target entity (typically plaintiff/defendant)"
+    )
+    target_role: str = Field(
+        description="Role of the target entity (e.g., 'plaintiff', 'defendant')"
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Confidence score for this relation (0.0-1.0)"
+    )
+    evidence: str | None = Field(
+        default=None,
+        description="Text evidence supporting this relation (e.g., the sentence containing 'representing the defendants')"
+    )
+    doc_id: str = Field(
+        description="Document where this relation was found"
+    )
+    char_start: int | None = Field(
+        default=None,
+        description="Character offset where the evidence starts in the document"
+    )
+    char_end: int | None = Field(
+        default=None,
+        description="Character offset where the evidence ends in the document"
+    )
+    extraction_method: str = Field(
+        default="pattern",
+        description="Method used to extract this relation ('pattern', 'llm', 'hybrid')"
+    )
+
+
+class RelationsArtifact(BaseModel):
+    """Stage 6 output: relationships between entities in the case.
+
+    This artifact contains all extracted relationships, primarily focused on
+    lawyer-client representation relationships.
+    """
+
+    case_id: str
+    extraction_timestamp: datetime = Field(default_factory=datetime.now)
+    relations: list[Relation] = Field(default_factory=list)
+    relation_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of relations by type"
+    )
