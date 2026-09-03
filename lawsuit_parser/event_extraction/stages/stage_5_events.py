@@ -258,17 +258,18 @@ class Stage5Events(BaseStage):
         resolved: list[tuple[DateCluster, DateEntry, tuple[int, int]]],
         doc_context: DocContext,
     ) -> None:
-        """Build one Event per resolved date, no LLM call: `description` is
-        a direct quote (see _quote_with_context), `actors` is the source
-        cluster's full candidate_actors (uncurated), `event_type`/`outcome`
-        are left unset."""
+        """Build one Event per resolved date, no LLM call: `quote` is
+        a direct quote (see _quote_with_context), `summary` is left unset,
+        `actors` is the source cluster's full candidate_actors (uncurated),
+        `event_type`/`outcome` are left unset."""
         events: list[Event] = []
         for event_id_counter, (cluster, date_entry, span) in enumerate(resolved):
             doc_text, sentence_spans = doc_context(cluster.doc_id)
             events.append(Event(
                 event_id=f"event_{event_id_counter:04d}",
                 cluster_id=cluster.cluster_id,
-                description=_quote_with_context(doc_text, sentence_spans, *span),
+                quote=_quote_with_context(doc_text, sentence_spans, *span),
+                summary=None,
                 actors=cluster.candidate_actors,
                 dates=[date_entry.text],
                 date_parsed=date_entry.parsed_date,
@@ -290,8 +291,10 @@ class Stage5Events(BaseStage):
         """Build Event(s) per cluster via an LLM (see module docstring),
         restricted to each cluster's resolved (non-stamp-only) dates - a
         cluster whose dates were all stamp-only doesn't appear here at
-        all, so it costs nothing."""
+        all, so it costs nothing. Generates both a direct quote from the
+        source paragraph and an LLM-synthesized summary for each event."""
         titles_by_doc, summaries_by_doc = self._load_doc_context(case_id)
+        doc_context = self._doc_context_loader(case_id)
 
         backend = config.get("llm_backend", "ollama")
         llm_model = config["llm_model"]
@@ -303,9 +306,11 @@ class Stage5Events(BaseStage):
         # cluster regardless of this setting.
         batch_size = max(1, config.get("batch_size", 1)) if backend != "nuextract" else 1
 
-        by_cluster: dict[str, tuple[DateCluster, list[DateEntry]]] = {}
-        for cluster, date_entry, _span in resolved:
-            by_cluster.setdefault(cluster.cluster_id, (cluster, []))[1].append(date_entry)
+        by_cluster: dict[str, tuple[DateCluster, list[DateEntry], dict[str, tuple[int, int]]]] = {}
+        for cluster, date_entry, span in resolved:
+            cluster_data = by_cluster.setdefault(cluster.cluster_id, (cluster, [], {}))
+            cluster_data[1].append(date_entry)
+            cluster_data[2][date_entry.text] = span
 
         # Dedupe by (citation, resolved dates, candidate_actors) *before*
         # calling the LLM at all, not just via a cache checked as we go: at
@@ -322,12 +327,12 @@ class Stage5Events(BaseStage):
         def cache_key(cluster: DateCluster, dates: list[DateEntry]) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
             return (cluster.citation, tuple(d.text for d in dates), tuple(sorted(cluster.candidate_actors)))
 
-        pending: dict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[DateCluster, list[DateEntry]]] = {}
+        pending: dict[tuple[str, tuple[str, ...], tuple[str, ...]], tuple[DateCluster, list[DateEntry], dict[str, tuple[int, int]]]] = {}
         cluster_keys: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
-        for cluster, dates in by_cluster.values():
+        for cluster, dates, spans in by_cluster.values():
             key = cache_key(cluster, dates)
             cluster_keys[cluster.cluster_id] = key
-            pending.setdefault(key, (cluster, dates))
+            pending.setdefault(key, (cluster, dates, spans))
         cache_hits = len(by_cluster) - len(pending)
 
         results: dict[tuple[str, tuple[str, ...], tuple[str, ...]], list[dict]] = {}
@@ -340,7 +345,7 @@ class Stage5Events(BaseStage):
             pbar.set_postfix_str(batch[0][0].doc_id)
 
             if backend == "nuextract" or batch_size == 1:
-                for key, (cluster, dates) in zip(batch_keys, batch):
+                for key, (cluster, dates, _spans) in zip(batch_keys, batch):
                     synthesizer = synthesize_events_with_nuextract if backend == "nuextract" else synthesize_events_with_llm
                     results[key] = synthesizer(
                         citation=cluster.citation,
@@ -361,7 +366,7 @@ class Stage5Events(BaseStage):
                         "document_title": titles_by_doc.get(cluster.doc_id),
                         "document_summary": summaries_by_doc.get(cluster.doc_id),
                     }
-                    for j, (cluster, dates) in enumerate(batch)
+                    for j, (cluster, dates, _spans) in enumerate(batch)
                 ]
                 batch_results = synthesize_events_batch_with_llm(items=items, model=llm_model, base_url=llm_base_url)
                 for j, key in enumerate(batch_keys):
@@ -373,20 +378,30 @@ class Stage5Events(BaseStage):
         event_id_counter = 0
         clusters_with_events = 0
 
-        for cluster, dates in by_cluster.values():
+        for cluster, dates, date_spans in by_cluster.values():
             raw_events = results.get(cluster_keys[cluster.cluster_id], [])
             if raw_events:
                 clusters_with_events += 1
 
             entry_by_text = {date.text: date for date in dates}
+            doc_text, sentence_spans = doc_context(cluster.doc_id)
+
             for raw_event in raw_events:
                 covered = [entry_by_text[t] for t in raw_event["dates"] if t in entry_by_text]
                 parsed = sorted(d.parsed_date for d in covered if d.parsed_date is not None)
+
+                # Generate quote from the first date in the event, or use cluster citation if no dates
+                quote = cluster.citation or ""
+                if raw_event["dates"] and raw_event["dates"][0] in date_spans:
+                    first_date_span = date_spans[raw_event["dates"][0]]
+                    quote = _quote_with_context(doc_text, sentence_spans, *first_date_span)
+
                 events.append(Event(
                     event_id=f"event_{event_id_counter:04d}",
                     cluster_id=cluster.cluster_id,
                     event_type=raw_event["event_type"],
-                    description=raw_event["description"],
+                    quote=quote,
+                    summary=raw_event["description"],
                     outcome=raw_event["outcome"],
                     actors=raw_event["actors"],
                     dates=raw_event["dates"],

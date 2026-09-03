@@ -389,23 +389,28 @@ class DatesArtifact(BaseModel):
 class Event(BaseModel):
     """One dated occurrence from Stage 4's dates.json, in graph-ready form
     (actors are canonical names entities.json already resolved, never
-    invented). Populated one of two ways, per [stage_5].use_llm:
-    - False (default, deterministic - no LLM call): `description` is a
-      direct quote (the sentence containing the date, plus one sentence of
-      context on each side), `event_type`/`outcome` are left unset, and
-      `actors` is the source DateCluster's full candidate_actors (no
-      per-event curation).
-    - True: an LLM reads the cluster's citation and fills in `event_type`/
-      `description`/`outcome`, and curates `actors` down to who was
-      actually involved - constrained to candidate_actors via a
-      JSON-schema enum so it can never name someone GLiNER didn't already
-      resolve. Much slower (one LLM call, or one call per batch - see
-      [stage_5].batch_size - per distinct cluster)."""
+    invented). Always includes a direct `quote` from the source text.
+    Optionally includes an LLM-generated `summary` when [stage_5].use_llm
+    is true:
+    - `quote` (always populated): Direct quote - the sentence containing
+      the date, plus one sentence of context on each side, with the date
+      text itself wrapped in ** markers.
+    - `summary` (optional, when [stage_5].use_llm is true): LLM-generated
+      description of what happened based on the paragraph context.
+    - `event_type`/`outcome` (optional, when [stage_5].use_llm is true):
+      Additional structured fields from LLM synthesis.
+    - `actors`: When use_llm is false, includes all candidate_actors; when
+      true, curated by LLM to only those actually involved (constrained to
+      candidate_actors via JSON-schema enum)."""
 
     event_id: str
     cluster_id: str = Field(description="The DateCluster (dates.json) this event was synthesized from")
     event_type: str | None = Field(default=None, description="Only set when [stage_5].use_llm is true")
-    description: str
+    quote: str = Field(description="Direct quote from source text with date marked in ** (always populated)")
+    summary: str | None = Field(
+        default=None,
+        description="LLM-generated description of the event (only populated when [stage_5].use_llm is true)"
+    )
     outcome: str | None = Field(default=None, description="What the event resulted in, if the text states one")
     actors: list[str] = Field(
         default_factory=list,

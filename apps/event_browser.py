@@ -259,16 +259,18 @@ def main():
         for event in unique_events:
             events_data.append({
                 "date": event.dates[0] if event.dates else "—",
-                "actors": ", ".join(event.actors),
+                "actors": ", ".join(event.actors) if event.actors else "—",
                 "document": event.source_doc_id,
-                "summary": event.description,
+                "quote": event.quote,
+                "summary": event.summary or "—",
             })
 
         EVENTS_COLUMNS = [
-            ("Date", "date", 15),
-            ("Actors", "actors", 30),
-            ("Document", "document", 10),
-            ("Summary", "summary", 55),
+            ("Date", "date", 12),
+            ("Actors", "actors", 20),
+            ("Document", "document", 8),
+            ("Quote", "quote", 30),
+            ("Summary", "summary", 30),
         ]
         st.markdown(render_html_table(EVENTS_COLUMNS, events_data), unsafe_allow_html=True)
     else:

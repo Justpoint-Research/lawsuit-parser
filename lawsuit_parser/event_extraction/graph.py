@@ -74,7 +74,9 @@ def _event_tooltip(event: Event) -> str:
         parts.append(event.event_type)
     if event.dates:
         parts.append(", ".join(event.dates))
-    parts.append(event.description[:400])
+    if event.summary:
+        parts.append(f"Summary: {event.summary[:300]}")
+    parts.append(f"Quote: {event.quote[:300]}")
     if event.outcome:
         parts.append(f"Outcome: {event.outcome}")
     return "\n".join(parts)
