@@ -211,8 +211,18 @@ Examples:
             print(f"Error: Cases directory not found: {cases_dir}", file=CONSOLE)
             return 1
 
-        # Find all case directories
-        case_ids = [d.name for d in cases_dir.iterdir() if d.is_dir()]
+        # Find all case directories (recursively, preserving nested structure)
+        case_ids = []
+        for item in cases_dir.rglob("*"):
+            if item.is_dir():
+                # Skip docling directories (they mirror the structure but aren't case dirs)
+                if "docling" in item.parts:
+                    continue
+                # Check if this directory has documents or confirmations subdirectories
+                if (item / "documents").exists() or (item / "confirmations").exists():
+                    # Use relative path from cases_dir as case_id
+                    relative_path = item.relative_to(cases_dir)
+                    case_ids.append(str(relative_path))
 
         if not case_ids:
             print(f"No cases found in {cases_dir}", file=CONSOLE)

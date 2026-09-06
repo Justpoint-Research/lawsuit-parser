@@ -186,3 +186,43 @@ extract_relations = true
 
 # Minimum confidence threshold for including a relation (0.0-1.0)
 min_confidence = 0.7
+
+[lawsuit_classification]
+# Classify lawsuits into categories using LLM (for generating training data)
+# and optionally a trained BERT-based classifier (for fast inference)
+
+# Use LLM for zero-shot classification (generates training data)
+use_llm_classifier = true
+
+# Use trained BERT model for fast classification (after training on LLM-generated data)
+use_bert_classifier = false
+
+# LLM backend settings (same options as stage_1)
+llm_backend = "ollama"
+llm_model = "qwen3:30b-a3b"
+llm_base_url = "http://localhost:11434"
+
+# How many pages from the beginning of documents to use for classification
+classification_page_count = 3
+
+# How many documents from each case to examine (prioritizes complaints/initial filings)
+classification_doc_count = 2
+
+# Categories to classify (multilabel)
+categories = [
+    "product_liability",
+    "personal_injury",
+    "class_action"
+]
+
+# Minimum confidence threshold for assigning a label (0.0-1.0)
+min_confidence = 0.6
+
+# BERT model settings (for trained classifier)
+bert_model = "nlpaueb/legal-bert-base-uncased"  # or "bert-base-uncased"
+bert_max_length = 512
+bert_batch_size = 8
+
+# Training data paths
+training_data_path = "data/classification/training_data.json"
+model_save_path = "data/classification/bert_classifier"

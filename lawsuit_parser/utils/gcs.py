@@ -2,7 +2,7 @@
 
 from google.cloud import storage
 from google.auth import default
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 
 def get_storage_client() -> storage.Client:
@@ -53,7 +53,7 @@ def extract_blob_name(gcs_path: str) -> str | None:
         return None
 
     # Handle relative paths (document_link/..., confirmation/...)
-    # Database stores paths exactly as they appear in GCS - no transformation needed
+    # Database stores paths exactly as they appear in GCS (URL-encoded)
     return gcs_path
 
 

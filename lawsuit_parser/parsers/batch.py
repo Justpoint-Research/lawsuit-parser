@@ -64,12 +64,23 @@ def get_docling_dir(pdf_path: Path) -> Path:
     directories while still avoiding name collisions.
 
     Args:
-        pdf_path: Path to PDF file (e.g. data/cases/case_104/documents/foo.pdf)
+        pdf_path: Path to PDF file (e.g. data/cases/case_104/documents/foo.pdf
+            or data/cases/ny_sample/case_104/documents/foo.pdf)
 
     Returns:
         Directory to save Docling outputs into
-        (e.g. data/cases/case_104/docling/documents)
+        (e.g. data/cases/case_104/docling/documents or
+        data/cases/ny_sample/case_104/docling/documents)
     """
+    # Walk up from the PDF to find the case directory (the one containing documents/ or confirmations/)
+    current = pdf_path.parent
+    while current.parent != current:  # Stop at root
+        if (current / "documents").exists() or (current / "confirmations").exists():
+            # Found the case directory
+            return current / "docling" / pdf_path.parent.name
+        current = current.parent
+
+    # Fallback to old behavior if we can't find the case directory
     case_dir = pdf_path.parents[1]
     return case_dir / "docling" / pdf_path.parent.name
 

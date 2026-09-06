@@ -7,6 +7,7 @@ create denormalized JSON files for easy consumption.
 
 import json
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ class CaseExporter:
         self,
         engine: Engine,
         output_dir: Path | str,
-        gcs_bucket_name: str = "court-docs",
+        gcs_bucket_name: str = "courts_crawl",
         schema: str = "courts_final",
         table_prefix: str = "ny_",
         extract_text: bool = False,
@@ -38,7 +39,7 @@ class CaseExporter:
         Args:
             engine: SQLAlchemy engine connected to the scrapping database (port 5433).
             output_dir: Directory where case JSON files and PDFs will be saved.
-            gcs_bucket_name: GCS bucket name where documents are stored (default: court-docs).
+            gcs_bucket_name: GCS bucket name where documents are stored (default: courts_crawl).
             schema: Postgres schema holding the crawl tables (default: courts_final,
                 where the former ``public.court_cases``/``public.court_documents``
                 data now lives).
@@ -61,6 +62,8 @@ class CaseExporter:
         self.table_prefix = table_prefix
         self.extract_text = extract_text
         self.use_gpu = use_gpu
+        # Extract state code from table_prefix (e.g., "ny_" -> "ny")
+        self.state_code = table_prefix.rstrip("_") if table_prefix else ""
         self.cases_table = f"{schema}.{table_prefix}cases_after_search"
         self.documents_table = f"{schema}.{table_prefix}docket_documents"
         # Historical archive of case snapshots (same shape as cases_table,
@@ -76,15 +79,24 @@ class CaseExporter:
         self.storage_client = storage.Client()
         self.bucket = self.storage_client.bucket(gcs_bucket_name)
 
-    def export_case_by_id(self, case_id: int) -> Path:
+    def export_case_by_id(self, case_id: int, skip_if_exists: bool = True) -> tuple[Path, bool]:
         """Export a case by its database ID ({table_prefix}cases_after_search.id).
 
         Args:
             case_id: The integer ID from the cases table's ``id`` column.
+            skip_if_exists: If True, skip export if the JSON file already exists
+                (allows resuming interrupted exports). Default: True.
 
         Returns:
-            Path to the created JSON file.
+            Tuple of (path to JSON file, whether it was skipped).
         """
+        # Check if case already exported
+        case_dir = self.output_dir / f"case_{case_id}"
+        json_path = case_dir / f"case_{case_id}.json"
+
+        if skip_if_exists and json_path.exists():
+            return json_path, True  # Skipped
+
         # Query case data
         case_query = text(f"""
             SELECT
@@ -194,12 +206,11 @@ class CaseExporter:
         for row in transcription_rows:
             transcriptions_by_doc.setdefault(row["case_file_id"], []).append(row)
 
-        # Create output directory for this case
-        case_dir = self.output_dir / f"case_{case_id}"
+        # Ensure output directory exists (may already exist from skip check above)
         case_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download PDF files
-        self._download_case_files(documents, case_dir)
+        # Download PDF files and extract their metadata
+        pdf_metadata_by_doc = self._download_case_files(documents, case_dir)
 
         # Optional Docling text extraction, run only once the PDFs are on
         # disk to extract from (see _extract_case_text and the
@@ -210,7 +221,7 @@ class CaseExporter:
 
         # Create denormalized structure
         denormalized_case = self._create_denormalized_json(
-            case_data, documents, case_history, transcriptions_by_doc, text_paths_by_doc
+            case_data, documents, case_history, transcriptions_by_doc, text_paths_by_doc, pdf_metadata_by_doc
         )
 
         # Save JSON
@@ -218,7 +229,7 @@ class CaseExporter:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(denormalized_case, f, indent=2, default=str)
 
-        return json_path
+        return json_path, False  # Successfully exported (not skipped)
 
     def _create_denormalized_json(
         self,
@@ -227,6 +238,7 @@ class CaseExporter:
         case_history: list[dict[str, Any]],
         transcriptions_by_doc: dict[int, list[dict[str, Any]]],
         text_paths_by_doc: dict[int, dict[str, str]],
+        pdf_metadata_by_doc: dict[int, dict[str, Any]],
     ) -> dict[str, Any]:
         """Create a denormalized JSON structure.
 
@@ -240,6 +252,9 @@ class CaseExporter:
             text_paths_by_doc: Docling-extracted ``.txt`` paths (relative to
                 the case directory) keyed by document id - see
                 _extract_case_text. Empty when extract_text=False.
+            pdf_metadata_by_doc: PDF file metadata (author, creation date, etc.)
+                keyed by document id. Contains 'document_metadata' and
+                'confirmation_metadata' when available.
 
         Returns:
             Denormalized dictionary ready for JSON serialization.
@@ -271,6 +286,13 @@ class CaseExporter:
             if doc_text_paths.get("confirmation_text_path"):
                 processed_doc["local_confirmation_text_path"] = doc_text_paths["confirmation_text_path"]
 
+            # Add PDF metadata if available
+            doc_pdf_metadata = pdf_metadata_by_doc.get(doc["id"], {})
+            if doc_pdf_metadata.get("document_metadata"):
+                processed_doc["pdf_metadata"] = doc_pdf_metadata["document_metadata"]
+            if doc_pdf_metadata.get("confirmation_metadata"):
+                processed_doc["confirmation_pdf_metadata"] = doc_pdf_metadata["confirmation_metadata"]
+
             processed_docs.append(processed_doc)
 
         # Create denormalized structure
@@ -291,12 +313,16 @@ class CaseExporter:
             },
         }
 
-    def _download_case_files(self, documents: list[dict[str, Any]], case_dir: Path):
-        """Download all files for a case from GCS.
+    def _download_case_files(self, documents: list[dict[str, Any]], case_dir: Path) -> dict[int, dict[str, Any]]:
+        """Download all files for a case from GCS and extract PDF metadata.
 
         Args:
             documents: List of document dictionaries.
             case_dir: Directory where files should be saved.
+
+        Returns:
+            Dictionary keyed by document id, containing 'document_metadata'
+            and 'confirmation_metadata' for each document's PDFs.
         """
         # Create subdirectories
         docs_dir = case_dir / "documents"
@@ -304,7 +330,11 @@ class CaseExporter:
         docs_dir.mkdir(exist_ok=True)
         confirm_dir.mkdir(exist_ok=True)
 
+        pdf_metadata_by_doc = {}
+
         for doc in documents:
+            doc_metadata = {}
+
             # Download main document
             if doc.get("document_bucket_link"):
                 gcs_path = doc["document_bucket_link"]
@@ -313,6 +343,10 @@ class CaseExporter:
 
                 try:
                     self.download_from_gcs_to_file(gcs_path, local_path)
+                    # Extract PDF metadata
+                    metadata = self._extract_pdf_metadata(local_path)
+                    if metadata:
+                        doc_metadata["document_metadata"] = metadata
                 except Exception as e:
                     print(f"Warning: Failed to download {gcs_path}: {e}")
 
@@ -324,8 +358,18 @@ class CaseExporter:
 
                 try:
                     self.download_from_gcs_to_file(gcs_path, local_path)
+                    # Extract PDF metadata
+                    metadata = self._extract_pdf_metadata(local_path)
+                    if metadata:
+                        doc_metadata["confirmation_metadata"] = metadata
                 except Exception as e:
                     print(f"Warning: Failed to download {gcs_path}: {e}")
+
+            # Store metadata for this document if any was extracted
+            if doc_metadata:
+                pdf_metadata_by_doc[doc["id"]] = doc_metadata
+
+        return pdf_metadata_by_doc
 
     def _extract_case_text(
         self, documents: list[dict[str, Any]], case_dir: Path
@@ -417,6 +461,10 @@ class CaseExporter:
             print(f"Warning: Could not extract blob name from {gcs_path}")
             return
 
+        # Prefix with state code (e.g., "ny/document_link/...")
+        if self.state_code:
+            blob_name = f"{self.state_code}/{blob_name}"
+
         # Download from GCS
         blob = self.bucket.blob(blob_name)
 
@@ -443,6 +491,10 @@ class CaseExporter:
 
         if not blob_name:
             raise Exception(f"Could not extract blob name from {gcs_path}")
+
+        # Prefix with state code (e.g., "ny/document_link/...")
+        if self.state_code:
+            blob_name = f"{self.state_code}/{blob_name}"
 
         # Download from GCS
         blob = self.bucket.blob(blob_name)
@@ -488,3 +540,48 @@ class CaseExporter:
             filename += ".pdf"
 
         return filename
+
+    def _extract_pdf_metadata(self, pdf_path: Path) -> dict[str, Any] | None:
+        """Extract metadata from a PDF file using pdfinfo command.
+
+        Args:
+            pdf_path: Path to the PDF file.
+
+        Returns:
+            Dictionary with PDF metadata, or None if extraction fails.
+        """
+        if not pdf_path.exists():
+            return None
+
+        try:
+            # Try using pdfinfo command-line tool (part of poppler-utils)
+            result = subprocess.run(
+                ["pdfinfo", str(pdf_path)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode == 0:
+                metadata = {}
+                for line in result.stdout.split("\n"):
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        if value:  # Only include non-empty values
+                            metadata[key] = value
+                return metadata if metadata else None
+
+        except FileNotFoundError:
+            # pdfinfo not available - silently skip PDF metadata extraction
+            print(
+                "Warning: pdfinfo command not found. Install poppler-utils to extract PDF metadata."
+            )
+            return None
+        except subprocess.TimeoutExpired:
+            print(f"Warning: PDF metadata extraction timed out for {pdf_path}")
+            return None
+        except Exception as e:
+            print(f"Warning: Failed to extract PDF metadata from {pdf_path}: {e}")
+            return None

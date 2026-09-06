@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
+from tqdm import tqdm
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -73,7 +74,7 @@ def get_random_case_ids(
         WHERE cc.case_id IS NOT NULL  -- Filter out cases without case_id
           AND EXISTS (
               SELECT 1 FROM {documents_table} cd
-              WHERE cd.case_id = cc.case_id
+              WHERE cd.docket_id = cc.docket_id
           )  -- Filter out cases without documents
         ORDER BY RANDOM()
         LIMIT :count
@@ -89,7 +90,7 @@ def get_random_case_ids(
 def export_cases(
     case_ids: list[int],
     output_dir: Path,
-    bucket_name: str = "court-docs",
+    bucket_name: str = "courts_crawl",
     schema: str = "courts_final",
     table_prefix: str = "ny_",
     extract_text: bool = False,
@@ -124,20 +125,40 @@ def export_cases(
         total = len(case_ids)
         successful = 0
         failed = 0
+        skipped = 0
 
-        for idx, case_id in enumerate(case_ids, 1):
-            try:
-                print(f"\n[{idx}/{total}] Exporting case {case_id}...")
-                json_path = exporter.export_case_by_id(case_id)
-                print(f"✓ Successfully exported to {json_path}")
-                successful += 1
-            except Exception as e:
-                print(f"✗ Failed to export case {case_id}: {e}")
-                failed += 1
+        # Use tqdm for progress bar with ETA
+        with tqdm(
+            total=total,
+            desc="Exporting cases",
+            unit="case",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            colour="green"
+        ) as pbar:
+            for case_id in case_ids:
+                try:
+                    # skip_if_exists=True allows resuming interrupted exports
+                    json_path, was_skipped = exporter.export_case_by_id(case_id, skip_if_exists=True)
+
+                    if was_skipped:
+                        skipped += 1
+                    else:
+                        successful += 1
+                        tqdm.write(f"✓ Exported case {case_id}")
+
+                    pbar.set_postfix_str(f"✓{successful} ⊘{skipped} ✗{failed}")
+
+                except Exception as e:
+                    tqdm.write(f"✗ Failed case {case_id}: {e}")
+                    failed += 1
+                    pbar.set_postfix_str(f"✓{successful} ⊘{skipped} ✗{failed}")
+
+                pbar.update(1)
 
         print("\n" + "=" * 80)
         print(f"Export complete!")
         print(f"  Successful: {successful}/{total}")
+        print(f"  Skipped: {skipped}/{total} (already exported)")
         print(f"  Failed: {failed}/{total}")
         print(f"  Output directory: {output_dir}")
         print("=" * 80)
@@ -166,8 +187,8 @@ def main():
     parser.add_argument(
         "--bucket",
         type=str,
-        default="court-docs",
-        help="GCS bucket name (default: court-docs)",
+        default="courts_crawl",
+        help="GCS bucket name (default: courts_crawl)",
     )
     parser.add_argument(
         "--case-ids",

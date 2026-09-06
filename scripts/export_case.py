@@ -67,8 +67,8 @@ def main():
     parser.add_argument(
         "--bucket",
         type=str,
-        default="court-docs",
-        help="GCS bucket name (default: court-docs)",
+        default="courts_crawl",
+        help="GCS bucket name (default: courts_crawl)",
     )
     parser.add_argument(
         "--schema",
@@ -118,10 +118,13 @@ def main():
         )
 
         # Export the case
-        json_path = exporter.export_case_by_id(args.case_id)
+        json_path, was_skipped = exporter.export_case_by_id(args.case_id)
 
         print("\n" + "=" * 80)
-        print("✓ Export successful!")
+        if was_skipped:
+            print("⊘ Case already exported (skipped)")
+        else:
+            print("✓ Export successful!")
         print(f"  JSON file: {json_path}")
         print(f"  Case directory: {json_path.parent}")
         print("=" * 80)

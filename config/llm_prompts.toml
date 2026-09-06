@@ -120,3 +120,32 @@ For EACH entity, extract:
 Be thorough - extract from headers, body text, signatures, and contact blocks. Include attorneys even if only email/phone is given.
 Return empty list if no entities can be extracted.
 """
+
+[lawsuit_classification]
+template = """
+You are classifying a lawsuit into one or more legal categories based on the case documents.
+
+Case context:
+Case ID: {case_id}
+Caption: {caption}
+Court: {court}
+Case type: {case_type}
+
+Document excerpts from this case (first {page_count} page(s) of initial documents):
+{text_excerpt}
+
+Based on the documents, determine which of the following categories apply to this lawsuit. Multiple categories can apply:
+
+1. PRODUCT_LIABILITY: The lawsuit involves claims about a defective or dangerous product causing harm. This includes medical devices, drugs, consumer products, vehicles, machinery, etc. Look for allegations about design defects, manufacturing defects, failure to warn, or breach of warranty.
+
+2. PERSONAL_INJURY: The lawsuit involves claims for physical or emotional harm to an individual. This includes car accidents, slip and fall, medical malpractice, assault, wrongful death, etc. Look for allegations about bodily injury, pain and suffering, medical expenses, or loss of consortium.
+
+3. CLASS_ACTION: The lawsuit is brought by one or more plaintiffs on behalf of a larger group (class) of similarly situated people. Look for phrases like "class action", "on behalf of all", "class members", "class certification", "numerosity", or references to Fed. R. Civ. P. 23.
+
+For each applicable category, provide:
+- category: One of (product_liability, personal_injury, class_action)
+- confidence: A confidence score from 0.0 to 1.0
+- reasoning: A brief 1-2 sentence explanation of why this category applies based on specific evidence from the documents
+
+Return an empty labels list if the documents do not clearly indicate any of these categories - do not guess.
+"""
