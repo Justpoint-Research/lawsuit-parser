@@ -6,6 +6,7 @@ create denormalized JSON files for easy consumption.
 """
 
 import json
+import logging
 import re
 import subprocess
 from datetime import datetime
@@ -19,6 +20,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from lawsuit_parser.utils.gcs import extract_blob_name
+
+logger = logging.getLogger(__name__)
 
 
 class CaseExporter:
@@ -348,7 +351,7 @@ class CaseExporter:
                     if metadata:
                         doc_metadata["document_metadata"] = metadata
                 except Exception as e:
-                    print(f"Warning: Failed to download {gcs_path}: {e}")
+                    logger.warning(f"Failed to download {gcs_path}: {e}")
 
             # Download confirmation document
             if doc.get("document_confirmation_bucket_link"):
@@ -363,7 +366,7 @@ class CaseExporter:
                     if metadata:
                         doc_metadata["confirmation_metadata"] = metadata
                 except Exception as e:
-                    print(f"Warning: Failed to download {gcs_path}: {e}")
+                    logger.warning(f"Failed to download {gcs_path}: {e}")
 
             # Store metadata for this document if any was extracted
             if doc_metadata:
@@ -436,7 +439,7 @@ class CaseExporter:
                     text_path.write_text(parsed.raw_text, encoding="utf-8")
                     doc_text_paths[path_key] = relative_text_path
                 except Exception as e:
-                    print(f"Warning: Failed to extract text from {pdf_path}: {e}")
+                    logger.warning(f"Failed to extract text from {pdf_path}: {e}")
 
             if doc_text_paths:
                 text_paths_by_doc[doc["id"]] = doc_text_paths
@@ -451,14 +454,12 @@ class CaseExporter:
             local_path: Local file path where to save.
         """
         if local_path.exists():
-            print(f"Skipping existing file: {local_path}")
             return
 
         # Extract blob name from GCS path
         blob_name = extract_blob_name(gcs_path)
 
         if not blob_name:
-            print(f"Warning: Could not extract blob name from {gcs_path}")
             return
 
         # Prefix with state code (e.g., "ny/document_link/...")
@@ -470,7 +471,6 @@ class CaseExporter:
 
         try:
             blob.download_to_filename(str(local_path))
-            print(f"Downloaded: {blob_name} -> {local_path}")
         except Exception as e:
             raise Exception(f"Failed to download {blob_name}: {e}") from e
 
@@ -575,13 +575,11 @@ class CaseExporter:
 
         except FileNotFoundError:
             # pdfinfo not available - silently skip PDF metadata extraction
-            print(
-                "Warning: pdfinfo command not found. Install poppler-utils to extract PDF metadata."
-            )
+            logger.debug("pdfinfo command not found. Install poppler-utils to extract PDF metadata.")
             return None
         except subprocess.TimeoutExpired:
-            print(f"Warning: PDF metadata extraction timed out for {pdf_path}")
+            logger.warning(f"PDF metadata extraction timed out for {pdf_path}")
             return None
         except Exception as e:
-            print(f"Warning: Failed to extract PDF metadata from {pdf_path}: {e}")
+            logger.warning(f"Failed to extract PDF metadata from {pdf_path}: {e}")
             return None

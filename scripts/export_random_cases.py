@@ -14,6 +14,7 @@ Requirements:
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -169,6 +170,13 @@ def export_cases(
 
 def main():
     """Main entry point."""
+    # Configure logging to file (not console to avoid interfering with tqdm)
+    logging.basicConfig(
+        filename="case_export.log",
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         description="Export random court cases with documents from the scrapping database."
     )
