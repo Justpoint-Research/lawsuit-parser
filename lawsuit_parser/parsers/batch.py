@@ -1,6 +1,7 @@
 """Batch processing of PDF documents in the case data directory."""
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -49,44 +50,67 @@ def find_all_pdfs(data_dir: Path, case_id: str | None = None) -> list[Path]:
     return pdfs
 
 
-def get_docling_dir(pdf_path: Path) -> Path:
+def _find_case_dir(pdf_path: Path) -> Path:
+    """Walk up from a PDF to find its case directory (the one containing
+    `documents/` or `confirmations/`)."""
+    current = pdf_path.parent
+    while current.parent != current:  # Stop at root
+        if (current / "documents").exists() or (current / "confirmations").exists():
+            return current
+        current = current.parent
+
+    # Fallback to old behavior if we can't find the case directory
+    return pdf_path.parents[1]
+
+
+def get_docling_dir(pdf_path: Path, data_root: Path, output_root: Path) -> Path:
     """
     Determine the directory to save a PDF's Docling outputs
     (.docling.json, .md) into.
 
+    Docling output lives under output_root (e.g. data/extraction), not next
+    to the source PDF under data_root (e.g. data/cases) - this mirrors the
+    event-extraction pipeline's own data_root/output_root split (see
+    BaseStage.__init__): source case data stays untouched, pipeline-
+    generated artifacts (including this expensive-to-regenerate Docling
+    parse) live in their own tree that can be wiped/rebuilt independently.
+
     A case directory holds PDFs of the same name under multiple source
     subdirectories (e.g. `documents/` and `confirmations/` can each contain
-    a `document_<id>.pdf` that are different files). Saving Docling output
-    next to the PDF, as `parse_pdf_document` does by default, spreads it
-    across those source subdirectories and risks collisions if they're ever
-    flattened. Mirroring the source subdirectory under a single case-level
-    `docling/` directory keeps generated artifacts out of the source
-    directories while still avoiding name collisions.
+    a `document_<id>.pdf` that are different files), so within the case's
+    output directory, Docling output is further split by mirroring that
+    source subdirectory (`docling/documents/`, `docling/confirmations/`) to
+    avoid name collisions between them.
 
     Args:
-        pdf_path: Path to PDF file (e.g. data/cases/case_104/documents/foo.pdf
-            or data/cases/ny_sample/case_104/documents/foo.pdf)
+        pdf_path: Path to PDF file, somewhere under data_root (e.g.
+            data_root/case_104/documents/foo.pdf or
+            data_root/ny_sample/case_104/documents/foo.pdf)
+        data_root: Root directory PDFs are read from (e.g. data/cases).
+        output_root: Root directory to write Docling output under (e.g.
+            data/extraction) - the case's path relative to data_root is
+            reproduced under output_root.
 
     Returns:
-        Directory to save Docling outputs into
-        (e.g. data/cases/case_104/docling/documents or
-        data/cases/ny_sample/case_104/docling/documents)
+        Directory to save Docling outputs into (e.g.
+        data/extraction/case_104/docling/documents or
+        data/extraction/ny_sample/case_104/docling/documents)
     """
-    # Walk up from the PDF to find the case directory (the one containing documents/ or confirmations/)
-    current = pdf_path.parent
-    while current.parent != current:  # Stop at root
-        if (current / "documents").exists() or (current / "confirmations").exists():
-            # Found the case directory
-            return current / "docling" / pdf_path.parent.name
-        current = current.parent
+    case_dir = _find_case_dir(pdf_path)
+    relative_case_dir = case_dir.relative_to(data_root)
+    return output_root / relative_case_dir / "docling" / pdf_path.parent.name
 
-    # Fallback to old behavior if we can't find the case directory
-    case_dir = pdf_path.parents[1]
-    return case_dir / "docling" / pdf_path.parent.name
+
+def _docling_path(pdf_path: Path, data_root: Path, output_root: Path) -> Path:
+    """Where a PDF's Docling output (.docling.json) would live, whether or
+    not it's been parsed yet."""
+    return get_docling_dir(pdf_path, data_root, output_root) / f"{pdf_path.stem}.docling.json"
 
 
 def parse_and_save_pdf(
     pdf_path: Path,
+    data_root: Path,
+    output_root: Path,
     skip_existing: bool = False,
     use_gpu: bool = True,
 ) -> tuple[bool, str]:
@@ -96,27 +120,36 @@ def parse_and_save_pdf(
     A confirmations/ PDF (an e-filing confirmation notice) also gets a
     parsed-JSON sidecar saved next to it - Stage 1's confirmation-metadata
     extraction (extract_confirmation_details) still reads that sidecar's
-    "paragraphs". A documents/ PDF (a case's main filings) does NOT get
-    one: the event extraction pipeline reads those via Docling only now
-    (see BaseStage.load_document_text's docstring) - the sidecar's
-    paragraph reconstruction (walking Docling's hierarchical reading-order
-    tree) could silently drop entire pages that Docling's own flat text
-    export still captures, confirmed on a dense deposition transcript
-    where it lost 88% of the document.
+    "paragraphs". This sidecar stays next to the source PDF under
+    data_root (not under output_root like the Docling output below) since
+    Stage 1 reads it via get_confirmations_dir, a data_root path. A
+    documents/ PDF (a case's main filings) does NOT get one: the event
+    extraction pipeline reads those via Docling only now (see
+    BaseStage.load_document_text's docstring) - the sidecar's paragraph
+    reconstruction (walking Docling's hierarchical reading-order tree)
+    could silently drop entire pages that Docling's own flat text export
+    still captures, confirmed on a dense deposition transcript where it
+    lost 88% of the document.
 
     Args:
-        pdf_path: Path to PDF file
+        pdf_path: Path to PDF file, somewhere under data_root.
+        data_root: Root directory PDFs are read from (e.g. data/cases).
+        output_root: Root directory to write Docling output under (e.g.
+            data/extraction) - see get_docling_dir.
         skip_existing: Skip if Docling output already exists
         use_gpu: Use GPU acceleration
 
     Returns:
         Tuple of (success: bool, message: str)
     """
-    docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+    docling_dir = get_docling_dir(pdf_path, data_root, output_root)
 
     try:
-        # Check if already processed
-        if skip_existing and docling_path.exists():
+        # Check if already processed. Redundant with parse_all_pdfs's own
+        # upfront filtering when called from there, but kept here too as a
+        # safety net for direct callers and for a file that got parsed by
+        # a concurrent run between that filtering pass and this call.
+        if skip_existing and _docling_path(pdf_path, data_root, output_root).exists():
             return True, "Skipped (already exists)"
 
         # Parse the PDF (saves .docling.json/.md as a side effect)
@@ -125,7 +158,7 @@ def parse_and_save_pdf(
             use_gpu=use_gpu,
             extract_tables=True,
             extract_images=False,
-            docling_dir=get_docling_dir(pdf_path),
+            docling_dir=docling_dir,
         )
 
         if pdf_path.parent.name != "documents":
@@ -146,6 +179,7 @@ def parse_all_pdfs(
     use_gpu: bool = True,
     progress_file: Any = None,
     max_workers: int = 8,
+    output_root: Path | None = None,
 ) -> dict[str, Any]:
     """
     Parse all PDFs in the data directory.
@@ -166,11 +200,19 @@ def parse_all_pdfs(
             Set to 1 for sequential parsing. Defaults to 8; benchmarking on
             a single GPU showed 4 workers captures most of the throughput
             gain from overlap, with 8 adding a smaller further improvement.
+        output_root: Root directory to write Docling output under (see
+            get_docling_dir). Defaults to data_dir/"extraction", the
+            sibling of data_dir/"cases" that the event-extraction pipeline
+            itself reads/writes pipeline-generated artifacts under.
 
     Returns:
         Dictionary with summary statistics, including a "failures" list of
         (pdf_path, error_message) tuples.
     """
+    data_root = data_dir / "cases"
+    if output_root is None:
+        output_root = data_dir / "extraction"
+
     # Find all PDFs
     pdfs = find_all_pdfs(data_dir, case_id)
 
@@ -178,46 +220,94 @@ def parse_all_pdfs(
         logger.warning("No PDF files found")
         return {"total": 0, "success": 0, "failed": 0, "skipped": 0, "failures": []}
 
-    # Process each PDF with progress bar
     stats = {"total": len(pdfs), "success": 0, "failed": 0, "skipped": 0}
     failures = []
 
-    def record(pdf_path: Path, success: bool, message: str) -> None:
+    # Filter out already-parsed files upfront rather than submitting them
+    # to the thread pool and letting parse_and_save_pdf's own skip_existing
+    # check short-circuit them one by one: that made tqdm's bar (and its
+    # rate/ETA) start from every already-parsed file racing past as a
+    # near-instant "skip", which read as the run being stuck once real
+    # parsing began right after - the counters looked frozen for as long
+    # as the first real (10-30s) GPU parse took to complete. Filtering
+    # first means the bar only ever tracks real work.
+    if skip_existing:
+        pdfs = [p for p in pdfs if not _docling_path(p, data_root, output_root).exists()]
+        stats["skipped"] = stats["total"] - len(pdfs)
+
+    if not pdfs:
+        logger.info("All files already parsed")
+        stats["failures"] = []
+        return stats
+
+    # Process each PDF with progress bar
+    # Seconds actually spent parsing (excludes near-instant skips), summed
+    # and counted separately from tqdm's own rate - see the docstring note
+    # on `smoothing` below for why this exists.
+    real_time_total = 0.0
+    real_count = 0
+
+    def timed_parse(pdf_path: Path) -> tuple[bool, str, float]:
+        start = time.monotonic()
+        success, message = parse_and_save_pdf(
+            pdf_path,
+            data_root,
+            output_root,
+            skip_existing=skip_existing,
+            use_gpu=use_gpu,
+        )
+        return success, message, time.monotonic() - start
+
+    def record(pdf_path: Path, success: bool, message: str, duration: float) -> None:
+        nonlocal real_time_total, real_count
         if "Skipped" in message:
             stats["skipped"] += 1
-        elif success:
+            return
+        # Real work happened (attempted parse, whether it succeeded or
+        # failed) - count its time, unlike a skip's near-zero duration.
+        real_time_total += duration
+        real_count += 1
+        if success:
             stats["success"] += 1
         else:
             stats["failed"] += 1
             failures.append((str(pdf_path), message))
 
-    with tqdm(total=len(pdfs), desc="Parsing PDFs", unit="file", file=progress_file) as pbar:
+    def update_postfix(pbar: tqdm) -> None:
+        postfix = dict(success=stats["success"], failed=stats["failed"], skipped=stats["skipped"])
+        if real_count:
+            # Average seconds per actually-parsed file (skips excluded) -
+            # the number that matters for estimating remaining runtime,
+            # since a batch's skip/parse mix at the start (e.g. mostly
+            # already-parsed files) would otherwise skew a blended rate.
+            postfix["avg_s"] = f"{real_time_total / real_count:.1f}"
+        pbar.set_postfix(postfix)
+
+    # smoothing=0 makes tqdm report a cumulative (n / total_elapsed) rate
+    # and ETA instead of its default exponential-moving-average one, which
+    # reacts to only the last few iterations - on this workload, where most
+    # files take 2-10s but occasional scanned/OCR-heavy ones take 90s+, the
+    # default smoothing made the displayed rate/ETA swing wildly right
+    # after each outlier. A cumulative average is far steadier, at the cost
+    # of reacting more slowly to a genuine sustained speed change.
+    with tqdm(total=len(pdfs), desc="Parsing PDFs", unit="file", file=progress_file, smoothing=0) as pbar:
         if max_workers <= 1:
             for pdf_path in pdfs:
-                success, message = parse_and_save_pdf(
-                    pdf_path,
-                    skip_existing=skip_existing,
-                    use_gpu=use_gpu,
-                )
-                record(pdf_path, success, message)
-                pbar.set_postfix(success=stats["success"], failed=stats["failed"], skipped=stats["skipped"])
+                success, message, duration = timed_parse(pdf_path)
+                record(pdf_path, success, message, duration)
+                update_postfix(pbar)
                 pbar.update(1)
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_pdf = {
-                    executor.submit(
-                        parse_and_save_pdf,
-                        pdf_path,
-                        skip_existing=skip_existing,
-                        use_gpu=use_gpu,
-                    ): pdf_path
+                    executor.submit(timed_parse, pdf_path): pdf_path
                     for pdf_path in pdfs
                 }
                 for future in as_completed(future_to_pdf):
                     pdf_path = future_to_pdf[future]
-                    success, message = future.result()
-                    record(pdf_path, success, message)
-                    pbar.set_postfix(success=stats["success"], failed=stats["failed"], skipped=stats["skipped"])
+                    success, message, duration = future.result()
+                    record(pdf_path, success, message, duration)
+                    update_postfix(pbar)
                     pbar.update(1)
 
     # Log summary

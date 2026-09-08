@@ -89,10 +89,10 @@ Browse exported cases from the local filesystem - **no database or GCS authentic
 1. **Export cases first** (one-time):
 ```bash
 # Export 20 random cases
-uv run python scripts/export_random_cases.py --count 20
+uv run python scripts/export_cases.py --count 20
 
 # Or export specific cases
-uv run python scripts/export_random_cases.py --case-ids "273,51,70"
+uv run python scripts/export_cases.py --case-ids "273,51,70"
 ```
 
 2. **Start the Local Browser**:

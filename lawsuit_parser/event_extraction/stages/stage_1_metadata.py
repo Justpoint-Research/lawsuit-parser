@@ -183,10 +183,11 @@ class Stage1Metadata(BaseStage):
         pdf_files = sorted(pdf_files, key=self._document_sort_key)
         parsed_files = list(documents_dir.glob("*.json")) if documents_dir.exists() else []
 
-        # Docling outputs (.docling.json, .md) live under a case-level
-        # docling/documents/ directory, mirrored from documents/ - see
+        # Docling outputs (.docling.json, .md) live under output_root, in a
+        # case-level docling/documents/ directory mirrored from
+        # data_root's documents/ - see
         # lawsuit_parser.parsers.batch.get_docling_dir.
-        docling_dir = self.get_case_dir(case_id) / "docling" / "documents"
+        docling_dir = self.get_output_case_dir(case_id) / "docling" / "documents"
         docling_files = list(docling_dir.glob("*.docling.json")) if docling_dir.exists() else []
 
         confirmations_dir = self.get_confirmations_dir(case_id)
@@ -221,7 +222,7 @@ class Stage1Metadata(BaseStage):
 
             # Extract Docling metadata (if enabled)
             if extract_from_docling:
-                docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+                docling_path = get_docling_dir(pdf_path, self.data_root, self.output_root) / f"{pdf_path.stem}.docling.json"
                 docling_data = None
                 if docling_path.exists():
                     try:
@@ -878,7 +879,7 @@ class Stage1Metadata(BaseStage):
         """
         sort_date = None
 
-        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+        docling_path = get_docling_dir(pdf_path, self.data_root, self.output_root) / f"{pdf_path.stem}.docling.json"
         if docling_path.exists():
             try:
                 docling_data = self.load_json(docling_path)
@@ -1075,7 +1076,7 @@ class Stage1Metadata(BaseStage):
         Returns:
             Document text
         """
-        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+        docling_path = get_docling_dir(pdf_path, self.data_root, self.output_root) / f"{pdf_path.stem}.docling.json"
         if docling_path.exists():
             try:
                 docling_data = self.load_json(docling_path)

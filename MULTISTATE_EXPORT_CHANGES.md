@@ -14,7 +14,7 @@ Initially all PDF downloads were failing with 404 errors because:
 **Files modified**:
 - `lawsuit_parser/utils/case_exporter.py`
 - `scripts/export_case.py`
-- `scripts/export_random_cases.py`
+- `scripts/export_cases.py`
 
 **Changes**:
 - Changed default bucket from `court-docs` to `courts_crawl`
@@ -39,7 +39,7 @@ if self.state_code:
 ```
 
 ### 3. Fixed Database Join Bug
-**File**: `scripts/export_random_cases.py`
+**File**: `scripts/export_cases.py`
 
 **Issue**: Query was joining on `case_id` instead of `docket_id`
 - `case_id` is NOT unique across courts (e.g., "622075/2025" can exist in multiple counties)
@@ -115,7 +115,7 @@ uv run python scripts/export_case.py 100 \
 
 #### Export IL cases
 ```bash
-uv run python scripts/export_random_cases.py \
+uv run python scripts/export_cases.py \
   --count 50 \
   --output-dir data/cases/il_sample \
   --table-prefix il_
@@ -173,7 +173,7 @@ data/cases/{state}_after_search/
 - ✅ `lawsuit_parser/utils/case_exporter.py` - Added state prefix support
 - ✅ `lawsuit_parser/utils/gcs.py` - URL encoding handling
 - ✅ `scripts/export_case.py` - Updated bucket default
-- ✅ `scripts/export_random_cases.py` - Fixed join bug, updated bucket
+- ✅ `scripts/export_cases.py` - Fixed join bug, updated bucket
 - ✅ `scripts/check_additional_metadata.py` - Added state prefix support
 - ✅ `scripts/show_case_urls.py` - Added state prefix support
 

@@ -62,6 +62,16 @@ def quiet_console(log_path: Path):
 
     Yields a stream still attached to the real console, for output (like
     the tqdm progress bar) that should stay visible.
+
+    The yielded stream is opened on /dev/tty rather than dup'd from fd 2:
+    a dup of fd 2 is only as reliable as fd 2 itself being the terminal at
+    that moment, and in practice (background/nohup launches, wrapper
+    scripts, etc.) fd 2 can already be pointing somewhere else, which
+    silently sent the progress bar into this same log file instead of the
+    terminal. /dev/tty always refers to the process's controlling
+    terminal regardless of what fd 1/2 have been redirected to. Falls back
+    to the fd-2-dup behavior if there's no controlling terminal at all
+    (e.g. run under cron/CI with no tty).
     """
     log_file = open(log_path, 'a', buffering=1, encoding='utf-8')
 
@@ -69,7 +79,10 @@ def quiet_console(log_path: Path):
     sys.stderr.flush()
     saved_stdout_fd = os.dup(1)
     saved_stderr_fd = os.dup(2)
-    console = os.fdopen(os.dup(2), 'w', buffering=1, encoding='utf-8')
+    try:
+        console = open('/dev/tty', 'w', buffering=1, encoding='utf-8')
+    except OSError:
+        console = os.fdopen(os.dup(2), 'w', buffering=1, encoding='utf-8')
 
     try:
         os.dup2(log_file.fileno(), 1)

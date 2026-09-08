@@ -24,8 +24,8 @@ echo ""
 
 # Option 1: Resume export (skip already exported cases)
 echo "Starting export..."
-nohup uv run python scripts/export_random_cases.py \
-  --case-ids "$(cat ny_case_ids.txt)" \
+nohup uv run python scripts/export_cases.py \
+  --case-ids-file ny_case_ids.txt \
   --output-dir data/cases/ny_after_search \
   --table-prefix ny_ \
   > ny_export.log 2>&1 &

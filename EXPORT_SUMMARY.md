@@ -254,7 +254,7 @@ Export complete!
 
 2. Export cases:
    ```bash
-   uv run python scripts/export_random_cases.py \
+   uv run python scripts/export_cases.py \
      --case-ids "$(cat fl_case_ids.txt)" \
      --output-dir data/cases/fl_after_search \
      --table-prefix fl_

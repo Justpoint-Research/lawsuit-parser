@@ -93,6 +93,21 @@ def main():
         action="store_true",
         help="Disable GPU acceleration for --extract-text",
     )
+    parser.add_argument(
+        "--download-files",
+        action="store_true",
+        help="Also download PDFs/confirmations from GCS (off by default - "
+        "only the DB-sourced JSON metadata is written)",
+    )
+    parser.add_argument(
+        "--extraction-dir",
+        type=Path,
+        default=Path("data/extraction"),
+        help="Root directory for Docling output when --extract-text is set "
+        "(default: data/extraction). Keep this parallel to --output-dir - "
+        "e.g. --output-dir data/cases/ny_sample should pair with "
+        "--extraction-dir data/extraction/ny_sample.",
+    )
 
     args = parser.parse_args()
 
@@ -115,6 +130,8 @@ def main():
             table_prefix=args.table_prefix,
             extract_text=args.extract_text,
             use_gpu=not args.no_gpu,
+            download_files=args.download_files,
+            extraction_root=args.extraction_dir,
         )
 
         # Export the case

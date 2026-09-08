@@ -29,10 +29,10 @@ Before using the local browser, you need to export cases:
 
 ```bash
 # Export 20 random cases
-uv run python scripts/export_random_cases.py --count 20
+uv run python scripts/export_cases.py --count 20
 
 # Or export specific cases
-uv run python scripts/export_random_cases.py --case-ids "273,51,70,350"
+uv run python scripts/export_cases.py --case-ids "273,51,70,350"
 ```
 
 This creates the directory structure:
@@ -138,7 +138,7 @@ If you see "No cases found in data/cases directory":
 
 1. Export cases first:
    ```bash
-   uv run python scripts/export_random_cases.py --count 20
+   uv run python scripts/export_cases.py --count 20
    ```
 
 2. Verify the data directory exists:

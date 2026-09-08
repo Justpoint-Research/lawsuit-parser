@@ -63,7 +63,7 @@ def export_case_by_id(self, case_id: int, skip_if_exists: bool = True) -> tuple[
     return json_path, was_skipped
 ```
 
-**scripts/export_random_cases.py**
+**scripts/export_cases.py**
 ```python
 from tqdm import tqdm
 
@@ -200,7 +200,7 @@ Already included in project dependencies.
 If you prefer the old format:
 
 ```python
-# In export_random_cases.py, replace tqdm loop with:
+# In export_cases.py, replace tqdm loop with:
 for idx, case_id in enumerate(case_ids, 1):
     print(f"[{idx}/{total}] Exporting case {case_id}...")
     json_path, was_skipped = exporter.export_case_by_id(case_id)

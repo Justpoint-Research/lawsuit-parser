@@ -51,7 +51,7 @@ bash export_ny_all_cases.sh
 Run the export command directly:
 
 ```bash
-nohup uv run python scripts/export_random_cases.py \
+nohup uv run python scripts/export_cases.py \
   --case-ids "$(cat ny_case_ids.txt)" \
   --output-dir data/cases/ny_after_search \
   --table-prefix ny_ \
@@ -99,7 +99,7 @@ find data/cases/ny_after_search -name "*.pdf" | wc -l
 If you need to stop:
 
 ```bash
-pkill -f "export_random_cases.py"
+pkill -f "export_cases.py"
 ```
 
 ## Estimates

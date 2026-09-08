@@ -196,7 +196,7 @@ data/cases/ny_after_search/
 Resume behavior controlled by `skip_if_exists` parameter:
 
 ```python
-# In export_random_cases.py
+# In export_cases.py
 json_path = exporter.export_case_by_id(case_id, skip_if_exists=True)
 ```
 

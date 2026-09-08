@@ -209,7 +209,7 @@ class BaseStage(ABC):
             return self.load_text(text_path)
 
         pdf_path = self.get_documents_dir(case_id) / file_name
-        docling_path = get_docling_dir(pdf_path) / f"{pdf_path.stem}.docling.json"
+        docling_path = get_docling_dir(pdf_path, self.data_root, self.output_root) / f"{pdf_path.stem}.docling.json"
         if docling_path.exists():
             try:
                 docling_data = self.load_json(docling_path)

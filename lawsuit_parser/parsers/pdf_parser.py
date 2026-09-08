@@ -1,6 +1,9 @@
 """PDF document parser using Docling for structured extraction."""
 
+import glob
 import json
+import os
+import sys
 from dataclasses import dataclass, field, asdict
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +47,54 @@ class ParsedDocument:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
 
+_CUDA_LIBS_ENV_SENTINEL = "_LAWSUIT_PARSER_CUDA_LIBS_ON_PATH"
+
+
+def _ensure_cuda_libs_loadable() -> None:
+    """Re-exec this process with LD_LIBRARY_PATH set if needed, so
+    onnxruntime's CUDAExecutionProvider can actually load.
+
+    onnxruntime dlopens CUDA runtime libraries (libcublasLt.so.12,
+    libcurand.so.10, etc.) the first time a GPU session is created. Those
+    libraries are present in this venv - they ship as transitive pip
+    dependencies of torch (nvidia-cublas-cu12, nvidia-curand-cu12, ...) -
+    but glibc's dynamic linker only reads LD_LIBRARY_PATH once, at process
+    startup; setting os.environ from inside an already-running process has
+    no effect on it (confirmed empirically). onnxruntime does not raise
+    when that dlopen fails - it silently falls back to CPUExecutionProvider,
+    which is what made GPU acceleration silently not happen (near-zero GPU
+    utilization, high CPU) despite use_gpu=True and a working PyTorch CUDA
+    install (torch bundles/finds its own CUDA libs independently and isn't
+    affected by this).
+
+    Re-execing is the only way to make a live LD_LIBRARY_PATH change take
+    effect for a process already running - cheap (one extra interpreter
+    startup) and only paid once per process, guarded by an env sentinel so
+    it doesn't loop and doesn't affect processes that already have these
+    libs on their path.
+    """
+    if os.environ.get(_CUDA_LIBS_ENV_SENTINEL):
+        return
+
+    try:
+        import nvidia
+    except ImportError:
+        return  # no pip-installed CUDA libs to add - nothing to do
+
+    lib_dirs = [
+        d for d in glob.glob(os.path.join(nvidia.__path__[0], "*", "lib"))
+        if os.path.isdir(d)
+    ]
+    if not lib_dirs:
+        return
+
+    os.environ["LD_LIBRARY_PATH"] = (
+        os.pathsep.join(lib_dirs) + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
+    )
+    os.environ[_CUDA_LIBS_ENV_SENTINEL] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 @lru_cache(maxsize=2)
 def _build_converter(use_gpu: bool) -> DocumentConverter:
     """
@@ -56,6 +107,9 @@ def _build_converter(use_gpu: bool) -> DocumentConverter:
     document and avoids the GPU memory growth that comes from repeatedly
     creating and discarding ONNX Runtime CUDA sessions.
     """
+    if use_gpu:
+        _ensure_cuda_libs_loadable()
+
     # Configure layout model to use ONNX runtime instead of transformers
     # This bypasses the torch import bug in transformers 5.x
     # ONNX runtime can still use GPU via CUDA execution provider

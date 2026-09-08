@@ -126,7 +126,7 @@ Skipping case 106: already exported (...)
 ```bash
 # Stop safely with any of:
 Ctrl+C                                    # In terminal
-pkill -f "export_random_cases.py"        # From another terminal
+pkill -f "export_cases.py"        # From another terminal
 kill <PID>                                # Using process ID
 ```
 
@@ -215,7 +215,7 @@ bash export_ny_all_cases.sh
 
 ## Implementation in Scripts
 
-### export_random_cases.py
+### export_cases.py
 ```python
 # Line 130-133
 for idx, case_id in enumerate(case_ids, 1):

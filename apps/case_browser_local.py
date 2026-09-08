@@ -275,7 +275,7 @@ def main():
 
     if not cases:
         st.error("❌ No cases found in data/cases directory")
-        st.info("💡 Export cases first using: `uv run python scripts/export_random_cases.py --count 20`")
+        st.info("💡 Export cases first using: `uv run python scripts/export_cases.py --count 20`")
         return
 
     # Sidebar navigation

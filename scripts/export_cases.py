@@ -6,7 +6,7 @@ sample of court cases, and exports them to denormalized JSON files along with
 downloading their associated PDF documents from Google Cloud Storage.
 
 Usage:
-    python scripts/export_random_cases.py --count 100 --output-dir data/cases
+    python scripts/export_cases.py --count 100 --output-dir data/cases
 
 Requirements:
     - Cloud SQL Proxy must be running (make run-proxy)
@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
-from tqdm import tqdm
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -96,8 +95,10 @@ def export_cases(
     table_prefix: str = "ny_",
     extract_text: bool = False,
     use_gpu: bool = True,
+    download_files: bool = False,
+    extraction_dir: Path = Path("data/extraction"),
 ):
-    """Export multiple cases.
+    """Export multiple cases via bulk queries (4 queries total, not 4 per case).
 
     Args:
         case_ids: List of case IDs to export.
@@ -107,8 +108,16 @@ def export_cases(
         table_prefix: Per-state table prefix, e.g. "ny_" or "fl_".
         extract_text: Also run Docling over every downloaded PDF and save
             a .txt counterpart (slow, GPU/CPU-heavy - off by default).
+            Ignored when download_files=False.
         use_gpu: Whether Docling should use GPU acceleration when
             extract_text=True.
+        download_files: If False (the default), skip downloading
+            PDFs/confirmations from GCS entirely - only the DB-sourced JSON
+            metadata is written. Pass True to also download files.
+        extraction_dir: Root directory for Docling output when
+            extract_text=True (default: data/extraction). Keep this
+            parallel to output_dir - e.g. output_dir=data/cases/ny_sample
+            should pair with extraction_dir=data/extraction/ny_sample.
     """
     engine = create_scrapping_engine()
 
@@ -121,46 +130,19 @@ def export_cases(
             table_prefix=table_prefix,
             extract_text=extract_text,
             use_gpu=use_gpu,
+            download_files=download_files,
+            extraction_root=extraction_dir,
         )
 
-        total = len(case_ids)
-        successful = 0
-        failed = 0
-        skipped = 0
-
-        # Use tqdm for progress bar with ETA
-        with tqdm(
-            total=total,
-            desc="Exporting cases",
-            unit="case",
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-            colour="green"
-        ) as pbar:
-            for case_id in case_ids:
-                try:
-                    # skip_if_exists=True allows resuming interrupted exports
-                    json_path, was_skipped = exporter.export_case_by_id(case_id, skip_if_exists=True)
-
-                    if was_skipped:
-                        skipped += 1
-                    else:
-                        successful += 1
-                        tqdm.write(f"✓ Exported case {case_id}")
-
-                    pbar.set_postfix_str(f"✓{successful} ⊘{skipped} ✗{failed}")
-
-                except Exception as e:
-                    tqdm.write(f"✗ Failed case {case_id}: {e}")
-                    failed += 1
-                    pbar.set_postfix_str(f"✓{successful} ⊘{skipped} ✗{failed}")
-
-                pbar.update(1)
+        print(f"Exporting {len(case_ids)} cases (download_files={download_files})...")
+        stats = exporter.export_cases_bulk(case_ids, skip_if_exists=True)
 
         print("\n" + "=" * 80)
         print(f"Export complete!")
-        print(f"  Successful: {successful}/{total}")
-        print(f"  Skipped: {skipped}/{total} (already exported)")
-        print(f"  Failed: {failed}/{total}")
+        print(f"  Successful: {stats['successful']}/{stats['total']}")
+        print(f"  Skipped: {stats['skipped']}/{stats['total']} (already exported)")
+        print(f"  No documents: {stats['no_documents']}/{stats['total']}")
+        print(f"  Failed: {stats['failed']}/{stats['total']}")
         print(f"  Output directory: {output_dir}")
         print("=" * 80)
 
@@ -170,7 +152,6 @@ def export_cases(
 
 def main():
     """Main entry point."""
-    # Configure logging to file (not console to avoid interfering with tqdm)
     logging.basicConfig(
         filename="case_export.log",
         level=logging.INFO,
@@ -204,6 +185,13 @@ def main():
         help="Comma-separated list of specific case IDs to export (skips random sampling)",
     )
     parser.add_argument(
+        "--case-ids-file",
+        type=Path,
+        help="Path to a file containing comma- or newline-separated case IDs to export "
+        "(skips random sampling). Use this instead of --case-ids when the list is too "
+        "long for the shell's argument limit.",
+    )
+    parser.add_argument(
         "--schema",
         type=str,
         default="courts_final",
@@ -226,6 +214,21 @@ def main():
         action="store_true",
         help="Disable GPU acceleration for --extract-text",
     )
+    parser.add_argument(
+        "--download-files",
+        action="store_true",
+        help="Also download PDFs/confirmations from GCS (off by default - "
+        "only the DB-sourced JSON metadata is written)",
+    )
+    parser.add_argument(
+        "--extraction-dir",
+        type=Path,
+        default=Path("data/extraction"),
+        help="Root directory for Docling output when --extract-text is set "
+        "(default: data/extraction). Keep this parallel to --output-dir - "
+        "e.g. --output-dir data/cases/ny_sample should pair with "
+        "--extraction-dir data/extraction/ny_sample.",
+    )
 
     args = parser.parse_args()
 
@@ -237,7 +240,12 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Get case IDs
-    if args.case_ids:
+    if args.case_ids_file:
+        # Parse specific case IDs from a file (comma- or newline-separated)
+        raw = args.case_ids_file.read_text()
+        case_ids = [int(x.strip()) for x in raw.replace("\n", ",").split(",") if x.strip()]
+        print(f"Exporting {len(case_ids)} specific cases from {args.case_ids_file}...")
+    elif args.case_ids:
         # Parse specific case IDs
         case_ids = [int(x.strip()) for x in args.case_ids.split(",")]
         print(f"Exporting {len(case_ids)} specific cases...")
@@ -267,6 +275,8 @@ def main():
         table_prefix=args.table_prefix,
         extract_text=args.extract_text,
         use_gpu=not args.no_gpu,
+        download_files=args.download_files,
+        extraction_dir=args.extraction_dir,
     )
 
 

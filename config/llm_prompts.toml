@@ -145,7 +145,7 @@ Based on the documents, determine which of the following categories apply to thi
 For each applicable category, provide:
 - category: One of (product_liability, personal_injury, class_action)
 - confidence: A confidence score from 0.0 to 1.0
-- reasoning: A brief 1-2 sentence explanation of why this category applies based on specific evidence from the documents
+- reasoning: A short paragraph (3-5 sentences) justifying why this category applies, citing specific evidence from the documents and naming which document(s) it comes from
 
 Return an empty labels list if the documents do not clearly indicate any of these categories - do not guess.
 """

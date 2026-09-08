@@ -38,4 +38,4 @@ The event extraction pipeline is a modular system for extracting legal events an
 ### Scripts
 - `scripts/run_event_extraction.py` - Run the event extraction pipeline
 - `scripts/export_case.py` - Export individual cases
-- `scripts/export_random_cases.py` - Batch export cases
+- `scripts/export_cases.py` - Batch export cases

@@ -20,7 +20,7 @@ This document describes how to export all 11,435 cases from the `courts_final.ny
 ### Option 1: Using the case IDs file
 ```bash
 case_ids=$(cat ny_case_ids.txt)
-uv run python scripts/export_random_cases.py \
+uv run python scripts/export_cases.py \
   --case-ids "$case_ids" \
   --output-dir data/cases/ny_after_search \
   --table-prefix ny_
@@ -29,7 +29,7 @@ uv run python scripts/export_random_cases.py \
 ### Option 2: Export in batches (recommended for large exports)
 ```bash
 # Export first 1000 cases
-head -c 5000 ny_case_ids.txt | uv run python scripts/export_random_cases.py \
+head -c 5000 ny_case_ids.txt | uv run python scripts/export_cases.py \
   --case-ids "$(cat -)" \
   --output-dir data/cases/ny_after_search \
   --table-prefix ny_
@@ -43,7 +43,7 @@ python scripts/export_in_batches.py \
 
 ### Option 3: Run in background with nohup
 ```bash
-nohup uv run python scripts/export_random_cases.py \
+nohup uv run python scripts/export_cases.py \
   --case-ids "$(cat ny_case_ids.txt)" \
   --output-dir data/cases/ny_after_search \
   --table-prefix ny_ \
@@ -95,7 +95,7 @@ The export script will skip cases that already exist (based on JSON file presenc
 
 ```bash
 # Re-running the same command will skip completed cases
-uv run python scripts/export_random_cases.py \
+uv run python scripts/export_cases.py \
   --case-ids "$(cat ny_case_ids.txt)" \
   --output-dir data/cases/ny_after_search \
   --table-prefix ny_
@@ -139,21 +139,21 @@ To export Florida, Illinois, or California cases:
 ```bash
 # Florida
 python scripts/get_all_case_ids_for_state.py --state fl
-uv run python scripts/export_random_cases.py \
+uv run python scripts/export_cases.py \
   --case-ids "$(cat fl_case_ids.txt)" \
   --output-dir data/cases/fl_after_search \
   --table-prefix fl_
 
 # Illinois
 python scripts/get_all_case_ids_for_state.py --state il
-uv run python scripts/export_random_cases.py \
+uv run python scripts/export_cases.py \
   --case-ids "$(cat il_case_ids.txt)" \
   --output-dir data/cases/il_after_search \
   --table-prefix il_
 
 # California
 python scripts/get_all_case_ids_for_state.py --state ca
-uv run python scripts/export_random_cases.py \
+uv run python scripts/export_cases.py \
   --case-ids "$(cat ca_case_ids.txt)" \
   --output-dir data/cases/ca_after_search \
   --table-prefix ca_

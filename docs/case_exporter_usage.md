@@ -101,13 +101,13 @@ Export a random sample of cases (default: 100):
 
 ```bash
 # Export 100 random cases
-uv run python scripts/export_random_cases.py
+uv run python scripts/export_cases.py
 
 # Export specific number of cases
-uv run python scripts/export_random_cases.py --count 50
+uv run python scripts/export_cases.py --count 50
 
 # Specify output directory
-uv run python scripts/export_random_cases.py --count 100 --output-dir data/sample_cases
+uv run python scripts/export_cases.py --count 100 --output-dir data/sample_cases
 ```
 
 Both scripts accept `--schema` (default: `courts_final`) and `--table-prefix` (default: `ny_`)
@@ -120,7 +120,7 @@ so the same exporter works against any state's crawl tables that follow the
 Export specific cases by providing comma-separated IDs:
 
 ```bash
-uv run python scripts/export_random_cases.py --case-ids "273,51,70,350"
+uv run python scripts/export_cases.py --case-ids "273,51,70,350"
 ```
 
 ## Output Structure

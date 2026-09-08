@@ -216,10 +216,10 @@ Export complete court cases with all documents to denormalized JSON files and do
 uv run python scripts/export_case.py 1229
 
 # Export 100 random cases
-uv run python scripts/export_random_cases.py --count 100
+uv run python scripts/export_cases.py --count 100
 
 # Export specific cases
-uv run python scripts/export_random_cases.py --case-ids "273,51,70"
+uv run python scripts/export_cases.py --case-ids "273,51,70"
 ```
 
 Each exported case includes:

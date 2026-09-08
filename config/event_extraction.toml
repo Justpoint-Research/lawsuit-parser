@@ -191,22 +191,60 @@ min_confidence = 0.7
 # Classify lawsuits into categories using LLM (for generating training data)
 # and optionally a trained BERT-based classifier (for fast inference)
 
+# Which subdirectories of paths.data_root to pull cases from, e.g.
+# data/cases/<source>/<case_id>/. Swap or extend this list to change the
+# training-data pool without touching code (e.g. add "ny_after_search" or
+# "mdl" once those sources have a compatible case layout / are ready to use).
+case_sources = ["ny_sample"]
+
 # Use LLM for zero-shot classification (generates training data)
 use_llm_classifier = true
 
 # Use trained BERT model for fast classification (after training on LLM-generated data)
 use_bert_classifier = false
 
-# LLM backend settings (same options as stage_1)
-llm_backend = "ollama"
+# Providers to query when no --providers flag is given on the CLI (each run
+# targets one or more of "ollama", "anthropic", "gemini" - run them
+# separately, e.g. once per provider, then reconcile with
+# scripts/reconcile_classifications.py once a case has results from more
+# than one). Cloud providers cost money per call. Anthropic reads
+# ANTHROPIC_API_KEY from the env; Gemini runs through Vertex AI and
+# authenticates with Application Default Credentials - run
+# `gcloud auth application-default login` once, no API key needed.
+llm_providers = ["ollama"]
+
+# Ollama (local, free)
 llm_model = "qwen3:30b-a3b"
 llm_base_url = "http://localhost:11434"
 
-# How many pages from the beginning of documents to use for classification
+# Two-tier context sizing (see select_ollama_num_ctx) - GPU spillover to
+# CPU past the small tier cost ~10x wall-clock on a 24GB 4090, so most
+# cases stay on the small tier; re-measure if the GPU or model changes.
+ollama_num_ctx = 40960
+ollama_num_ctx_max = 100000
+ollama_timeout = 240.0
+
+# Anthropic (Claude) - see https://docs.claude.com/en/docs/about-claude/models
+anthropic_model = "claude-opus-5"
+
+# Gemini (via Vertex AI, ADC auth) - a small/fast model is plenty here.
+# gemini_project / gemini_location are optional: they default to
+# GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION, then the active gcloud
+# config, then location "global".
+gemini_model = "gemini-2.5-flash"
+# gemini_project = "research-456013"
+# gemini_location = "global"
+
+# How many pages' worth of text to read from any *one* document (every
+# document in the case is used - see select_documents_for_classification -
+# this only bounds a single huge exhibit from crowding out the rest)
 classification_page_count = 3
 
-# How many documents from each case to examine (prioritizes complaints/initial filings)
-classification_doc_count = 2
+# Hard cap on the combined text of all of a case's documents passed to the
+# LLM (prevents token overflow on document-heavy cases). Complaint-type
+# documents are ordered first, so truncation drops later, less central
+# documents rather than the complaint itself.
+max_text_chars = 100000
 
 # Categories to classify (multilabel)
 categories = [
