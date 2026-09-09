@@ -33,15 +33,20 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-# Import from zero_shot_classifier
+# Import shared helpers
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from zero_shot_classifier import (
     load_case_context,
-    load_document_text,
-    select_documents_for_classification,
     call_ollama,
     build_classification_prompt,
     CLASSIFICATION_RESPONSE_SCHEMA,
+    find_cases,
+)
+from train_bert_classifier import build_bert_input_text
+from summarize_cases_for_classification import (
+    gather_case_text,
+    load_summary_prompt_template,
+    summarize_case,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,13 +61,19 @@ class BERTClassifier:
             device if torch.cuda.is_available() else "cpu"
         )
 
-        # Load config
-        config_path = model_path / "config.json"
-        with open(config_path) as f:
+        # Load training metadata (categories, max_length). Older runs wrote
+        # this to config.json; current runs use classifier_meta.json so the
+        # HF model config.json stays intact.
+        meta_path = model_path / "classifier_meta.json"
+        if not meta_path.exists():
+            meta_path = model_path / "config.json"
+        with open(meta_path) as f:
             self.config = json.load(f)
 
         self.categories = self.config["categories"]
         self.max_length = self.config["max_length"]
+        # How the model was trained to read a case (see build_bert_input_text).
+        self.input_field = self.config.get("input_field", "auto")
 
         # Load model and tokenizer
         self.model = AutoModelForSequenceClassification.from_pretrained(
@@ -75,30 +86,6 @@ class BERTClassifier:
 
         logger.info(f"Loaded BERT model from {model_path}")
         logger.info(f"Categories: {self.categories}")
-
-    def prepare_text(
-        self,
-        case_metadata: dict[str, Any],
-        text_excerpt: str,
-    ) -> str:
-        """Prepare input text for classification."""
-        text_parts = [
-            f"Caption: {case_metadata.get('caption', 'Unknown')}",
-            f"Court: {case_metadata.get('court', 'Unknown')}",
-            f"Case Type: {case_metadata.get('case_type', 'Unknown')}",
-        ]
-
-        # Add document names if available
-        if case_metadata.get("document_names"):
-            text_parts.append(
-                f"Documents: {', '.join(case_metadata['document_names'])}"
-            )
-
-        # Add text excerpt
-        if text_excerpt:
-            text_parts.append(f"\nExcerpt:\n{text_excerpt}")
-
-        return "\n".join(text_parts)
 
     def classify(
         self,
@@ -146,60 +133,73 @@ def classify_with_bert(
     case_dir: Path,
     classifier: BERTClassifier,
     config: dict[str, Any],
+    data_root: Path,
+    output_root: Path,
+    summary_template: str,
 ) -> dict[str, Any] | None:
-    """Classify a case using trained BERT model."""
-    logger.info(f"Classifying {case_id} with BERT...")
+    """Classify a case with the trained BERT model.
 
-    # Load case metadata
+    Builds the exact same input the model was trained on
+    (build_bert_input_text): for a summary-trained model that means
+    generating the case summary here with the local LLM, one call per case.
+    """
+    logger.info(f"Classifying {case_id} with BERT ({classifier.input_field})...")
+
     case_metadata = load_case_context(case_dir)
     if not case_metadata:
         logger.warning(f"No metadata found for {case_id}")
         return None
 
-    # Select and load documents
-    doc_count = config.get("classification_doc_count", 2)
-    documents = select_documents_for_classification(case_dir, doc_count)
+    record: dict[str, Any] = {
+        "case_id": case_id,
+        "caption": case_metadata.get("caption"),
+        "court": case_metadata.get("court"),
+        "case_type": case_metadata.get("case_type"),
+    }
 
-    if not documents:
-        logger.warning(f"No documents found for {case_id}")
-        return None
+    if classifier.input_field in ("summary", "auto"):
+        summarized = summarize_case(
+            case_dir,
+            config,
+            data_root,
+            output_root,
+            classifier.tokenizer,
+            summary_template,
+            max_words=config.get("summary_max_words", 200),
+            input_max_chars=config.get("summary_input_max_chars", 30000),
+            max_tokens=classifier.max_length - 2,
+        )
+        if summarized:
+            record["summary"] = summarized["summary"]
+        elif classifier.input_field == "summary":
+            logger.warning(f"{case_id}: could not summarize, skipping")
+            return None
 
-    # Gather text
-    page_count = config.get("classification_page_count", 3)
-    max_chars_per_page = 3000
+    if "summary" not in record:
+        # Excerpt fallback - match the ~1000-char snippet the excerpt-trained
+        # model saw (zero_shot_classifier stores text_excerpt[:1000]).
+        text = gather_case_text(
+            case_dir, case_metadata, config, data_root, output_root,
+            config.get("summary_input_max_chars", 30000),
+        )
+        record["text_excerpt"] = text[:1000]
+        record["document_names"] = [
+            dm["document_name"]
+            for dm in case_metadata.get("documents_metadata", [])
+            if dm.get("document_name")
+        ]
 
-    text_parts = []
-
-    # Add document names
-    doc_names = []
-    for doc_meta in case_metadata.get("documents_metadata", [])[:doc_count]:
-        if doc_meta.get("document_name"):
-            doc_names.append(doc_meta["document_name"])
-
-    case_metadata["document_names"] = doc_names
-
-    # Add document text
-    for doc_path in documents:
-        doc_text = load_document_text(doc_path, max_chars_per_page * page_count)
-        if doc_text:
-            text_parts.append(doc_text)
-
-    text_excerpt = "\n\n".join(text_parts)
-
-    # Prepare input and classify
-    input_text = classifier.prepare_text(case_metadata, text_excerpt)
+    input_text = build_bert_input_text(record, input_field=classifier.input_field)
     labels = classifier.classify(
         input_text,
         threshold=config.get("min_confidence", 0.6),
     )
 
     return {
-        "case_id": case_id,
-        "caption": case_metadata.get("caption"),
-        "court": case_metadata.get("court"),
-        "case_type": case_metadata.get("case_type"),
+        **{k: record[k] for k in ("case_id", "caption", "court", "case_type")},
         "labels": labels,
         "classifier": "bert",
+        "input_field": classifier.input_field,
         "model_path": str(config.get("model_save_path")),
     }
 
@@ -298,15 +298,19 @@ def main():
 
         classifier = BERTClassifier(model_path)
 
-    # Find cases
-    data_root = Path(paths_config.get("data_root", "data/cases"))
-    if args.all:
-        case_dirs = [d for d in data_root.iterdir() if d.is_dir()]
-    else:
-        case_dirs = [data_root / case_id for case_id in args.cases]
-        case_dirs = [d for d in case_dirs if d.exists()]
+    # Find cases - same source-aware discovery as zero_shot_classifier.py
+    data_root = Path(config.get("data_root", "data/cases"))
+    if not data_root.exists():
+        data_root = Path(paths_config.get("data_root", "data/cases"))
+    output_root = Path(paths_config.get("output_root", "data/extraction"))
+    case_sources = config.get("case_sources", ["ny_sample"])
+    case_dirs = find_cases(data_root, case_sources, args.cases or None)
 
-    logger.info(f"Found {len(case_dirs)} cases to classify")
+    logger.info(f"Found {len(case_dirs)} cases to classify (sources: {case_sources})")
+
+    summary_template = load_summary_prompt_template(
+        REPO_ROOT / "config" / "llm_prompts.toml"
+    )
 
     # Classify cases
     results = []
@@ -314,7 +318,10 @@ def main():
         case_id = case_dir.name
 
         if args.use_bert:
-            result = classify_with_bert(case_id, case_dir, classifier, config)
+            result = classify_with_bert(
+                case_id, case_dir, classifier, config,
+                data_root, output_root, summary_template,
+            )
         else:
             result = classify_with_llm(case_id, case_dir, config)
 

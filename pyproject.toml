@@ -48,6 +48,8 @@ dependencies = [
     "pyvis>=0.3.2",
     "nltk>=3.10.3",
     "watchdog>=6.0.0",
+    # Train/eval split and multilabel metrics for scripts/train_bert_classifier.py
+    "scikit-learn>=1.4.0",
 ]
 
 [project.optional-dependencies]

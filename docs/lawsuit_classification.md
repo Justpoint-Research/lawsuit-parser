@@ -120,21 +120,73 @@ Example output structure:
 }
 ```
 
-### Step 2: Train BERT Classifier
+### Step 1b: Reconcile Multi-Provider Labels
 
-Train a fast BERT model using the LLM-generated training data:
+`zero_shot_classifier.py` stores each provider's labels separately under
+`provider_results`. Collapse them into one label set per case before
+training:
 
 ```bash
-# Train with default settings
+python scripts/reconcile_classifications.py --require-all-providers
+```
+
+This writes two files:
+
+- `data/classification/reconciled.json` - a per-strategy breakdown
+  (majority / union / intersection) for inspection.
+- `data/classification/reconciled_training_data.json` - the file the BERT
+  trainer reads. By default it uses the **intersection** strategy: a
+  category is labelled `1` only when *every* provider that ran for the
+  case assigned it; any disagreement makes it `0`. Cases that end up with
+  no positive label are kept as negative examples.
+
+Use `--training-strategy majority` or `union` to bake in a looser rule.
+
+### Step 1c: Generate Case Summaries (BERT input)
+
+The raw `text_excerpt` stored for training is only the first ~1000 characters
+of the filings - mostly caption/summons boilerplate. Instead, generate a
+dense factual summary per case with the **local Ollama model** and use that
+as the classifier's input:
+
+```bash
+python scripts/summarize_cases_for_classification.py
+```
+
+- Prompt (`config/llm_prompts.toml` -> `[classification_summary]`) is
+  **label-agnostic** - it never names the categories or asks a yes/no
+  question, so the summary can't leak the label. The same prompt runs for
+  every case.
+- Each summary is measured with the **BERT tokenizer** against the exact
+  string the trainer builds and guaranteed to fit `bert_max_length`. On
+  overflow the model is re-prompted once for a shorter summary, then
+  hard-truncated as a last resort.
+- Output: `data/classification/case_summaries.json`. Resumable; re-run with
+  `--force` to regenerate. `reconcile_classifications.py` auto-merges it
+  into `reconciled_training_data.json` as a `summary` field.
+
+### Step 2: Train BERT Classifier
+
+Train a fast BERT model on the reconciled training data:
+
+```bash
+# Train on the LLM summaries (recommended once Step 1c has run)
+python scripts/train_bert_classifier.py --input-field summary
+
+# Train with default settings - 'auto' uses the summary when present,
+# else the raw excerpt
 python scripts/train_bert_classifier.py
 
 # Custom training
 python scripts/train_bert_classifier.py \
-  --data data/classification/training_data.json \
+  --data data/classification/reconciled_training_data.json \
   --model nlpaueb/legal-bert-base-uncased \
   --epochs 5 \
   --batch-size 16 \
   --learning-rate 2e-5
+
+# Drop cases with no positive reconciled label instead of keeping them
+python scripts/train_bert_classifier.py --drop-empty
 
 # Resume from checkpoint
 python scripts/train_bert_classifier.py --resume
@@ -196,11 +248,29 @@ python scripts/classify_lawsuit.py --all --use-bert --output results.json
                    │
                    ▼
     ┌──────────────────────────────────┐
-    │ Training Data                    │
+    │ Per-provider Training Data       │
     │ (training_data.json)             │
     │ - Case texts                     │
-    │ - Multilabel annotations         │
-    │ - Confidence scores              │
+    │ - provider_results (per LLM)     │
+    └──────────────┬───────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────┐
+    │ Local-LLM summaries              │
+    │ (summarize_cases_for_            │
+    │  classification.py)              │
+    │ - label-agnostic prompt          │
+    │ - fits bert_max_length           │
+    │ → case_summaries.json            │
+    └──────────────┬───────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────┐
+    │ Reconciliation + merge summary  │
+    │ (reconcile_classifications.py)   │
+    │ - intersection: unanimous = 1    │
+    │ - else 0                         │
+    │ → reconciled_training_data.json  │
     └──────────────┬───────────────────┘
                    │
                    ▼

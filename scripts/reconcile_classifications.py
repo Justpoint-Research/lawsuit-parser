@@ -10,7 +10,12 @@ ways of combining the providers' votes into one label set:
                     for this case included it (strict majority)
     union         - included if ANY provider included it
     intersection  - included if ALL providers that ran for this case
-                    included it
+                    included it (any disagreement drops the label to 0)
+
+It also writes a second file (--training-output) in the shape
+train_bert_classifier.py expects: one row per case with a flat "labels"
+list taken from a single strategy (--training-strategy, default
+intersection) and the case's text/metadata fields carried through.
 
 A case's provider count varies depending on how many providers you've run
 so far (see zero_shot_classifier.py --providers) - reconciliation always
@@ -111,7 +116,30 @@ def main():
         "--output",
         type=Path,
         default=REPO_ROOT / "data" / "classification" / "reconciled.json",
-        help="Path to write the reconciled output",
+        help="Path to write the reconciled output (per-strategy breakdown)",
+    )
+    parser.add_argument(
+        "--training-output",
+        type=Path,
+        default=REPO_ROOT / "data" / "classification" / "reconciled_training_data.json",
+        help="Path to write a train_bert_classifier.py-ready file whose per-case "
+        "'labels' come from a single reconciliation strategy",
+    )
+    parser.add_argument(
+        "--training-strategy",
+        choices=STRATEGIES,
+        default="intersection",
+        help="Which strategy's labels to bake into --training-output "
+        "(default: intersection = a label is kept only when every provider "
+        "that ran for the case agreed on it; any disagreement drops it)",
+    )
+    parser.add_argument(
+        "--summaries",
+        type=Path,
+        default=REPO_ROOT / "data" / "classification" / "case_summaries.json",
+        help="Optional summarize_cases_for_classification.py output; when "
+        "present its per-case 'summary' is merged into --training-output so "
+        "train_bert_classifier.py can use it as the model input",
     )
     parser.add_argument(
         "--providers",
@@ -143,6 +171,12 @@ def main():
     with open(args.input) as f:
         data = json.load(f)
 
+    summaries: dict[str, Any] = {}
+    if args.summaries and args.summaries.exists():
+        with open(args.summaries) as f:
+            summaries = json.load(f).get("summaries", {})
+        logger.info(f"Loaded {len(summaries)} case summary/summaries from {args.summaries}")
+
     all_results = data.get("results", [])
     providers = args.providers or sorted({
         provider
@@ -158,6 +192,13 @@ def main():
     # Coverage breakdown - how many cases have how many of the considered providers
     coverage_counts: Counter[int] = Counter()
     reconciled_cases = []
+    training_cases = []
+    # Text/metadata fields carried through verbatim so train_bert_classifier.py
+    # can build its input text without re-reading the source case files.
+    passthrough_fields = (
+        "caption", "court", "case_type", "case_received_date", "case_status",
+        "text_excerpt", "documents_used", "document_names",
+    )
     skipped_incomplete = 0
 
     for case in all_results:
@@ -178,6 +219,20 @@ def main():
             **reconciliation,
         })
 
+        training_case = {
+            "case_id": case["case_id"],
+            **{f: case.get(f) for f in passthrough_fields},
+            "labels": [
+                {"category": entry["category"]}
+                for entry in reconciliation[args.training_strategy]
+            ],
+            "provider_count": n,
+        }
+        summary_entry = summaries.get(case["case_id"])
+        if summary_entry and summary_entry.get("summary"):
+            training_case["summary"] = summary_entry["summary"]
+        training_cases.append(training_case)
+
     # Save reconciled output
     args.output.parent.mkdir(parents=True, exist_ok=True)
     output_data = {
@@ -192,6 +247,23 @@ def main():
     }
     with open(args.output, "w") as f:
         json.dump(output_data, f, indent=2)
+
+    # Training-ready file: one strategy's labels, plus the case text fields
+    args.training_output.parent.mkdir(parents=True, exist_ok=True)
+    training_data = {
+        "metadata": {
+            "source": str(args.input),
+            "providers_considered": providers,
+            "require_all_providers": args.require_all_providers,
+            "reconciliation_strategy": args.training_strategy,
+            "categories": data.get("metadata", {}).get("categories"),
+            "total_cases": len(training_cases),
+            "cases_with_summary": sum(1 for tc in training_cases if tc.get("summary")),
+        },
+        "results": training_cases,
+    }
+    with open(args.training_output, "w") as f:
+        json.dump(training_data, f, indent=2)
 
     # --- Report ---
     print("\n=== Provider Coverage ===")
@@ -224,7 +296,24 @@ def main():
     ]
     print(f"\nCases where strategies disagree: {len(disagreements)}/{len(reconciled_cases)}")
 
+    # Training-file label distribution (the strategy actually baked in)
+    print(f"\n=== Training file ({args.training_strategy}, {len(training_cases)} case(s)) ===")
+    train_counts: Counter[str] = Counter()
+    empty_rows = 0
+    for tc in training_cases:
+        if not tc["labels"]:
+            empty_rows += 1
+        for lbl in tc["labels"]:
+            train_counts[lbl["category"]] += 1
+    for category, count in sorted(train_counts.items()):
+        pct = count / len(training_cases) * 100 if training_cases else 0.0
+        print(f"  {category}: {count} positive ({pct:.1f}%)")
+    print(f"  cases with no positive label: {empty_rows}")
+    n_with_summary = sum(1 for tc in training_cases if tc.get("summary"))
+    print(f"  cases with an LLM summary: {n_with_summary}/{len(training_cases)}")
+
     print(f"\nReconciled output saved to: {args.output}")
+    print(f"Training-ready output saved to: {args.training_output}")
 
 
 if __name__ == "__main__":

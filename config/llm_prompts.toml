@@ -121,6 +121,32 @@ Be thorough - extract from headers, body text, signatures, and contact blocks. I
 Return empty list if no entities can be extracted.
 """
 
+[classification_summary]
+# Label-agnostic factual summary of a case, used verbatim as the input text
+# for the BERT classifier (scripts/summarize_cases_for_classification.py).
+# Deliberately never mentions the target categories or asks a yes/no
+# classification question - the same fixed prompt runs for every case, so
+# the summary carries the discriminative facts without leaking the label.
+template = """
+You are writing a neutral, factual summary of a single lawsuit from its court filings. This summary will be read by an automated system, so be precise and information-dense.
+
+Case caption: {caption}
+Court: {court}
+Case type: {case_type}
+
+Case documents (initial filings first):
+{text_excerpt}
+
+Write a summary of {max_words} words or fewer that states:
+- who the plaintiff(s) and defendant(s) are and the relationship between them
+- the product, event, transaction, or conduct the lawsuit concerns
+- the specific injury, loss, or damages the plaintiff alleges, and how it was allegedly caused
+- the legal claims or causes of action the plaintiff asserts
+- whether the plaintiff sues only for themselves or also on behalf of other people, and the current procedural posture of the case
+
+Write plain prose, {max_words} words or fewer. No headings, no bullet points, no preamble or sign-off. Report only what the filings actually say; do not assign legal categories, label the case, or speculate.
+"""
+
 [lawsuit_classification]
 template = """
 You are classifying a lawsuit into one or more legal categories based on the case documents.

@@ -25,10 +25,60 @@ Usage:
 import argparse
 import json
 import logging
+import re
 import sys
 import tomllib
 from pathlib import Path
 from typing import Any
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _clean(value: Any) -> str:
+    """Strip HTML tags and collapse whitespace from a metadata field."""
+    return " ".join(_TAG_RE.sub(" ", str(value or "")).split())
+
+
+# Field name for the LLM-generated summary in a reconciled training row.
+SUMMARY_FIELD = "summary"
+
+
+def build_bert_input_text(result: dict[str, Any], input_field: str = "auto") -> str:
+    """Assemble the exact text fed to the BERT tokenizer for one case.
+
+    Single source of truth shared by training
+    (scripts/train_bert_classifier.py), summary generation
+    (scripts/summarize_cases_for_classification.py, which sizes summaries
+    against this) and inference (scripts/classify_lawsuit.py).
+
+    input_field:
+        "summary" - always use the LLM summary (raises if absent)
+        "excerpt" - always use the raw document excerpt
+        "auto"    - summary when present, else the excerpt
+    """
+    header = [
+        f"Caption: {_clean(result.get('caption')) or 'Unknown'}",
+        f"Court: {_clean(result.get('court')) or 'Unknown'}",
+        f"Case Type: {_clean(result.get('case_type')) or 'Unknown'}",
+    ]
+
+    summary = (result.get(SUMMARY_FIELD) or "").strip()
+    use_summary = summary and input_field in ("auto", "summary")
+    if input_field == "summary" and not summary:
+        raise ValueError(
+            f"input_field='summary' but case {result.get('case_id')!r} has no "
+            f"{SUMMARY_FIELD!r} - run scripts/summarize_cases_for_classification.py"
+        )
+
+    if use_summary:
+        return "\n".join(header + [f"\nSummary:\n{summary}"])
+
+    parts = list(header)
+    if result.get("document_names"):
+        parts.append(f"Documents: {', '.join(result['document_names'])}")
+    if result.get("text_excerpt"):
+        parts.append(f"\nExcerpt:\n{result['text_excerpt']}")
+    return "\n".join(parts)
 
 import numpy as np
 import torch
@@ -93,11 +143,29 @@ def load_config(config_path: Path) -> dict[str, Any]:
     return config.get("lawsuit_classification", {})
 
 
-def load_training_data(data_path: Path) -> tuple[list[str], list[list[int]], list[str]]:
+def load_training_data(
+    data_path: Path,
+    drop_empty: bool = False,
+    input_field: str = "auto",
+) -> tuple[list[str], list[list[int]], list[str]]:
     """Load and prepare training data from JSON file.
 
+    Expects the file produced by reconcile_classifications.py
+    (--training-output): each result carries a flat "labels" list whose
+    categories are the ones the LLM providers agreed on under the chosen
+    reconciliation strategy, and (when summaries have been generated and
+    merged in) a "summary" field.
+
+    Args:
+        data_path: Path to the reconciled training-data JSON.
+        drop_empty: If True, skip cases whose reconciled label vector is
+            all-zero. Default False - those rows are kept as negative
+            examples (needed for calibration and for rare categories).
+        input_field: "summary", "excerpt" or "auto" - see
+            build_bert_input_text. "summary" skips cases with no summary.
+
     Returns:
-        texts: List of input texts (case metadata + document excerpts)
+        texts: List of input texts (case metadata + summary/excerpt)
         labels: List of multilabel binary vectors
         categories: List of category names
     """
@@ -109,24 +177,16 @@ def load_training_data(data_path: Path) -> tuple[list[str], list[list[int]], lis
 
     texts = []
     labels = []
+    n_summary = 0
+    n_excerpt = 0
+    n_no_summary_skipped = 0
 
     for result in data["results"]:
-        # Build input text from metadata and excerpt
-        text_parts = [
-            f"Caption: {result.get('caption', 'Unknown')}",
-            f"Court: {result.get('court', 'Unknown')}",
-            f"Case Type: {result.get('case_type', 'Unknown')}",
-        ]
+        if input_field == "summary" and not (result.get(SUMMARY_FIELD) or "").strip():
+            n_no_summary_skipped += 1
+            continue
 
-        # Add document names if available
-        if result.get("document_names"):
-            text_parts.append(f"Documents: {', '.join(result['document_names'])}")
-
-        # Add text excerpt
-        if result.get("text_excerpt"):
-            text_parts.append(f"\nExcerpt:\n{result['text_excerpt']}")
-
-        text = "\n".join(text_parts)
+        text = build_bert_input_text(result, input_field=input_field)
 
         # Build multilabel vector
         label_vector = [0] * len(categories)
@@ -135,12 +195,20 @@ def load_training_data(data_path: Path) -> tuple[list[str], list[list[int]], lis
             if category in category_to_idx:
                 label_vector[category_to_idx[category]] = 1
 
-        # Only include if at least one label is present
-        if sum(label_vector) > 0:
-            texts.append(text)
-            labels.append(label_vector)
+        if drop_empty and sum(label_vector) == 0:
+            continue
+        texts.append(text)
+        labels.append(label_vector)
+        if (result.get(SUMMARY_FIELD) or "").strip() and input_field != "excerpt":
+            n_summary += 1
+        else:
+            n_excerpt += 1
 
     logger.info(f"Loaded {len(texts)} training examples")
+    logger.info(
+        f"Input text: {n_summary} from summary, {n_excerpt} from raw excerpt"
+        + (f", {n_no_summary_skipped} skipped (no summary)" if n_no_summary_skipped else "")
+    )
     logger.info(f"Categories: {categories}")
 
     # Print label distribution
@@ -227,16 +295,16 @@ def evaluate(
     # Calculate metrics
     metrics = {
         "hamming_loss": hamming_loss(all_labels, all_predictions),
-        "f1_micro": f1_score(all_labels, all_predictions, average="micro"),
-        "f1_macro": f1_score(all_labels, all_predictions, average="macro"),
-        "f1_samples": f1_score(all_labels, all_predictions, average="samples"),
+        "f1_micro": f1_score(all_labels, all_predictions, average="micro", zero_division=0),
+        "f1_macro": f1_score(all_labels, all_predictions, average="macro", zero_division=0),
+        "f1_samples": f1_score(all_labels, all_predictions, average="samples", zero_division=0),
     }
 
     # Per-category metrics
     for idx, category in enumerate(categories):
         cat_labels = all_labels[:, idx]
         cat_preds = all_predictions[:, idx]
-        metrics[f"f1_{category}"] = f1_score(cat_labels, cat_preds)
+        metrics[f"f1_{category}"] = f1_score(cat_labels, cat_preds, zero_division=0)
 
     return metrics
 
@@ -302,6 +370,20 @@ def main():
         help="Only evaluate (no training)",
     )
     parser.add_argument(
+        "--drop-empty",
+        action="store_true",
+        help="Skip cases with no positive reconciled label instead of "
+        "keeping them as negative examples",
+    )
+    parser.add_argument(
+        "--input-field",
+        choices=["auto", "summary", "excerpt"],
+        default="auto",
+        help="Which case text to feed BERT: the LLM 'summary' (from "
+        "scripts/summarize_cases_for_classification.py), the raw document "
+        "'excerpt', or 'auto' (summary when present, else excerpt)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -320,8 +402,8 @@ def main():
 
     # Determine paths
     data_path = args.data or Path(config.get(
-        "training_data_path",
-        "data/classification/training_data.json"
+        "reconciled_training_data_path",
+        "data/classification/reconciled_training_data.json"
     ))
     model_name = args.model or config.get(
         "bert_model",
@@ -342,7 +424,9 @@ def main():
 
     # Load training data
     logger.info(f"Loading training data from {data_path}")
-    texts, labels, categories = load_training_data(data_path)
+    texts, labels, categories = load_training_data(
+        data_path, drop_empty=args.drop_empty, input_field=args.input_field
+    )
 
     # Split data
     train_texts, test_texts, train_labels, test_labels = train_test_split(
@@ -354,7 +438,10 @@ def main():
     logger.info(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    if args.resume and (output_dir / "pytorch_model.bin").exists():
+    if args.resume and (
+        (output_dir / "model.safetensors").exists()
+        or (output_dir / "pytorch_model.bin").exists()
+    ):
         logger.info(f"Resuming from checkpoint: {output_dir}")
         model = AutoModelForSequenceClassification.from_pretrained(
             output_dir,
@@ -431,14 +518,18 @@ def main():
             model.save_pretrained(output_dir)
             tokenizer.save_pretrained(output_dir)
 
-            # Save config and category mapping
+            # Save category mapping / training metadata alongside the model.
+            # NB: a separate filename - "config.json" belongs to
+            # model.save_pretrained() and must not be overwritten or the
+            # model can't be reloaded.
             config_data = {
                 "model_name": model_name,
                 "categories": categories,
                 "max_length": max_length,
+                "input_field": args.input_field,
                 "best_f1_macro": best_f1,
             }
-            with open(output_dir / "config.json", "w") as f:
+            with open(output_dir / "classifier_meta.json", "w") as f:
                 json.dump(config_data, f, indent=2)
 
     logger.info(f"\nTraining complete! Best F1-macro: {best_f1:.4f}")

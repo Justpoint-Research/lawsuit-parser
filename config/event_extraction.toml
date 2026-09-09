@@ -265,5 +265,19 @@ bert_max_length = 512
 bert_batch_size = 8
 
 # Training data paths
+# training_data_path      - raw per-provider LLM output (zero_shot_classifier.py)
+# reconciled_training_data_path - the file train_bert_classifier.py trains on,
+#   written by reconcile_classifications.py --training-output: a label is 1 only
+#   when every provider agreed on it (intersection strategy), else 0.
 training_data_path = "data/classification/training_data.json"
+reconciled_training_data_path = "data/classification/reconciled_training_data.json"
 model_save_path = "data/classification/bert_classifier"
+
+# LLM case summaries used as the BERT classifier's input text
+# (scripts/summarize_cases_for_classification.py). The summary is generated
+# by the local Ollama model (llm_model / llm_base_url above) from a
+# label-agnostic prompt and sized to fit bert_max_length.
+case_summaries_path = "data/classification/case_summaries.json"
+summary_max_words = 200          # word target asked of the local LLM
+summary_input_max_chars = 30000  # document text fed to the summarizer (keeps
+                                 # the local model on its fast context tier)
