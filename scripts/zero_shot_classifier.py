@@ -16,7 +16,9 @@ Usage:
     # Classify all cases with the local Ollama model (free)
     python scripts/zero_shot_classifier.py --providers ollama
 
-    # Add Claude results to the same cases (needs ANTHROPIC_API_KEY set)
+    # Add Claude results to the same cases (needs an Anthropic API key or
+    # bearer token - in the env as ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN,
+    # or in the [api] table of ~/.config/lawsuit-parser/secrets.toml)
     python scripts/zero_shot_classifier.py --providers anthropic
 
     # Add Gemini results too (needs `gcloud auth application-default login`)
@@ -51,15 +53,48 @@ import requests
 from tqdm import tqdm
 
 PROVIDERS = ("ollama", "anthropic", "gemini")
-PROVIDER_API_KEY_ENV_VARS = {
-    "anthropic": "ANTHROPIC_API_KEY",
+# Each cloud provider is usable if *any* of these env vars is set. The
+# anthropic SDK auto-resolves either an API key or a bearer auth token
+# (e.g. a `claude setup-token` OAuth token).
+PROVIDER_CREDENTIAL_ENV_VARS = {
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
 }
 
 # Add parent directory to path for imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+# Gitignored credentials file, shared with the rest of the project (see
+# lawsuit_parser/utils/db.py). The [api] table there is an alternative to
+# exporting env vars; env vars still win when both are set.
+SECRETS_PATH = Path.home() / ".config" / "lawsuit-parser" / "secrets.toml"
+
 logger = logging.getLogger(__name__)
+
+
+def load_api_secrets() -> dict[str, Any]:
+    """Return the ``[api]`` table from the user's secrets file, or ``{}``."""
+    try:
+        with SECRETS_PATH.open("rb") as f:
+            return tomllib.load(f).get("api", {})
+    except (FileNotFoundError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def resolve_anthropic_credentials() -> dict[str, str]:
+    """Anthropic client kwargs from env vars, else the secrets file.
+
+    Returns ``{"api_key": ...}`` or ``{"auth_token": ...}`` or ``{}`` (let the
+    SDK do its own resolution). Env vars take precedence over the secrets file.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return {}  # SDK reads these itself
+    api = load_api_secrets()
+    if api.get("anthropic_api_key"):
+        return {"api_key": api["anthropic_api_key"]}
+    if api.get("anthropic_auth_token"):
+        return {"auth_token": api["anthropic_auth_token"]}
+    return {}
 
 
 # Classification response schema
@@ -190,28 +225,52 @@ def call_ollama(
     return json.loads(content)
 
 
-def _with_additional_properties_false(schema: dict) -> dict:
-    """Return a deep copy of a JSON schema with `additionalProperties: false`
-    added to every object node.
+# Numeric-range keywords Claude's strict structured-output rejects (Ollama
+# and Gemini accept them).
+_CLAUDE_UNSUPPORTED_NUMBER_KEYWORDS = (
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+)
 
-    Claude's structured-output (`output_config.format`) requires this for
-    strict schema validation; Ollama and Gemini accept the schema as-is, so
-    this is only applied for the Claude call.
+
+def _for_claude_strict_schema(schema: dict) -> dict:
+    """Return a deep copy of a JSON schema massaged for Claude's structured
+    output (`output_config.format`): `additionalProperties: false` on every
+    object node, and numeric-range keywords stripped from number/integer
+    nodes. Ollama and Gemini accept the original schema as-is.
     """
     schema = json.loads(json.dumps(schema))  # cheap deep copy
 
-    def add_recursively(node: Any) -> None:
+    def fix_recursively(node: Any) -> None:
         if isinstance(node, dict):
             if node.get("type") == "object":
                 node.setdefault("additionalProperties", False)
+            if node.get("type") in ("number", "integer"):
+                for kw in _CLAUDE_UNSUPPORTED_NUMBER_KEYWORDS:
+                    node.pop(kw, None)
             for value in node.values():
-                add_recursively(value)
+                fix_recursively(value)
         elif isinstance(node, list):
             for item in node:
-                add_recursively(item)
+                fix_recursively(item)
 
-    add_recursively(schema)
+    fix_recursively(schema)
     return schema
+
+
+# Claude Code subscription OAuth tokens (`claude setup-token`, "sk-ant-oat...")
+# are rejected with a blanket 429 unless the request's system prompt identifies
+# it as Claude Code. Console API keys ("sk-ant-api...") need none of this.
+CLAUDE_CODE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def _using_oauth_token(client_kwargs: dict[str, str]) -> bool:
+    """True if Claude auth is a `claude setup-token` OAuth bearer token."""
+    token = client_kwargs.get("auth_token") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+    return token.startswith("sk-ant-oat")
 
 
 def call_claude(
@@ -219,15 +278,22 @@ def call_claude(
     prompt: str,
     schema: dict,
     timeout: float = 120.0,
+    client_kwargs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Call the Claude API with JSON-schema constrained output.
 
-    Reads the API key from the ANTHROPIC_API_KEY env var (the anthropic
-    SDK's own default credential resolution) - nothing else to configure.
+    Credentials: an API key (ANTHROPIC_API_KEY) or a bearer token
+    (ANTHROPIC_AUTH_TOKEN, e.g. from `claude setup-token`), taken from the
+    env, or - via ``client_kwargs`` from ``resolve_anthropic_credentials()`` -
+    from the ``[api]`` table of ~/.config/lawsuit-parser/secrets.toml.
     """
     import anthropic
 
-    client = anthropic.Anthropic()
+    client_kwargs = client_kwargs or {}
+    client = anthropic.Anthropic(**client_kwargs)
+    extra: dict[str, Any] = {}
+    if _using_oauth_token(client_kwargs):
+        extra["system"] = CLAUDE_CODE_SYSTEM_PROMPT
     response = client.with_options(timeout=timeout).messages.create(
         model=model,
         max_tokens=2048,
@@ -235,9 +301,10 @@ def call_claude(
         output_config={
             "format": {
                 "type": "json_schema",
-                "schema": _with_additional_properties_false(schema),
+                "schema": _for_claude_strict_schema(schema),
             }
         },
+        **extra,
     )
     text = next(block.text for block in response.content if block.type == "text")
     return json.loads(text)
@@ -294,12 +361,15 @@ def _default_gcloud_project() -> str | None:
 def check_provider_credentials(provider: str) -> None:
     """Fail fast with a clear message if a cloud provider's credentials aren't
     available, rather than a deep SDK stack trace on the first call."""
-    env_var = PROVIDER_API_KEY_ENV_VARS.get(provider)
-    if env_var and not os.environ.get(env_var):
-        raise SystemExit(
-            f"{env_var} is not set - required to call the '{provider}' provider. "
-            f"export {env_var}=... and re-run."
-        )
+    if provider == "anthropic":
+        env_vars = PROVIDER_CREDENTIAL_ENV_VARS["anthropic"]
+        if not any(os.environ.get(v) for v in env_vars) and not resolve_anthropic_credentials():
+            names = " or ".join(env_vars)
+            raise SystemExit(
+                f"No Anthropic credentials found - set {names} in the env, or "
+                f"add anthropic_api_key / anthropic_auth_token to the [api] "
+                f"table of {SECRETS_PATH}, and re-run."
+            )
     if provider == "gemini":
         try:
             import google.auth
@@ -338,10 +408,11 @@ def call_provider(
         )
     elif provider == "anthropic":
         return call_claude(
-            model=config.get("anthropic_model", "claude-opus-5"),
+            model=config.get("anthropic_model", "claude-sonnet-5"),
             prompt=prompt,
             schema=schema,
             timeout=timeout,
+            client_kwargs=resolve_anthropic_credentials(),
         )
     elif provider == "gemini":
         return call_gemini(
@@ -361,7 +432,7 @@ def provider_model_name(provider: str, config: dict[str, Any]) -> str:
     if provider == "ollama":
         return config["llm_model"]
     elif provider == "anthropic":
-        return config.get("anthropic_model", "claude-opus-5")
+        return config.get("anthropic_model", "claude-sonnet-5")
     elif provider == "gemini":
         return config.get("gemini_model", "gemini-2.5-flash")
     raise ValueError(f"Unknown provider: {provider!r}")

@@ -208,7 +208,10 @@ use_bert_classifier = false
 # separately, e.g. once per provider, then reconcile with
 # scripts/reconcile_classifications.py once a case has results from more
 # than one). Cloud providers cost money per call. Anthropic reads
-# ANTHROPIC_API_KEY from the env; Gemini runs through Vertex AI and
+# ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN (a bearer token, e.g. from
+# `claude setup-token`) from the env, or anthropic_api_key /
+# anthropic_auth_token from the [api] table of
+# ~/.config/lawsuit-parser/secrets.toml; Gemini runs through Vertex AI and
 # authenticates with Application Default Credentials - run
 # `gcloud auth application-default login` once, no API key needed.
 llm_providers = ["ollama"]
@@ -225,7 +228,7 @@ ollama_num_ctx_max = 100000
 ollama_timeout = 240.0
 
 # Anthropic (Claude) - see https://docs.claude.com/en/docs/about-claude/models
-anthropic_model = "claude-opus-5"
+anthropic_model = "claude-sonnet-5"
 
 # Gemini (via Vertex AI, ADC auth) - a small/fast model is plenty here.
 # gemini_project / gemini_location are optional: they default to
