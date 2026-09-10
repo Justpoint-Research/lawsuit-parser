@@ -1,7 +1,7 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
-        download-sample-cases download-wayback-files parse-pdfs
+        download-sample-cases download-wayback-files parse-pdfs classification-review
 
 # The default shell for make
 SHELL := /bin/bash
@@ -35,6 +35,7 @@ help:
 	@echo "  make notebook          - Start Jupyter notebook server"
 	@echo "  make case-browser      - Start Case Browser Streamlit app"
 	@echo "  make event-browser     - Start Event Browser Streamlit app (extracted events, actor filtering)"
+	@echo "  make classification-review - Start Classification Review Streamlit app (model votes + reasoning)"
 	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
 	@echo "  make download_sample_cases - Export sample cases (95, 227, 309, 377, 2303) to data/cases"
 	@echo "  make download-wayback-files - Download archived MDL files from Wayback Machine"
@@ -125,6 +126,11 @@ event-browser: ensure-venv
 	@echo "Starting Event Browser app..."
 	@echo "Opening app at http://localhost:8501"
 	TRANSFORMERS_VERBOSITY=error PYTHONWARNINGS=ignore uv run streamlit run apps/event_browser.py
+
+classification-review: ensure-venv
+	@echo "Starting Classification Review app..."
+	@echo "Opening app at http://localhost:8501"
+	uv run streamlit run apps/classification_review.py
 
 test-pdf-parser: ensure-venv
 	@echo "Testing PDF parser on sample document..."

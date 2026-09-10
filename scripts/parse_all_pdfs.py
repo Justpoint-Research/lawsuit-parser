@@ -127,9 +127,32 @@ def quiet_console(log_path: Path):
     '--workers',
     type=int,
     default=8,
-    help='Number of PDFs to parse concurrently (default: 8)'
+    help='Number of worker processes parsing PDFs concurrently (default: 8). '
+         'Aim for workers * threads-per-worker near the physical core count. '
+         '--workers 1 parses sequentially in-process (no pool).'
 )
-def main(data_dir: str, case_id: str | None, skip_existing: bool, no_gpu: bool, workers: int):
+@click.option(
+    '--threads-per-worker',
+    type=int,
+    default=4,
+    help='CPU threads each worker\'s Docling model stages may use (default: 4).'
+)
+@click.option(
+    '--max-tasks-per-child',
+    type=int,
+    default=200,
+    help='Recycle a worker process after this many parses to reclaim leaked '
+         'memory / reset a bad CUDA context (default: 200; 0 disables).'
+)
+def main(
+    data_dir: str,
+    case_id: str | None,
+    skip_existing: bool,
+    no_gpu: bool,
+    workers: int,
+    threads_per_worker: int,
+    max_tasks_per_child: int,
+):
     """Parse all PDF documents and extract structured content.
 
     Examples:
@@ -153,6 +176,10 @@ def main(data_dir: str, case_id: str | None, skip_existing: bool, no_gpu: bool, 
       # Parse sequentially (concurrency is on by default, --workers 8)
 
       python scripts/parse_all_pdfs.py --workers 1
+
+      # Saturate a 32-core box (CPU-only), recycling workers often
+
+      python scripts/parse_all_pdfs.py --no-gpu --workers 8 --threads-per-worker 4
     """
     # Convert to Path objects
     data_dir_path = Path(data_dir)
@@ -167,6 +194,8 @@ def main(data_dir: str, case_id: str | None, skip_existing: bool, no_gpu: bool, 
             use_gpu=not no_gpu,
             progress_file=console,
             max_workers=workers,
+            num_threads=threads_per_worker,
+            max_tasks_per_child=max_tasks_per_child or None,
         )
 
     # Back on the real console: report the outcome.

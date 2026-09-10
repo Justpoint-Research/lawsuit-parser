@@ -43,6 +43,19 @@ def _pg_bigint_array(values: list[int]) -> str:
     return "ARRAY[" + ",".join(str(int(v)) for v in values) + "]::bigint[]"
 
 
+def _pg_text_array(values: list[str]) -> str:
+    """Render strings as a Postgres ``ARRAY[...]::text[]`` literal.
+
+    Same rationale as :func:`_pg_bigint_array` (the id list is embedded in the
+    query text so ``fetch_from_postgres`` can cache by hashing it). Used for
+    ``docket_id`` / ``case_id`` columns, which are ``text`` in the NY tables -
+    passing those through ``_pg_bigint_array`` raised ``ValueError`` on the
+    base64-style docket ids. Single quotes are doubled; the values come from
+    the database's own columns, not user input.
+    """
+    return "ARRAY[" + ",".join("'" + str(v).replace("'", "''") + "'" for v in values) + "]::text[]"
+
+
 class CaseExporter:
     """Export court cases with all related data and files."""
 
@@ -340,12 +353,12 @@ class CaseExporter:
                 document_confirmation_link_id, ocr_created,
                 ocr_transcription_id, created_at, updated_at
             FROM {self.documents_table}
-            WHERE docket_id = ANY({_pg_bigint_array(docket_ids)})
+            WHERE docket_id = ANY({_pg_text_array(docket_ids)})
             ORDER BY id
         """
         history_query = f"""
             SELECT * FROM {self.case_history_table}
-            WHERE docket_id = ANY({_pg_bigint_array(docket_ids)})
+            WHERE docket_id = ANY({_pg_text_array(docket_ids)})
             ORDER BY created_at
         """
         transcriptions_query = f"""

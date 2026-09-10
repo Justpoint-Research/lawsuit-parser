@@ -1,16 +1,31 @@
 """Batch processing of PDF documents in the case data directory."""
 
 import logging
+import multiprocessing
+import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
 
-from lawsuit_parser.parsers.pdf_parser import parse_pdf_document, save_parsed_document
+from lawsuit_parser.parsers.pdf_parser import (
+    _ensure_cuda_libs_loadable,
+    parse_pdf_document,
+    save_parsed_document,
+)
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_WORKERS = 8
+DEFAULT_NUM_THREADS = 4
+# Recycle each worker process after this many parses. Docling's ONNX/CUDA
+# sessions leak a little memory per document, and a fresh process is the
+# reliable way to reclaim it (and to recover a worker whose CUDA context
+# has gone bad - see the TableFormer "CUDA error: out of memory" storms in
+# pdf_parsing.log). None disables recycling.
+DEFAULT_MAX_TASKS_PER_CHILD = 200
 
 
 def find_all_pdfs(data_dir: Path, case_id: str | None = None) -> list[Path]:
@@ -113,6 +128,7 @@ def parse_and_save_pdf(
     output_root: Path,
     skip_existing: bool = False,
     use_gpu: bool = True,
+    num_threads: int = DEFAULT_NUM_THREADS,
 ) -> tuple[bool, str]:
     """
     Parse a single PDF and save Docling's output (.docling.json, .md).
@@ -138,6 +154,7 @@ def parse_and_save_pdf(
             data/extraction) - see get_docling_dir.
         skip_existing: Skip if Docling output already exists
         use_gpu: Use GPU acceleration
+        num_threads: CPU threads each Docling model stage may use.
 
     Returns:
         Tuple of (success: bool, message: str)
@@ -159,6 +176,7 @@ def parse_and_save_pdf(
             extract_tables=True,
             extract_images=False,
             docling_dir=docling_dir,
+            num_threads=num_threads,
         )
 
         if pdf_path.parent.name != "documents":
@@ -172,14 +190,71 @@ def parse_and_save_pdf(
         return False, f"Error: {error_msg[:100]}"
 
 
+# --- Process-pool worker plumbing ---------------------------------------
+#
+# parse_all_pdfs fans PDFs out to a ProcessPoolExecutor rather than a
+# ThreadPoolExecutor: Docling's per-file work is a mix of native ONNX/torch
+# calls (which drop the GIL) and a substantial amount of pure-Python
+# document assembly + JSON serialization (which does not), so beyond a
+# handful of threads the GIL, not the CPU, is the ceiling. Separate
+# processes each get their own interpreter, their own Docling converter,
+# and their own CUDA context, and they can be recycled to reclaim leaked
+# GPU/host memory. The trade-off is that the worker callable and its
+# arguments must be picklable - hence a module-level function taking a
+# plain tuple, instead of parse_all_pdfs's former local closure.
+
+
+def _init_worker(num_threads: int) -> None:
+    """Runs once per worker process (and again after each recycle).
+
+    Caps the BLAS/OpenMP thread pools that some of Docling's incidental
+    numpy/OpenCV work spins up. Docling's own model stages are capped
+    separately via AcceleratorOptions.num_threads (passed through
+    parse_pdf_document); this just stops the non-Docling code in each
+    process from each grabbing the whole machine.
+    """
+    for var in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[var] = str(num_threads)
+
+
+def _parse_one_job(job: tuple) -> tuple[str, bool, str, float]:
+    """Picklable worker entry point: parse one PDF, return a timed result.
+
+    Mirrors the accounting the old in-process `timed_parse` closure did -
+    wall time spent, so parse_all_pdfs can keep a skips-excluded average.
+    """
+    pdf_path, data_root, output_root, skip_existing, use_gpu, num_threads = job
+    start = time.monotonic()
+    try:
+        success, message = parse_and_save_pdf(
+            pdf_path,
+            data_root,
+            output_root,
+            skip_existing=skip_existing,
+            use_gpu=use_gpu,
+            num_threads=num_threads,
+        )
+    except Exception as e:  # defensive: never let a worker die on one file
+        success, message = False, f"Error: {str(e)[:100]}"
+    return str(pdf_path), success, message, time.monotonic() - start
+
+
 def parse_all_pdfs(
     data_dir: Path = Path("data"),
     case_id: str | None = None,
     skip_existing: bool = False,
     use_gpu: bool = True,
     progress_file: Any = None,
-    max_workers: int = 8,
+    max_workers: int = DEFAULT_WORKERS,
     output_root: Path | None = None,
+    num_threads: int = DEFAULT_NUM_THREADS,
+    max_tasks_per_child: int | None = DEFAULT_MAX_TASKS_PER_CHILD,
 ) -> dict[str, Any]:
     """
     Parse all PDFs in the data directory.
@@ -192,18 +267,21 @@ def parse_all_pdfs(
         progress_file: Stream the tqdm progress bar is written to
             (default: sys.stderr). Useful when stderr has been redirected
             elsewhere and the progress bar still needs to reach a console.
-        max_workers: Number of PDFs to parse concurrently. All workers share
-            a single cached Docling converter (see `_build_converter`), so
-            this overlaps one file's CPU-bound work (page rasterization,
-            text extraction, disk I/O) with another's GPU inference, rather
-            than spinning up separate converters/CUDA contexts per worker.
-            Set to 1 for sequential parsing. Defaults to 8; benchmarking on
-            a single GPU showed 4 workers captures most of the throughput
-            gain from overlap, with 8 adding a smaller further improvement.
+        max_workers: Number of worker processes parsing PDFs concurrently
+            (ProcessPoolExecutor). Each worker builds its own Docling
+            converter on first use. Set to 1 for sequential, in-process
+            parsing (no pool). Defaults to 8. Aim for
+            ``max_workers * num_threads`` roughly equal to the physical
+            core count.
         output_root: Root directory to write Docling output under (see
             get_docling_dir). Defaults to data_dir/"extraction", the
             sibling of data_dir/"cases" that the event-extraction pipeline
             itself reads/writes pipeline-generated artifacts under.
+        num_threads: CPU threads each worker's Docling model stages may
+            use (layout ONNX, TableFormer, OCR). Defaults to 4.
+        max_tasks_per_child: Recycle a worker process after this many
+            parses to reclaim leaked memory / reset a bad CUDA context.
+            None disables recycling. Ignored when max_workers <= 1.
 
     Returns:
         Dictionary with summary statistics, including a "failures" list of
@@ -240,6 +318,37 @@ def parse_all_pdfs(
         stats["failures"] = []
         return stats
 
+    max_workers = min(max_workers, len(pdfs))
+
+    if use_gpu and max_workers > 2:
+        # Each worker process builds its own Docling converter and its own
+        # CUDA context. Several of those running TableFormer on one GPU at
+        # once is what fills VRAM ("CUDA error: out of memory" in the log,
+        # after which that stage silently degrades). For a wide fan-out,
+        # run CPU-only (use_gpu=False) or keep max_workers small.
+        logger.warning(
+            "use_gpu=True with max_workers=%d: %d concurrent CUDA contexts "
+            "may exhaust GPU memory. Consider --no-gpu for wide parallelism.",
+            max_workers,
+            max_workers,
+        )
+
+    # onnxruntime's CUDAExecutionProvider needs CUDA runtime libs on
+    # LD_LIBRARY_PATH, which glibc only reads at process start - so this
+    # may re-exec the whole script once. Do it here, in the parent, before
+    # any worker process is started: otherwise every worker would try to
+    # re-exec *itself* on its first parse. No-op when GPU is off or the
+    # libs are already on the path. Must run before the pool is created
+    # (and before this process touches CUDA).
+    if use_gpu:
+        _ensure_cuda_libs_loadable()
+
+    # Cap incidental BLAS/OpenMP parallelism in the parent's environment so
+    # spawned workers inherit it at startup (those libs read these vars
+    # once, at import). Docling's own model stages are capped separately
+    # via num_threads; this covers the numpy/OpenCV code around them.
+    _init_worker(num_threads)
+
     # Process each PDF with progress bar
     # Seconds actually spent parsing (excludes near-instant skips), summed
     # and counted separately from tqdm's own rate - see the docstring note
@@ -247,16 +356,8 @@ def parse_all_pdfs(
     real_time_total = 0.0
     real_count = 0
 
-    def timed_parse(pdf_path: Path) -> tuple[bool, str, float]:
-        start = time.monotonic()
-        success, message = parse_and_save_pdf(
-            pdf_path,
-            data_root,
-            output_root,
-            skip_existing=skip_existing,
-            use_gpu=use_gpu,
-        )
-        return success, message, time.monotonic() - start
+    def make_job(pdf_path: Path) -> tuple:
+        return (pdf_path, data_root, output_root, skip_existing, use_gpu, num_threads)
 
     def record(pdf_path: Path, success: bool, message: str, duration: float) -> None:
         nonlocal real_time_total, real_count
@@ -292,20 +393,36 @@ def parse_all_pdfs(
     # of reacting more slowly to a genuine sustained speed change.
     with tqdm(total=len(pdfs), desc="Parsing PDFs", unit="file", file=progress_file, smoothing=0) as pbar:
         if max_workers <= 1:
+            # Sequential: parse in this process, no pool (thread caps were
+            # already applied to this process's env above).
             for pdf_path in pdfs:
-                success, message, duration = timed_parse(pdf_path)
+                _, success, message, duration = _parse_one_job(make_job(pdf_path))
                 record(pdf_path, success, message, duration)
                 update_postfix(pbar)
                 pbar.update(1)
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # "spawn", not the Linux default "fork": these workers import
+            # torch / onnxruntime / CUDA, and forking a process that has
+            # already loaded those is a known source of hangs and duplicated
+            # CUDA contexts. "spawn" is also what max_tasks_per_child
+            # requires. Costs a few seconds of interpreter+model startup per
+            # (re)spawned worker - negligible against a multi-hour batch.
+            executor_kwargs: dict[str, Any] = {
+                "max_workers": max_workers,
+                "initializer": _init_worker,
+                "initargs": (num_threads,),
+                "mp_context": multiprocessing.get_context("spawn"),
+            }
+            if max_tasks_per_child is not None:
+                executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
+            with ProcessPoolExecutor(**executor_kwargs) as executor:
                 future_to_pdf = {
-                    executor.submit(timed_parse, pdf_path): pdf_path
+                    executor.submit(_parse_one_job, make_job(pdf_path)): pdf_path
                     for pdf_path in pdfs
                 }
                 for future in as_completed(future_to_pdf):
                     pdf_path = future_to_pdf[future]
-                    success, message, duration = future.result()
+                    _, success, message, duration = future.result()
                     record(pdf_path, success, message, duration)
                     update_postfix(pbar)
                     pbar.update(1)

@@ -95,10 +95,19 @@ def _ensure_cuda_libs_loadable() -> None:
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-@lru_cache(maxsize=2)
-def _build_converter(use_gpu: bool) -> DocumentConverter:
+@lru_cache(maxsize=4)
+def _build_converter(use_gpu: bool, num_threads: int = 4) -> DocumentConverter:
     """
-    Build (and cache) the Docling converter for a given GPU setting.
+    Build (and cache) the Docling converter for a given GPU / thread setting.
+
+    ``num_threads`` caps the CPU threads each Docling model stage uses
+    (layout ONNX session's ``intra_op_num_threads``, TableFormer's
+    ``torch.set_num_threads``, OCR). When several converters run
+    concurrently - e.g. one per worker process in ``parse_all_pdfs`` - the
+    default of "one thread pool per stage sized to the whole machine"
+    oversubscribes the CPU badly (measured: 245 threads fighting over ~15
+    cores). Set this so ``workers * num_threads`` is around the physical
+    core count.
 
     Building a `DocumentConverter` re-initializes the ONNX layout and OCR
     models (session creation, HuggingFace revision lookup, CUDA context
@@ -141,6 +150,7 @@ def _build_converter(use_gpu: bool) -> DocumentConverter:
     # the GPU too - by default it only activates CUDA when the resolved
     # device string contains "cuda", so "auto" isn't enough to guarantee it.
     pipeline_options.accelerator_options.device = "cuda" if use_gpu else "cpu"
+    pipeline_options.accelerator_options.num_threads = num_threads
 
     # Initialize converter with ONNX-based layout detection
     return DocumentConverter(
@@ -158,6 +168,7 @@ def parse_pdf_document(
     save_docling_document: bool = True,
     save_markdown: bool = True,
     docling_dir: str | Path | None = None,
+    num_threads: int = 4,
 ) -> ParsedDocument:
     """
     Parse a PDF document and extract structured content.
@@ -188,6 +199,8 @@ def parse_pdf_document(
         save_markdown: Whether to save a Markdown rendering (default: True)
         docling_dir: Directory to save the Docling document and Markdown
             rendering into. Defaults to the PDF's own directory.
+        num_threads: CPU threads each Docling model stage may use (see
+            _build_converter). Default 4.
 
     Returns:
         ParsedDocument containing structured extracted content
@@ -217,7 +230,7 @@ def parse_pdf_document(
         docling_json_path = pdf_path.with_suffix(".docling.json")
         markdown_path = pdf_path.with_suffix(".md")
 
-    converter = _build_converter(use_gpu)
+    converter = _build_converter(use_gpu, num_threads)
 
     # Debug: log GPU usage setting
     import logging
