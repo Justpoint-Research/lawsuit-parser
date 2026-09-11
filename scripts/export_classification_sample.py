@@ -18,10 +18,10 @@ Usage:
 """
 
 import json
+import multiprocessing
 import shutil
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -34,9 +34,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from lawsuit_parser.parsers.batch import (
     DEFAULT_MAX_TASKS_PER_CHILD,
     DEFAULT_NUM_THREADS,
+    DEFAULT_STALL_TIMEOUT,
     DEFAULT_WORKERS,
     _init_worker,
     _parse_one_job,
+    _run_pdf_pool,
 )
 from lawsuit_parser.parsers.pdf_parser import _ensure_cuda_libs_loadable
 from lawsuit_parser.utils import CaseExporter, load_db_config
@@ -114,7 +116,13 @@ def download_selected_documents(exporter: CaseExporter, case_ids: list[int], doc
     return downloaded_paths
 
 
-def parse_pdfs(pdf_paths: list[Path], workers: int, use_gpu: bool, threads_per_worker: int) -> dict:
+def parse_pdfs(
+    pdf_paths: list[Path],
+    workers: int,
+    use_gpu: bool,
+    threads_per_worker: int,
+    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
+) -> dict:
     data_root = Path("data/cases")
     output_root = Path("data/extraction")
 
@@ -128,36 +136,41 @@ def parse_pdfs(pdf_paths: list[Path], workers: int, use_gpu: bool, threads_per_w
     def make_job(pdf_path: Path) -> tuple:
         return (pdf_path, data_root, output_root, True, use_gpu, threads_per_worker)
 
+    def record(pdf_path: Path, success: bool, message: str, duration: float) -> None:
+        if "Skipped" in message:
+            stats["skipped"] += 1
+        elif success:
+            stats["success"] += 1
+        else:
+            stats["failed"] += 1
+            failures.append((str(pdf_path), message))
+
+    def update_postfix(pbar: tqdm) -> None:
+        pbar.set_postfix(success=stats["success"], failed=stats["failed"], skipped=stats["skipped"])
+
     with tqdm(total=len(pdf_paths), desc="Parsing PDFs", unit="file") as pbar:
         if workers <= 1:
             for pdf_path in pdf_paths:
-                _, success, message, _ = _parse_one_job(make_job(pdf_path))
-                if "Skipped" in message:
-                    stats["skipped"] += 1
-                elif success:
-                    stats["success"] += 1
-                else:
-                    stats["failed"] += 1
-                    failures.append((str(pdf_path), message))
+                _, success, message, duration = _parse_one_job(make_job(pdf_path))
+                record(pdf_path, success, message, duration)
+                update_postfix(pbar)
                 pbar.update(1)
         else:
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_worker,
-                initargs=(threads_per_worker,),
-                max_tasks_per_child=DEFAULT_MAX_TASKS_PER_CHILD,
-            ) as pool:
-                futures = {pool.submit(_parse_one_job, make_job(p)): p for p in pdf_paths}
-                for future in as_completed(futures):
-                    _, success, message, _ = future.result()
-                    if "Skipped" in message:
-                        stats["skipped"] += 1
-                    elif success:
-                        stats["success"] += 1
-                    else:
-                        stats["failed"] += 1
-                        failures.append((str(futures[future]), message))
-                    pbar.update(1)
+            # Same pool logic as parse_all_pdfs.py (see batch._run_pdf_pool):
+            # "spawn" context (safe with torch/CUDA already loaded), worker
+            # recycling via max_tasks_per_child, and a stall watchdog that
+            # kills and restarts the pool if workers die and
+            # ProcessPoolExecutor fails to notice/replace them - the plain
+            # ProcessPoolExecutor + as_completed loop this used to run had
+            # none of that and would hang forever once workers died.
+            executor_kwargs = {
+                "max_workers": workers,
+                "initializer": _init_worker,
+                "initargs": (threads_per_worker,),
+                "mp_context": multiprocessing.get_context("spawn"),
+                "max_tasks_per_child": DEFAULT_MAX_TASKS_PER_CHILD,
+            }
+            _run_pdf_pool(pdf_paths, make_job, record, update_postfix, pbar, executor_kwargs, stall_timeout)
 
     stats["failures"] = failures
     return stats
@@ -168,7 +181,15 @@ def parse_pdfs(pdf_paths: list[Path], workers: int, use_gpu: bool, threads_per_w
 @click.option("--threads-per-worker", type=int, default=4, help="CPU threads per worker (default: 4)")
 @click.option("--no-gpu", is_flag=True, help="Disable GPU for Docling parsing")
 @click.option("--skip-download", is_flag=True, help="Skip the GCS download phase, only parse what's already on disk for the sample")
-def main(workers: int, threads_per_worker: int, no_gpu: bool, skip_download: bool):
+@click.option(
+    "--stall-timeout",
+    type=int,
+    default=DEFAULT_STALL_TIMEOUT,
+    help="If no file finishes within this many seconds while work is still "
+    "outstanding, kill the worker pool and start a fresh one for the "
+    f"remaining files instead of hanging forever (default: {DEFAULT_STALL_TIMEOUT}).",
+)
+def main(workers: int, threads_per_worker: int, no_gpu: bool, skip_download: bool, stall_timeout: int):
     sample = json.load(open(SAMPLE_IDS_PATH))
     doc_selection = json.load(open(DOC_SELECTION_PATH))
     positive_ids = set(sample["positive_ids"])
@@ -190,7 +211,13 @@ def main(workers: int, threads_per_worker: int, no_gpu: bool, skip_download: boo
         print(f"Found {len(pdf_paths)} PDFs already on disk for this sample")
 
     t0 = time.monotonic()
-    stats = parse_pdfs(pdf_paths, workers=workers, use_gpu=not no_gpu, threads_per_worker=threads_per_worker)
+    stats = parse_pdfs(
+        pdf_paths,
+        workers=workers,
+        use_gpu=not no_gpu,
+        threads_per_worker=threads_per_worker,
+        stall_timeout=stall_timeout,
+    )
     elapsed = time.monotonic() - t0
     print(
         f"Parsed {stats['success']}/{stats['total']} files "
