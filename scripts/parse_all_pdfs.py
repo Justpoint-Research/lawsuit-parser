@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 import click
+import psutil
 
 # Add parent directory to path to import lawsuit_parser
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -41,6 +42,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from lawsuit_parser.parsers import parse_all_pdfs
 
 LOG_FILE = Path("pdf_parsing.log")
+
+# Each worker loads its own Docling/torch models and can use several GB of
+# RSS; starting a run while another one (or its leftover orphaned workers)
+# is still holding memory risks the OOM killer taking out workers
+# mid-parse, which leaves ProcessPoolExecutor hung forever instead of
+# raising. Refuse to start at all if there isn't enough headroom.
+MIN_AVAILABLE_RAM_GB = 10
 
 
 def configure_logging(log_path: Path) -> None:
@@ -144,6 +152,14 @@ def quiet_console(log_path: Path):
     help='Recycle a worker process after this many parses to reclaim leaked '
          'memory / reset a bad CUDA context (default: 200; 0 disables).'
 )
+@click.option(
+    '--stall-timeout',
+    type=int,
+    default=120,
+    help='If no file finishes within this many seconds while work is still '
+         'outstanding, kill the worker pool and start a fresh one for the '
+         'remaining files instead of hanging forever (default: 120).'
+)
 def main(
     data_dir: str,
     case_id: str | None,
@@ -152,6 +168,7 @@ def main(
     workers: int,
     threads_per_worker: int,
     max_tasks_per_child: int,
+    stall_timeout: int,
 ):
     """Parse all PDF documents and extract structured content.
 
@@ -181,6 +198,17 @@ def main(
 
       python scripts/parse_all_pdfs.py --no-gpu --workers 8 --threads-per-worker 4
     """
+    available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    if available_gb < MIN_AVAILABLE_RAM_GB:
+        click.echo(
+            f"Refusing to start: only {available_gb:.1f} GB RAM available, "
+            f"need at least {MIN_AVAILABLE_RAM_GB} GB. Check for another "
+            "parse_all_pdfs.py run (or leftover worker processes from a "
+            "crashed one) still holding memory.",
+            err=True,
+        )
+        sys.exit(1)
+
     # Convert to Path objects
     data_dir_path = Path(data_dir)
 
@@ -196,6 +224,7 @@ def main(
             max_workers=workers,
             num_threads=threads_per_worker,
             max_tasks_per_child=max_tasks_per_child or None,
+            stall_timeout=stall_timeout,
         )
 
     # Back on the real console: report the outcome.

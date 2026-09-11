@@ -1,10 +1,11 @@
 """Batch processing of PDF documents in the case data directory."""
 
 import logging
+import math
 import multiprocessing
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,29 @@ DEFAULT_NUM_THREADS = 4
 # has gone bad - see the TableFormer "CUDA error: out of memory" storms in
 # pdf_parsing.log). None disables recycling.
 DEFAULT_MAX_TASKS_PER_CHILD = 200
+# If no file finishes within this many seconds while work is still
+# outstanding, the pool is treated as frozen (observed: all of a
+# ProcessPoolExecutor's workers vanish - OOM-killed, or lost to a worker-
+# recycling race - while its manager thread never notices, so it hangs
+# forever with no CPU use and no error). Rather than hang, kill whatever's
+# left of that pool and start a fresh one for the remaining files. Kept
+# short (rather than e.g. 600s) because _top_up_workers below already
+# handles the common case (the pool merely shrinking) - this timeout only
+# needs to catch the pool going fully idle/frozen.
+DEFAULT_STALL_TIMEOUT = 120
+# How often the stall watchdog checks for progress, and how often
+# _top_up_workers gets a chance to notice and replace missing workers.
+# Also the maximum extra delay before a stall is noticed.
+_STALL_POLL_SECONDS = 30
+# Give up (report the still-outstanding files as failed) rather than
+# restart forever if the pool freezes this many times in a row - most
+# likely a poison-pill file that reproduces the freeze on every retry.
+_MAX_CONSECUTIVE_STALLS = 5
+# Fraction of the requested max_workers below which _top_up_workers
+# spawns replacements rather than waiting for the pool to fully stall.
+# 0.8 of a --workers 27 run is 22 - the threshold observed in production
+# to still catch a decaying pool well before it stalls out entirely.
+_WORKER_TOPUP_FRACTION = 0.8
 
 
 def find_all_pdfs(data_dir: Path, case_id: str | None = None) -> list[Path]:
@@ -245,6 +269,142 @@ def _parse_one_job(job: tuple) -> tuple[str, bool, str, float]:
     return str(pdf_path), success, message, time.monotonic() - start
 
 
+def _force_kill_executor(executor: ProcessPoolExecutor) -> None:
+    """Kill every worker process a (presumed frozen) executor still tracks,
+    then abandon it without a normal blocking shutdown.
+
+    A regular `executor.shutdown(wait=True)` (or the pool's own `__exit__`)
+    would just hang again here: it waits on the same manager thread that's
+    already stuck, and on workers that may still be alive but wedged
+    rather than dead. Killing (not terminate - a wedged worker may be
+    stuck somewhere that ignores SIGTERM) every worker process directly is
+    what actually unwedges things.
+    """
+    for process in list(executor._processes.values()):
+        if process.is_alive():
+            process.kill()
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _top_up_workers(executor: ProcessPoolExecutor) -> None:
+    """Spawn replacement worker processes directly if the live count has
+    fallen below _WORKER_TOPUP_FRACTION of max_workers.
+
+    ProcessPoolExecutor is supposed to replace an exited worker itself -
+    its manager thread calls _adjust_process_count() whenever a worker
+    process exits - but that replacement has been observed to go missing
+    (see DEFAULT_STALL_TIMEOUT's comment on the worker-recycling race): a
+    recycled (max_tasks_per_child) or killed worker's exit goes unnoticed,
+    so the pool quietly shrinks instead of staying at max_workers. Calling
+    executor._spawn_process() directly here, rather than the executor's
+    own _adjust_process_count(), sidesteps whatever internal bookkeeping
+    (_idle_worker_semaphore) is losing track of the exit.
+    """
+    min_workers = max(1, math.ceil(executor._max_workers * _WORKER_TOPUP_FRACTION))
+    with executor._shutdown_lock:
+        # Drop entries for workers that already died, in case the manager
+        # thread never noticed the exit and so never pruned them itself -
+        # otherwise a dead-but-still-listed process would be miscounted
+        # as live below.
+        for pid, process in list(executor._processes.items()):
+            if not process.is_alive():
+                del executor._processes[pid]
+
+        live = len(executor._processes)
+        if live >= min_workers:
+            return
+        spawned = 0
+        while len(executor._processes) < executor._max_workers:
+            executor._spawn_process()
+            spawned += 1
+
+    logger.warning(
+        "Worker pool had only %d/%d live workers (below the top-up "
+        "threshold of %d) - spawned %d replacement worker(s)",
+        live, executor._max_workers, min_workers, spawned,
+    )
+
+
+def _run_pdf_pool(
+    pdfs: list[Path],
+    make_job,
+    record,
+    update_postfix,
+    pbar: tqdm,
+    executor_kwargs: dict[str, Any],
+    stall_timeout: float,
+    worker_fn=_parse_one_job,
+) -> None:
+    """Parse `pdfs` across a ProcessPoolExecutor, restarting the pool from
+    scratch (against whatever files are still outstanding) if it ever goes
+    stall_timeout seconds without finishing a single file.
+
+    See DEFAULT_STALL_TIMEOUT's comment for why this exists: a frozen pool
+    otherwise hangs forever with no CPU use and no error.
+
+    worker_fn defaults to the real `_parse_one_job` - overridable so this
+    can be exercised against a cheap dummy callable instead of a real PDF
+    parse.
+    """
+    remaining = {pdf_path: make_job(pdf_path) for pdf_path in pdfs}
+    consecutive_stalls = 0
+
+    while remaining:
+        executor = ProcessPoolExecutor(**executor_kwargs)
+        future_to_pdf = {
+            executor.submit(worker_fn, job): pdf_path
+            for pdf_path, job in remaining.items()
+        }
+        pending = set(future_to_pdf)
+        last_progress = time.monotonic()
+        stalled = False
+        try:
+            while pending:
+                done, pending = wait(pending, timeout=_STALL_POLL_SECONDS, return_when=FIRST_COMPLETED)
+                if done:
+                    last_progress = time.monotonic()
+                    consecutive_stalls = 0
+                    for future in done:
+                        pdf_path = future_to_pdf[future]
+                        try:
+                            _, success, message, duration = future.result()
+                        except Exception as e:
+                            success, message, duration = False, f"Error: {str(e)[:100]}", 0.0
+                        record(pdf_path, success, message, duration)
+                        update_postfix(pbar)
+                        pbar.update(1)
+                        del remaining[pdf_path]
+                elif time.monotonic() - last_progress > stall_timeout:
+                    consecutive_stalls += 1
+                    logger.warning(
+                        "No file finished in %ds with %d still outstanding "
+                        "(stall %d/%d) - worker pool looks frozen, killing "
+                        "it and restarting",
+                        stall_timeout, len(pending), consecutive_stalls, _MAX_CONSECUTIVE_STALLS,
+                    )
+                    stalled = True
+                    break
+
+                _top_up_workers(executor)
+        finally:
+            if stalled:
+                _force_kill_executor(executor)
+            else:
+                executor.shutdown(wait=True)
+
+        if stalled and consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+            logger.error(
+                "Worker pool froze %d times in a row - giving up on the "
+                "%d file(s) still outstanding",
+                consecutive_stalls, len(remaining),
+            )
+            for pdf_path in remaining:
+                record(pdf_path, False, "Error: worker pool repeatedly froze on this batch", 0.0)
+                update_postfix(pbar)
+                pbar.update(1)
+            return
+
+
 def parse_all_pdfs(
     data_dir: Path = Path("data"),
     case_id: str | None = None,
@@ -255,6 +415,7 @@ def parse_all_pdfs(
     output_root: Path | None = None,
     num_threads: int = DEFAULT_NUM_THREADS,
     max_tasks_per_child: int | None = DEFAULT_MAX_TASKS_PER_CHILD,
+    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
 ) -> dict[str, Any]:
     """
     Parse all PDFs in the data directory.
@@ -282,6 +443,10 @@ def parse_all_pdfs(
         max_tasks_per_child: Recycle a worker process after this many
             parses to reclaim leaked memory / reset a bad CUDA context.
             None disables recycling. Ignored when max_workers <= 1.
+        stall_timeout: If no file finishes within this many seconds while
+            work is still outstanding, kill the worker pool and start a
+            fresh one for the remaining files instead of hanging forever.
+            Ignored when max_workers <= 1.
 
     Returns:
         Dictionary with summary statistics, including a "failures" list of
@@ -415,17 +580,7 @@ def parse_all_pdfs(
             }
             if max_tasks_per_child is not None:
                 executor_kwargs["max_tasks_per_child"] = max_tasks_per_child
-            with ProcessPoolExecutor(**executor_kwargs) as executor:
-                future_to_pdf = {
-                    executor.submit(_parse_one_job, make_job(pdf_path)): pdf_path
-                    for pdf_path in pdfs
-                }
-                for future in as_completed(future_to_pdf):
-                    pdf_path = future_to_pdf[future]
-                    _, success, message, duration = future.result()
-                    record(pdf_path, success, message, duration)
-                    update_postfix(pbar)
-                    pbar.update(1)
+            _run_pdf_pool(pdfs, make_job, record, update_postfix, pbar, executor_kwargs, stall_timeout)
 
     # Log summary
     logger.info("\n" + "="*60)
