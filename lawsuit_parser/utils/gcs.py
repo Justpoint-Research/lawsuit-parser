@@ -32,7 +32,11 @@ def extract_blob_name(gcs_path: str) -> str | None:
     Returns:
         Blob name or None if not extractable.
     """
-    if not gcs_path:
+    # Bulk exports source document rows from a pandas DataFrame, so a SQL NULL
+    # arrives here as float('nan') rather than None - guard non-str inputs so
+    # callers don't have to (nan is truthy, so `if not gcs_path` alone lets it
+    # through to the .startswith call below).
+    if not gcs_path or not isinstance(gcs_path, str):
         return None
 
     # Handle gs:// URLs

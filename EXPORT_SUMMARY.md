@@ -8,7 +8,7 @@ Everything is prepared. The export system is **production-ready** with full resu
 
 ```bash
 # When ready, just run:
-bash export_ny_all_cases.sh
+bash scripts/export_ny_all_cases.sh
 ```
 
 That's it! The script handles everything:
@@ -31,14 +31,14 @@ Exporting cases: 42%|████████████▌             | 4805/
 
 | File | Purpose |
 |------|---------|
-| `export_ny_all_cases.sh` | **Main export script** - run this |
+| `scripts/export_ny_all_cases.sh` | **Main export script** - run this |
 | `ny_case_ids.txt` | All 11,435 case IDs ready to export |
 | `EXPORT_READY.md` | Quick reference guide |
 | `PROGRESS_BAR.md` | Progress bar documentation |
 | `RESUME_CAPABILITY.md` | Resume/interruption handling |
 | `TEST_RESUME.md` | Resume capability verification |
 | `verify_resume.sh` | Check current export status |
-| `clean_partial_export.sh` | Reset for fresh start (optional) |
+| `scripts/clean_partial_export.sh` | Reset for fresh start (optional) |
 | `NY_FULL_EXPORT_INSTRUCTIONS.md` | Detailed documentation |
 | `MULTISTATE_EXPORT_CHANGES.md` | Technical implementation details |
 
@@ -100,7 +100,7 @@ Run `bash verify_resume.sh` to check status.
 
 ### Start/Resume Export
 ```bash
-bash export_ny_all_cases.sh
+bash scripts/export_ny_all_cases.sh
 ```
 
 ### Check Status
@@ -115,8 +115,8 @@ bash verify_resume.sh
 
 ### Clean and Restart
 ```bash
-bash clean_partial_export.sh
-bash export_ny_all_cases.sh
+bash scripts/clean_partial_export.sh
+bash scripts/export_ny_all_cases.sh
 ```
 
 ### Monitor Disk Space
@@ -191,7 +191,7 @@ data/cases/ny_after_search/
 
 ### Starting Fresh
 ```bash
-$ bash export_ny_all_cases.sh
+$ bash scripts/export_ny_all_cases.sh
 
 ================================================================================
 Court Case Exporter
@@ -242,7 +242,7 @@ Export complete!
 1. Ensure 150+ GB disk space free
 2. Verify Cloud SQL Proxy running (port 5433)
 3. Check GCS authentication: `gcloud auth list`
-4. Run: `bash export_ny_all_cases.sh`
+4. Run: `bash scripts/export_ny_all_cases.sh`
 5. Monitor progress bar
 6. Wait ~9-12 hours (or run overnight)
 
@@ -276,12 +276,12 @@ All documentation available:
 The NY case export system is **production-ready**:
 
 ✅ **Code**: Tested and working (107 cases exported successfully)
-✅ **Scripts**: Ready to run (`export_ny_all_cases.sh`)
+✅ **Scripts**: Ready to run (`scripts/export_ny_all_cases.sh`)
 ✅ **Resume**: Fully implemented (case + PDF level)
 ✅ **Progress**: tqdm bar with ETA
 ✅ **Documentation**: Comprehensive guides
 ✅ **Multi-state**: Works for NY, FL, IL, CA
 
-**To run**: `bash export_ny_all_cases.sh` when ready
+**To run**: `bash scripts/export_ny_all_cases.sh` when ready
 
 **Estimated completion**: 9-12 hours for all 11,435 NY cases

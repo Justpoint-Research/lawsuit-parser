@@ -7,8 +7,8 @@ Everything is prepared and ready for the full NY export. **Do not run yet** - ju
 ## Files Prepared
 
 1. **ny_case_ids.txt** - All 11,435 case IDs (58KB)
-2. **export_ny_all_cases.sh** - Ready-to-run export script
-3. **clean_partial_export.sh** - Clean up partial exports (if needed)
+2. **scripts/export_ny_all_cases.sh** - Ready-to-run export script
+3. **scripts/clean_partial_export.sh** - Clean up partial exports (if needed)
 4. **NY_FULL_EXPORT_INSTRUCTIONS.md** - Detailed documentation
 5. **MULTISTATE_EXPORT_CHANGES.md** - Technical changes summary
 
@@ -36,15 +36,15 @@ This means you can:
 Will automatically skip the 107 already exported cases and continue:
 
 ```bash
-bash export_ny_all_cases.sh
+bash scripts/export_ny_all_cases.sh
 ```
 
 ### Option 2: Start Fresh
 Clean partial exports and start from scratch:
 
 ```bash
-bash clean_partial_export.sh
-bash export_ny_all_cases.sh
+bash scripts/clean_partial_export.sh
+bash scripts/export_ny_all_cases.sh
 ```
 
 ### Option 3: Manual Command

@@ -1,4 +1,5 @@
 [core]
     remote = storage
+    autostage = true
 ['remote "storage"']
     url = gs://ml_dvc_storage_lawsuit_parser/data

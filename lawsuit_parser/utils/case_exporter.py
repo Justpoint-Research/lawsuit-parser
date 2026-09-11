@@ -56,6 +56,22 @@ def _pg_text_array(values: list[str]) -> str:
     return "ARRAY[" + ",".join("'" + str(v).replace("'", "''") + "'" for v in values) + "]::text[]"
 
 
+def _blob_path(value: Any) -> str | None:
+    """Normalise a DB-sourced GCS path to a usable string, or None.
+
+    export_cases_bulk builds document dicts from a pandas DataFrame, so a SQL
+    NULL in ``document_bucket_link`` / ``document_confirmation_bucket_link``
+    arrives as ``float('nan')`` rather than ``None``. ``nan`` is truthy, so a
+    bare ``if doc.get("document_bucket_link"):`` check passes it straight
+    through to ``extract_blob_name``, which then calls ``.startswith`` on a
+    float and raises ``'float' object has no attribute 'startswith'`` - the
+    whole case export then fails, leaving an empty ``case_<id>/`` directory.
+    (export_case_by_id sources rows via SQLAlchemy, where NULL is already
+    ``None``, so it was never affected.)
+    """
+    return value if isinstance(value, str) and value else None
+
+
 class CaseExporter:
     """Export court cases with all related data and files."""
 
@@ -467,23 +483,19 @@ class CaseExporter:
             # DB only stores a relative blob path, e.g.
             # "document_link/document_xyz.pdf" - the URI is what a
             # metadata-only export needs to download the file later).
-            if doc.get("document_bucket_link"):
-                filename = self._extract_filename_from_gcs_path(
-                    doc["document_bucket_link"]
-                )
+            # _blob_path normalises a missing link (None, or float('nan') from
+            # a pandas-sourced row) to None so it's skipped cleanly.
+            document_link = _blob_path(doc.get("document_bucket_link"))
+            if document_link:
+                filename = self._extract_filename_from_gcs_path(document_link)
                 processed_doc["local_document_path"] = f"documents/{filename}"
-                processed_doc["gcs_document_uri"] = self._to_gcs_uri(
-                    doc["document_bucket_link"]
-                )
+                processed_doc["gcs_document_uri"] = self._to_gcs_uri(document_link)
 
-            if doc.get("document_confirmation_bucket_link"):
-                filename = self._extract_filename_from_gcs_path(
-                    doc["document_confirmation_bucket_link"]
-                )
+            confirmation_link = _blob_path(doc.get("document_confirmation_bucket_link"))
+            if confirmation_link:
+                filename = self._extract_filename_from_gcs_path(confirmation_link)
                 processed_doc["local_confirmation_path"] = f"confirmations/{filename}"
-                processed_doc["gcs_confirmation_uri"] = self._to_gcs_uri(
-                    doc["document_confirmation_bucket_link"]
-                )
+                processed_doc["gcs_confirmation_uri"] = self._to_gcs_uri(confirmation_link)
 
             processed_doc["transcriptions"] = transcriptions_by_doc.get(doc["id"], [])
 
@@ -544,8 +556,8 @@ class CaseExporter:
             doc_metadata = {}
 
             # Download main document
-            if doc.get("document_bucket_link"):
-                gcs_path = doc["document_bucket_link"]
+            gcs_path = _blob_path(doc.get("document_bucket_link"))
+            if gcs_path:
                 filename = self._extract_filename_from_gcs_path(gcs_path)
                 local_path = docs_dir / filename
 
@@ -559,8 +571,8 @@ class CaseExporter:
                     logger.warning(f"Failed to download {gcs_path}: {e}")
 
             # Download confirmation document
-            if doc.get("document_confirmation_bucket_link"):
-                gcs_path = doc["document_confirmation_bucket_link"]
+            gcs_path = _blob_path(doc.get("document_confirmation_bucket_link"))
+            if gcs_path:
                 filename = self._extract_filename_from_gcs_path(gcs_path)
                 local_path = confirm_dir / filename
 
@@ -652,6 +664,21 @@ class CaseExporter:
 
         return text_paths_by_doc
 
+    def _with_state_prefix(self, blob_name: str) -> str:
+        """Prefix a blob name with the state code (e.g., "ny/document_link/...").
+
+        Some rows in the docket_documents table already store
+        document_bucket_link/document_confirmation_bucket_link with the
+        state prefix baked in (~22% of rows, seen across at least NY) while
+        most store it bare - unconditionally prepending state_code on the
+        already-prefixed ones produced a doubled "ny/ny/..." blob name that
+        404s, silently dropping ~1 in 5 downloads. Only add the prefix when
+        it isn't already there.
+        """
+        if not self.state_code or blob_name.startswith(f"{self.state_code}/"):
+            return blob_name
+        return f"{self.state_code}/{blob_name}"
+
     def download_from_gcs_to_file(self, gcs_path: str, local_path: Path):
         """Download a file from GCS to local path.
 
@@ -668,9 +695,7 @@ class CaseExporter:
         if not blob_name:
             return
 
-        # Prefix with state code (e.g., "ny/document_link/...")
-        if self.state_code:
-            blob_name = f"{self.state_code}/{blob_name}"
+        blob_name = self._with_state_prefix(blob_name)
 
         # Download from GCS
         blob = self.bucket.blob(blob_name)
@@ -698,9 +723,7 @@ class CaseExporter:
         if not blob_name:
             raise Exception(f"Could not extract blob name from {gcs_path}")
 
-        # Prefix with state code (e.g., "ny/document_link/...")
-        if self.state_code:
-            blob_name = f"{self.state_code}/{blob_name}"
+        blob_name = self._with_state_prefix(blob_name)
 
         # Download from GCS
         blob = self.bucket.blob(blob_name)
@@ -730,8 +753,7 @@ class CaseExporter:
         blob_name = extract_blob_name(gcs_path)
         if not blob_name:
             return None
-        if self.state_code:
-            blob_name = f"{self.state_code}/{blob_name}"
+        blob_name = self._with_state_prefix(blob_name)
         return f"gs://{self.gcs_bucket_name}/{blob_name}"
 
     def _extract_filename_from_gcs_path(self, gcs_path: str) -> str:
@@ -749,7 +771,7 @@ class CaseExporter:
             # Fallback to hash of path
             import hashlib
 
-            return f"file_{hashlib.md5(gcs_path.encode()).hexdigest()}.pdf"
+            return f"file_{hashlib.md5(str(gcs_path).encode()).hexdigest()}.pdf"
 
         # Get last part of path
         filename = blob_name.split("/")[-1]

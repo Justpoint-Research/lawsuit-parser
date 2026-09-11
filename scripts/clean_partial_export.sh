@@ -14,10 +14,10 @@ if [ "$confirm" = "yes" ]; then
     echo "✓ Deleted"
     echo ""
     echo "Ready for fresh export. Run:"
-    echo "  bash export_ny_all_cases.sh"
+    echo "  bash scripts/export_ny_all_cases.sh"
 else
     echo "Cancelled. No files deleted."
     echo ""
     echo "To resume export (skip completed cases):"
-    echo "  bash export_ny_all_cases.sh"
+    echo "  bash scripts/export_ny_all_cases.sh"
 fi
