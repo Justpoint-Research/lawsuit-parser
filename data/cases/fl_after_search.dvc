@@ -1,0 +1,6 @@
+outs:
+- md5: 71eba0d22daa90edde7bbab40f8deda1.dir
+  size: 1908500
+  nfiles: 469
+  hash: md5
+  path: fl_after_search

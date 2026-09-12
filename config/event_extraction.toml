@@ -195,7 +195,7 @@ min_confidence = 0.7
 # data/cases/<source>/<case_id>/. Swap or extend this list to change the
 # training-data pool without touching code (e.g. add "ny_after_search" or
 # "mdl" once those sources have a compatible case layout / are ready to use).
-case_sources = ["ny_sample"]
+case_sources = ["ny_classification"]
 
 # Use LLM for zero-shot classification (generates training data)
 use_llm_classifier = true

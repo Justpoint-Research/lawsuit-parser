@@ -1,0 +1,6 @@
+outs:
+- md5: ad41af4e0dfdd94f2a7d89bbc4a79272.dir
+  size: 97031871
+  nfiles: 498
+  hash: md5
+  path: mdl

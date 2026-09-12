@@ -221,8 +221,8 @@ secrets.toml
 !config/secrets.toml.example
 
 # Data directory and cache
-/data
 !data/.gitkeep
+/data/cache/
 
 # Logs directory
 /logs

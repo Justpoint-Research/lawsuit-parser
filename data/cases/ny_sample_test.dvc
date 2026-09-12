@@ -1,0 +1,6 @@
+outs:
+- md5: b45abdaa357f39f61dd7599faadfe238.dir
+  size: 1080213
+  nfiles: 7
+  hash: md5
+  path: ny_sample_test

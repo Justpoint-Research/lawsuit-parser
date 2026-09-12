@@ -1,0 +1,5 @@
+outs:
+- md5: bd3c1755d993225404d59efead8d7a50
+  size: 1766
+  hash: md5
+  path: truncated_pdfs.txt

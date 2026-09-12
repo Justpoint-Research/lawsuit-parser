@@ -1,0 +1,6 @@
+outs:
+- md5: 9b221ce222d89425810666863eefcd9f.dir
+  size: 3113522837
+  nfiles: 34096
+  hash: md5
+  path: ny_classification

@@ -1,5 +1,9 @@
 [core]
     remote = storage
     autostage = true
+[cache]
+    type = hardlink,symlink
+    protected = true
 ['remote "storage"']
     url = gs://ml_dvc_storage_lawsuit_parser/data
+    jobs = 32
