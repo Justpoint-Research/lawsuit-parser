@@ -1,516 +1,222 @@
 # Lawsuit Classification System
 
-A two-stage classification system for categorizing lawsuits into multiple labels:
-- **Product Liability**: Defective or dangerous product claims
-- **Personal Injury**: Physical or emotional harm claims
-- **Class Action**: Lawsuits on behalf of a larger group
-
-## Architecture
-
-### Stage 1: Zero-Shot LLM Classifier (Training Data Generation)
-Uses Qwen/Ollama to analyze case documents and metadata, generating labeled training data.
-
-**Input**:
-- Case metadata (caption, court, case type, document names)
-- Document text (first N pages of initial filings)
-
-**Output**:
-- JSON file with multilabel classifications
-- Confidence scores and reasoning for each label
-
-### Stage 2: BERT-Based Classifier (Fast Inference)
-Trains a Legal-BERT model on LLM-generated training data for fast classification.
-
-**Advantages**:
-- 10-100x faster than LLM approach
-- Consistent latency
-- No API dependencies
-- Can run on CPU or GPU
+Multilabel classification of cases into `product_liability`, `personal_injury`, `class_action`
+(config's `[lawsuit_classification].categories`). Two stages: an LLM generates labeled training
+data, then a BERT model is fine-tuned on it for fast inference.
 
 ## Configuration
 
-All settings are in `config/event_extraction.toml`:
+All settings live in `config/event_extraction.toml` under `[lawsuit_classification]`:
 
 ```toml
-[lawsuit_classification]
-# LLM settings for zero-shot classification
-llm_backend = "ollama"
+case_sources = ["ny_classification"]   # data/cases/<source>/ dirs to pull cases from
+llm_providers = ["ollama"]             # providers queried when --providers isn't passed
 llm_model = "qwen3:30b-a3b"
 llm_base_url = "http://localhost:11434"
+anthropic_model = "claude-sonnet-5"    # only called if named in --providers/llm_providers
+gemini_model = "gemini-2.5-flash"      # via Vertex AI, ADC auth
 
-# Document selection
-classification_page_count = 3      # Pages per document
-classification_doc_count = 2       # Documents per case
-
-# Categories
-categories = [
-    "product_liability",
-    "personal_injury",
-    "class_action"
-]
-
-# Confidence threshold
+classification_page_count = 3          # cap on any single doc's text (not a doc-count cap)
+max_text_chars = 100000                # hard cap on total prompt text per case
 min_confidence = 0.6
 
-# BERT model settings
 bert_model = "nlpaueb/legal-bert-base-uncased"
 bert_max_length = 512
-bert_batch_size = 8
-
-# Paths
 training_data_path = "data/classification/training_data.json"
+reconciled_training_data_path = "data/classification/reconciled_training_data.json"
 model_save_path = "data/classification/bert_classifier"
+case_summaries_path = "data/classification/case_summaries.json"
 ```
 
-Prompts are in `config/llm_prompts.toml` under `[lawsuit_classification]`.
+`case_sources` is the scope for `zero_shot_classifier.py`/`summarize_cases_for_classification.py`
+when no case IDs are given on the CLI - it globs **every** case directory under each listed
+source, not a curated subset. Cloud providers (`anthropic`, `gemini`) cost money per call and are
+only queried when named explicitly via `--providers` or `llm_providers`.
+
+Prompts are in `config/llm_prompts.toml` under `[lawsuit_classification]` /
+`[classification_summary]`.
+
+## Building a scoped sample (recommended over classifying a whole source)
+
+`case_sources` directories can hold tens of thousands of cases; classifying all of them wastes
+LLM calls. `scripts/build_classification_sample.py` reads `data/cases/ny_after_search` (metadata
+only, no DB/network needed) and picks a stratified sample - positive: product-liability/personal-
+injury case types + caption class-action matches; negative: spread across other `case_type`
+buckets - writing `data/classification_sample_ids.json` (`positive_ids`/`negative_ids`).
+
+`scripts/export_classification_sample.py` then downloads (earliest N docs per case, per
+`data/classification_sample_doc_selection.json`) and Docling-parses exactly that sample:
+
+```bash
+uv run python scripts/export_classification_sample.py --no-gpu --workers 8
+
+# Already downloaded, e.g. from a bulk export - just (re-)parse:
+uv run python scripts/export_classification_sample.py --skip-download --no-gpu --workers 8
+```
+
+It writes `data/classification_labels.json` (a simple binary label per case, from the sampling
+heuristic - not an LLM judgment) and Docling output under `data/extraction/<source>/case_<id>/`.
+
+**Gotcha:** once a sample is built, restrict every downstream step to its case IDs explicitly
+(positional args, e.g. `case_<id> case_<id> ...`) rather than relying on `case_sources` scoping -
+otherwise a run sweeps in every case under the source, not just the sample. A case classified
+before its Docling parse finishes still gets a result (weak: metadata document-names only, no real
+text) that counts as "done" and won't be redone by a later default run - only `--force` fixes it.
 
 ## Usage
 
 ### Step 1: Generate Training Data with LLM
 
-Classify cases using Qwen/Ollama to generate labeled training data:
-
 ```bash
-# Classify all cases
-python scripts/zero_shot_classifier.py
+# Classify specific cases (recommended - see Gotcha above); --limit defaults to 50, use 0 for no cap
+uv run python scripts/zero_shot_classifier.py case_95 case_227 --providers ollama --limit 0
 
-# Classify specific cases
-python scripts/zero_shot_classifier.py case_95 case_227
+# Add a second provider's results to the same cases (kept side by side under provider_results)
+uv run python scripts/zero_shot_classifier.py case_95 case_227 --providers anthropic
 
-# Force re-classification
-python scripts/zero_shot_classifier.py --force
-
-# Custom output path
-python scripts/zero_shot_classifier.py --output data/my_training_data.json
+# Force re-classification (e.g. after fixing a weak-context case)
+uv run python scripts/zero_shot_classifier.py case_95 --providers ollama --force
 ```
 
-**Output**: `data/classification/training_data.json`
+Every document in the case is used (not a capped sample), complaint-type filings ordered first so
+truncation (`max_text_chars`) drops the least-central documents rather than the complaint.
 
-Example output structure:
+**Output**: `data/classification/training_data.json`, one entry per case:
+
 ```json
 {
-  "metadata": {
-    "created_at": "2026-09-04T...",
-    "model": "qwen3:30b-a3b",
-    "total_cases": 100,
-    "categories": ["product_liability", "personal_injury", "class_action"]
-  },
   "results": [
     {
       "case_id": "case_95",
       "caption": "BONNIE DARLING v. LOREAL USA, INC. et al",
       "court": "New York County Supreme Court",
       "case_type": "Torts - Product Liability",
-      "labels": [
-        {
-          "category": "product_liability",
-          "confidence": 0.95,
-          "reasoning": "Plaintiff alleges hair relaxer products caused harm..."
-        },
-        {
-          "category": "personal_injury",
-          "confidence": 0.88,
-          "reasoning": "Claims include physical injury and medical expenses..."
+      "documents_used": ["document_....pdf"],
+      "document_names": ["SUMMONS + COMPLAINT"],
+      "provider_results": {
+        "ollama": {
+          "labels": [
+            {"category": "product_liability", "confidence": 0.95, "reasoning": "..."}
+          ],
+          "model": "qwen3:30b-a3b",
+          "classified_at": "2026-09-04T..."
         }
-      ],
-      "classified_at": "2026-09-04T...",
-      "documents_used": ["document_..._complaint.pdf"]
+      }
     }
   ]
 }
 ```
+
+Each provider's result is stored side by side under `provider_results` so a case classified by
+Ollama today can get Claude/Gemini results added later without losing the earlier ones.
 
 ### Step 1b: Reconcile Multi-Provider Labels
 
-`zero_shot_classifier.py` stores each provider's labels separately under
-`provider_results`. Collapse them into one label set per case before
-training:
-
 ```bash
-python scripts/reconcile_classifications.py --require-all-providers
+uv run python scripts/reconcile_classifications.py --require-all-providers
 ```
 
-This writes two files:
-
-- `data/classification/reconciled.json` - a per-strategy breakdown
-  (majority / union / intersection) for inspection.
-- `data/classification/reconciled_training_data.json` - the file the BERT
-  trainer reads. By default it uses the **intersection** strategy: a
-  category is labelled `1` only when *every* provider that ran for the
-  case assigned it; any disagreement makes it `0`. Cases that end up with
-  no positive label are kept as negative examples.
-
-Use `--training-strategy majority` or `union` to bake in a looser rule.
+Writes `data/classification/reconciled.json` (majority/union/intersection breakdown for
+inspection) and `data/classification/reconciled_training_data.json` - the file the BERT trainer
+reads. Default strategy is **intersection**: a category is `1` only when every provider that ran
+for the case assigned it; use `--training-strategy majority`/`union` for a looser rule. Cases with
+no positive label are kept as negative examples.
 
 ### Step 1c: Generate Case Summaries (BERT input)
 
-The raw `text_excerpt` stored for training is only the first ~1000 characters
-of the filings - mostly caption/summons boilerplate. Instead, generate a
-dense factual summary per case with the **local Ollama model** and use that
-as the classifier's input:
+The raw `text_excerpt` in training data is only the first ~1000 characters of the filings - mostly
+boilerplate. Generate a dense factual summary per case instead:
 
 ```bash
-python scripts/summarize_cases_for_classification.py
+uv run python scripts/summarize_cases_for_classification.py
 ```
 
-- Prompt (`config/llm_prompts.toml` -> `[classification_summary]`) is
-  **label-agnostic** - it never names the categories or asks a yes/no
-  question, so the summary can't leak the label. The same prompt runs for
-  every case.
-- Each summary is measured with the **BERT tokenizer** against the exact
-  string the trainer builds and guaranteed to fit `bert_max_length`. On
-  overflow the model is re-prompted once for a shorter summary, then
-  hard-truncated as a last resort.
-- Output: `data/classification/case_summaries.json`. Resumable; re-run with
-  `--force` to regenerate. `reconcile_classifications.py` auto-merges it
-  into `reconciled_training_data.json` as a `summary` field.
+- Prompt (`[classification_summary]`) is **label-agnostic** - never names the categories or asks a
+  yes/no question, so the summary can't leak the label.
+- Measured against the **BERT tokenizer** on the exact string the trainer builds, guaranteed to
+  fit `bert_max_length`; overflow triggers one re-prompt for a shorter summary, then hard
+  truncation as a last resort.
+- Defaults to just the cases present in `training_data.json` (i.e. run this *after* Step 1, not
+  before) - pass `--all-cases` to summarize every case in `case_sources` instead.
+- Output: `data/classification/case_summaries.json`. Resumable; `--force` regenerates.
+  `reconcile_classifications.py` auto-merges it into `reconciled_training_data.json` as `summary`.
 
 ### Step 2: Train BERT Classifier
 
-Train a fast BERT model on the reconciled training data:
-
 ```bash
 # Train on the LLM summaries (recommended once Step 1c has run)
-python scripts/train_bert_classifier.py --input-field summary
+uv run python scripts/train_bert_classifier.py --input-field summary
 
-# Train with default settings - 'auto' uses the summary when present,
-# else the raw excerpt
-python scripts/train_bert_classifier.py
+# 'auto' (default): uses the summary when present, else the raw excerpt
+uv run python scripts/train_bert_classifier.py
 
-# Custom training
-python scripts/train_bert_classifier.py \
+uv run python scripts/train_bert_classifier.py \
   --data data/classification/reconciled_training_data.json \
-  --model nlpaueb/legal-bert-base-uncased \
-  --epochs 5 \
-  --batch-size 16 \
-  --learning-rate 2e-5
+  --model nlpaueb/legal-bert-base-uncased --epochs 5 --batch-size 16 --learning-rate 2e-5
 
-# Drop cases with no positive reconciled label instead of keeping them
-python scripts/train_bert_classifier.py --drop-empty
-
-# Resume from checkpoint
-python scripts/train_bert_classifier.py --resume
-
-# Evaluate only (no training)
-python scripts/train_bert_classifier.py --evaluate
+uv run python scripts/train_bert_classifier.py --drop-empty   # drop cases with no positive label
+uv run python scripts/train_bert_classifier.py --resume       # resume from checkpoint
+uv run python scripts/train_bert_classifier.py --evaluate     # evaluate only, no training
 ```
 
-**Training outputs**:
-- Trained model saved to `data/classification/bert_classifier/`
-- Includes: pytorch_model.bin, config.json, tokenizer files
-- Best model selected by F1-macro score on validation set
-
-**Expected performance** (varies by training data quality and size):
-- F1-macro: 0.75-0.90
-- Per-category F1: 0.70-0.95
-- Inference speed: ~10-50 cases/second (GPU), ~2-5 cases/second (CPU)
+Saves to `model_save_path` (`data/classification/bert_classifier/`); best checkpoint selected by
+F1-macro on the validation split.
 
 ### Step 3: Classify New Cases
 
-Use either BERT (fast) or LLM (flexible) for inference:
-
 ```bash
-# Classify with BERT (fast, requires trained model)
-python scripts/classify_lawsuit.py case_95 --use-bert
-
-# Classify with LLM (slower, no training needed)
-python scripts/classify_lawsuit.py case_95 --use-llm
-
-# Classify multiple cases
-python scripts/classify_lawsuit.py case_95 case_227 case_309 --use-bert
-
-# Classify all cases
-python scripts/classify_lawsuit.py --all --use-bert
-
-# Save results to file
-python scripts/classify_lawsuit.py --all --use-bert --output results.json
+uv run python scripts/classify_lawsuit.py case_95 --use-bert
+uv run python scripts/classify_lawsuit.py case_95 --use-llm
+uv run python scripts/classify_lawsuit.py case_95 case_227 --use-bert
+uv run python scripts/classify_lawsuit.py --all --use-bert --output results.json
 ```
 
-## Data Flow
+## Document selection
 
-```
-┌─────────────────────────────────────────────────────┐
-│ Input: Case Documents + Metadata                    │
-│ - documents/*.pdf (parsed with Docling)            │
-│ - case_*.json (database metadata)                   │
-└──────────────────┬──────────────────────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Stage 1: Zero-Shot LLM           │
-    │ (scripts/zero_shot_classifier.py)│
-    │                                   │
-    │ - Load case metadata & documents │
-    │ - Build prompt with context      │
-    │ - Call Qwen/Ollama for labels    │
-    │ - Save training data             │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Per-provider Training Data       │
-    │ (training_data.json)             │
-    │ - Case texts                     │
-    │ - provider_results (per LLM)     │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Local-LLM summaries              │
-    │ (summarize_cases_for_            │
-    │  classification.py)              │
-    │ - label-agnostic prompt          │
-    │ - fits bert_max_length           │
-    │ → case_summaries.json            │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Reconciliation + merge summary  │
-    │ (reconcile_classifications.py)   │
-    │ - intersection: unanimous = 1    │
-    │ - else 0                         │
-    │ → reconciled_training_data.json  │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Stage 2: BERT Training           │
-    │ (scripts/train_bert_classifier.py)│
-    │                                   │
-    │ - Load & split training data     │
-    │ - Fine-tune Legal-BERT           │
-    │ - Validate & save best model     │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Trained Model                    │
-    │ (bert_classifier/)               │
-    │ - pytorch_model.bin              │
-    │ - config.json                    │
-    │ - tokenizer files                │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Inference                        │
-    │ (scripts/classify_lawsuit.py)    │
-    │                                   │
-    │ - Fast BERT classification       │
-    │ - OR LLM classification          │
-    └──────────────┬───────────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────────┐
-    │ Output: Classifications          │
-    │ - Category labels                │
-    │ - Confidence scores              │
-    └──────────────────────────────────┘
-```
-
-## Input Data Structure
-
-The classifier expects cases organized as:
-
-```
-data/cases/
-├── case_95/
-│   ├── case_95.json              # Metadata from database
-│   ├── documents/                # PDF documents
-│   │   ├── document_XXX.pdf
-│   │   └── document_XXX.txt      # Extracted text (optional)
-│   └── docling/                  # Docling parsed output (optional)
-│       └── documents/
-│           └── document_XXX.docling.json
-├── case_227/
-│   └── ...
-└── case_309/
-    └── ...
-```
-
-**case_*.json structure**:
-```json
-{
-  "case_info": {
-    "case_id": "152401/2026",
-    "caption": "PLAINTIFF v. DEFENDANT",
-    "court": "New York County Supreme Court",
-    "case_type": "Torts - Product Liability",
-    "case_received_date": "02/26/2026",
-    "case_status": "Active"
-  },
-  "documents": [
-    {
-      "document_name": "SUMMONS + COMPLAINT",
-      "filed_by": "ATTORNEY NAME",
-      "filed_create": "02/26/2026",
-      "local_document_path": "documents/document_XXX.pdf"
-    }
-  ]
-}
-```
-
-## Document Selection
-
-The classifier intelligently selects documents for analysis:
-
-1. **Priority documents** (matched by filename keywords):
-   - complaint, petition, summons, verified
-   - amended_complaint, class_action_complaint
-
-2. **Fallback**: First N documents (sorted by filing date)
-
-3. **Text extraction priority**:
-   - `.txt` files (canonical text)
-   - `.docling.json` files (Docling output)
-   - Raw PDF (not implemented)
+Every PDF in `case_dir/documents/` is used - not a capped sample - so a label can't be missed
+because the deciding allegation is in a later filing. Complaint-type documents (filename matches
+`complaint`, `petition`, `summons`, `verified`, `amended_complaint`, `class_action_complaint`) are
+ordered first purely so truncation, if it ever triggers, drops less-central documents first. Text
+is loaded from a `.txt` sidecar if present, else the case's Docling `.docling.json`.
 
 ## Categories
 
-### Product Liability
-**Criteria**: Claims about defective or dangerous products causing harm
-- Design defects
-- Manufacturing defects
-- Failure to warn
-- Breach of warranty
-- Medical devices, drugs, consumer products
+- **product_liability** - defective/dangerous product claims (design/manufacturing defect,
+  failure to warn, breach of warranty; medical devices, drugs, consumer products)
+- **personal_injury** - physical/emotional harm claims (accidents, malpractice, wrongful death)
+- **class_action** - "class action", "on behalf of all", "class certification", Fed. R. Civ. P.
+  23 references, multiple similarly-situated plaintiffs
 
-### Personal Injury
-**Criteria**: Claims for physical or emotional harm
-- Car accidents, slip and fall
-- Medical malpractice
-- Assault, wrongful death
-- Bodily injury, pain and suffering
-- Medical expenses, loss of consortium
+Multiple categories can apply to the same case.
 
-### Class Action
-**Criteria**: Lawsuit on behalf of a larger group
-- Phrases: "class action", "on behalf of all", "class members"
-- "class certification", "numerosity"
-- References to Fed. R. Civ. P. 23
-- Multiple similarly situated plaintiffs
+## Extending
 
-**Note**: Multiple categories can apply to the same case. For example, a product liability case can also be a class action and involve personal injury claims.
+**New category**: add it to `config/event_extraction.toml`'s `categories`, extend the prompt
+template in `config/llm_prompts.toml`, add it to `CLASSIFICATION_RESPONSE_SCHEMA`'s enum in
+`scripts/zero_shot_classifier.py`, then re-run Steps 1-2.
 
-## Performance Considerations
-
-### LLM Classification (Zero-Shot)
-- **Speed**: ~10-30 seconds per case (depends on document length)
-- **Cost**: Local (free with Ollama), or API costs if using cloud LLM
-- **Quality**: High, can understand nuanced legal language
-- **Use case**: Generating training data, handling edge cases
-
-### BERT Classification
-- **Speed**: ~0.02-0.5 seconds per case (GPU), ~0.2-2 seconds (CPU)
-- **Cost**: One-time training cost, then free
-- **Quality**: 75-90% accuracy (depends on training data)
-- **Use case**: Batch processing, production inference
-
-## Extending the System
-
-### Adding New Categories
-
-1. Update config (`config/event_extraction.toml`):
-```toml
-categories = [
-    "product_liability",
-    "personal_injury",
-    "class_action",
-    "employment_discrimination",  # New category
-]
-```
-
-2. Update prompt template (`config/llm_prompts.toml`):
-```toml
-[lawsuit_classification]
-template = """
-...
-4. EMPLOYMENT_DISCRIMINATION: Claims of workplace discrimination...
-...
-"""
-```
-
-3. Update response schema in `zero_shot_classifier.py`:
-```python
-CLASSIFICATION_RESPONSE_SCHEMA = {
-    "properties": {
-        "labels": {
-            "items": {
-                "properties": {
-                    "category": {
-                        "enum": ["product_liability", "personal_injury",
-                                "class_action", "employment_discrimination"]
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-4. Re-generate training data and re-train model
-
-### Using a Different LLM Backend
-
-The system supports any Ollama model:
-
-```toml
-llm_model = "llama3:70b"           # Larger model
-llm_model = "mistral:7b"           # Smaller/faster model
-llm_model = "qwen2.5:14b"          # Alternative model
-```
-
-Or use a different backend by implementing the call interface.
-
-### Using a Different BERT Model
-
-```toml
-bert_model = "bert-base-uncased"              # General BERT
-bert_model = "nlpaueb/legal-bert-base-uncased"  # Legal domain
-bert_model = "nlpaueb/legal-bert-small-uncased" # Faster/smaller
-bert_model = "saibo/legal-roberta-base"       # RoBERTa variant
-```
+**Different LLM/BERT model**: change `llm_model` (any locally-pulled Ollama tag) or `bert_model`
+in config.
 
 ## Troubleshooting
 
-### "No documents found for case_X"
-- Ensure case directory has `documents/` subdirectory with PDFs
-- Check that documents are named with `.pdf` extension
-
-### "No metadata found for case_X"
-- Ensure case directory has `case_X.json` file
-- Check JSON file is valid and has `case_info` section
-
-### "BERT model not found"
-- Train the model first: `python scripts/train_bert_classifier.py`
-- Or specify custom path: `--model-path /path/to/model`
-
-### "Ollama connection failed"
-- Ensure Ollama is running: `ollama serve`
-- Check model is pulled: `ollama pull qwen3:30b-a3b`
-- Verify base_url in config matches Ollama port
-
-### Low classification quality
-- Increase `classification_page_count` to analyze more content
-- Increase `classification_doc_count` to read more documents
-- Generate more training data for BERT model
-- Try a larger LLM model (e.g., qwen3:30b instead of 7b)
+- **"No documents/metadata found for case_X"** - needs `case_X/documents/*.pdf` and
+  `case_X.json` (with `case_info`) on disk.
+- **"BERT model not found"** - train first, or pass `--model-path`.
+- **"Ollama connection failed"** - `ollama serve` running? `ollama pull qwen3:30b-a3b`? does
+  `llm_base_url` match the port?
+- **Low quality** - increase `classification_page_count` (per-document cap, not a document-count
+  cap), generate more training data, or try a larger model.
 
 ## Files
 
-**Scripts**:
-- `scripts/zero_shot_classifier.py` - Generate training data with LLM
-- `scripts/train_bert_classifier.py` - Train BERT classifier
-- `scripts/classify_lawsuit.py` - Classify cases (BERT or LLM)
+**Scripts**: `build_classification_sample.py`, `export_classification_sample.py`,
+`zero_shot_classifier.py`, `reconcile_classifications.py`,
+`summarize_cases_for_classification.py`, `train_bert_classifier.py`, `classify_lawsuit.py`
 
-**Config**:
-- `config/event_extraction.toml` - Classification settings
-- `config/llm_prompts.toml` - Prompt templates
+**Config**: `config/event_extraction.toml` (`[lawsuit_classification]`), `config/llm_prompts.toml`
 
-**Data**:
-- `data/classification/training_data.json` - LLM-generated labels
-- `data/classification/bert_classifier/` - Trained BERT model
-
-**Documentation**:
-- `docs/lawsuit_classification.md` - This file
+**Data**: `data/classification/training_data.json` (per-provider LLM labels),
+`data/classification/reconciled_training_data.json` (BERT trainer input),
+`data/classification/case_summaries.json`, `data/classification/bert_classifier/` (trained model),
+`data/classification_sample_ids.json` / `data/classification_labels.json` (sample selection)

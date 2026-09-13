@@ -22,8 +22,10 @@ lawsuit-parser/
 
 All documentation is organized in the [`docs/`](docs/) folder:
 - [Event Extraction Usage Guide](docs/event_extraction_usage.md)
+- [Pipeline Outputs Reference](docs/pipeline_outputs.md)
 - [Case Exporter Usage](docs/case_exporter_usage.md)
 - [Local Case Browser](docs/local_case_browser.md)
+- [Lawsuit Classification](docs/lawsuit_classification.md)
 - [Database Schema](docs/court_tables_relationships.md)
 
 See [docs/README.md](docs/README.md) for the complete documentation index.
@@ -223,8 +225,8 @@ uv run python scripts/export_cases.py --case-ids "273,51,70"
 ```
 
 Each exported case includes:
-- Complete case metadata from `court_cases` table
-- All associated documents from `court_documents` table
+- Complete case metadata from the `courts_final.{prefix}cases_after_search` table
+- All associated documents from the `courts_final.{prefix}docket_documents` table
 - Downloaded PDF files from Google Cloud Storage
 - Denormalized JSON file combining all information
 
@@ -278,10 +280,9 @@ python scripts/run_event_extraction.py case_67 --status
 python scripts/run_event_extraction.py case_67 --force
 ```
 
-**Pipeline Stages:**
-- **Stage 1:** Metadata extraction from database, PDFs, and Docling headers → `files_scan.json`, `gliner_config.json`
-- **Stage 2:** GLiNER entity detection with dynamic actor labels → `entities.json`
-- **Future:** Event timeline construction, temporal ordering, relationship extraction
+**Pipeline Stages:** metadata/actor extraction → GLiNER entity detection → document summaries →
+date clustering → event synthesis → relationship extraction. See
+[Pipeline Outputs Reference](docs/pipeline_outputs.md) for what each stage produces.
 
 **Key Features:**
 - Extracts parties (plaintiffs, defendants, etc.) from multiple sources

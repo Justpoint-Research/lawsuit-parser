@@ -113,23 +113,6 @@ Each case JSON file contains:
 }
 ```
 
-## Advantages
-
-✅ **No Database Required** - Works without Cloud SQL Proxy
-✅ **No GCS Authentication** - PDFs are already downloaded locally
-✅ **Fast Performance** - All data is local, no network latency
-✅ **Portable** - Can share the `data/cases` folder with others
-✅ **Offline Analysis** - Work without internet connection
-✅ **Version Control Friendly** - Export specific cases for testing
-
-## Use Cases
-
-1. **Development & Testing** - Test with a small dataset without full database
-2. **Offline Analysis** - Analyze cases on laptop without database access
-3. **Data Sharing** - Export and share specific cases with team members
-4. **Case Studies** - Create curated sets of interesting cases
-5. **Performance Testing** - Test UI changes without database overhead
-
 ## Troubleshooting
 
 ### No Cases Found

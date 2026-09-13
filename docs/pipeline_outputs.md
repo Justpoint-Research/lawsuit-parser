@@ -333,6 +333,39 @@ All outputs are JSON files in `data/extraction/<case_id>/events/`
 
 ---
 
+## Stage 6: Relationship Extraction
+
+**Purpose:** Extract relationships between entities, focused on lawyer-client representation
+
+### Output Files
+
+#### 1. `relations.json`
+**Model:** `RelationsArtifact`
+
+**Contains:**
+- `case_id` - Case identifier
+- `extraction_timestamp` - When relations were extracted
+- `relations[]` - Extracted relationships:
+  - `relation_id` - Unique ID (rel_0001, ...)
+  - `relation_type` - e.g. "represents"
+  - `source_entity`/`source_role`, `target_entity`/`target_role` - the two linked actors
+  - `confidence` - Reliability score
+  - `evidence` - Sentence the relation was matched from
+  - `doc_id`, `char_start`, `char_end` - Source location
+  - `extraction_method` - "pattern" (regex-based; no LLM mode yet)
+- `relation_counts` - Count by relation type
+
+**Extraction Tools:**
+
+| Element | Tool | Details |
+|---------|------|---------|
+| Relation detection | **Regex patterns** | Matches representation phrasing near two linked actors in `entities.json` |
+| Deduplication | **Filter** | Collapses relations with the same source + target + type |
+
+Config: `[stage_6]` in `config/event_extraction.toml` (`extract_relations`, `min_confidence`, default 0.7).
+
+---
+
 ## Data Flow Summary
 
 ```
@@ -377,6 +410,13 @@ All outputs are JSON files in `data/extraction/<case_id>/events/`
 │ • String search: Separate stamps from events           │
 ├─────────────────────────────────────────────────────────┤
 │ → events.json, stamp_dates.json                        │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│ Stage 6: Relationship Extraction                         │
+│ • Regex: lawyer-client representation patterns          │
+├─────────────────────────────────────────────────────────┤
+│ → relations.json                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -501,7 +541,8 @@ lawsuit-parser/
 │       ├── summaries.json        ← Stage 3: Document summaries
 │       ├── dates.json            ← Stage 4: Date clusters
 │       ├── events.json           ← Stage 5: Events timeline
-│       └── stamp_dates.json      ← Stage 5: Header dates
+│       ├── stamp_dates.json      ← Stage 5: Header dates
+│       └── relations.json        ← Stage 6: Relationships
 │
 └── lawsuit_parser/event_extraction/
     ├── stages/
@@ -520,5 +561,3 @@ lawsuit-parser/
 ## See Also
 
 - [Event Extraction Usage Guide](event_extraction_usage.md) - How to run the pipeline
-- [Pipeline Design](event_extraction_pipeline_design.md) - Architecture and extensibility
-- [Implementation Summary](event_extraction_implementation.md) - Technical details

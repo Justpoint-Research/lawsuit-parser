@@ -57,7 +57,7 @@ no case-level link at all, so there's no meaningful way to attach it to a single
 
 ### Finding the Correct GCS Bucket
 
-The PDF files are stored in a GCS bucket named **`court-docs`** under the `document_link/` prefix.
+The PDF files are stored in a GCS bucket named **`courts_crawl`** under the `document_link/` prefix.
 
 To verify bucket access:
 
@@ -65,14 +65,17 @@ To verify bucket access:
 # List all buckets
 uv run python scripts/list_gcs_buckets.py list-buckets
 
-# List files in the court-docs bucket
-uv run python scripts/list_gcs_buckets.py list-files --bucket court-docs --limit 10
+# List files in the courts_crawl bucket
+uv run python scripts/list_gcs_buckets.py list-files --bucket courts_crawl --limit 10
 
 # Search for document files
-uv run python scripts/list_gcs_buckets.py find-files --bucket court-docs --search "document_"
+uv run python scripts/list_gcs_buckets.py find-files --bucket courts_crawl --search "document_"
 ```
 
-**Note**: Documents are stored at `gs://court-docs/document_link/...`
+**Note**: Documents are stored per-state under `gs://courts_crawl/{state}/document_link/...` and
+`gs://courts_crawl/{state}/confirmation/...` (e.g. `ny/`, `fl/`), where `{state}` is the
+`--table-prefix` with its trailing underscore stripped. Paths are kept URL-encoded (GCS and the
+database agree on `%3D%3D` for `==`, etc.) - the exporter never decodes them.
 
 ### Export a Single Case
 
@@ -82,7 +85,7 @@ Export a specific case by its database ID (`{table_prefix}cases_after_search.id`
 # Using default output directory (data/cases), schema (courts_final) and prefix (ny_)
 uv run python scripts/export_case.py 1229
 
-# Specify output directory (bucket defaults to court-docs)
+# Specify output directory (bucket defaults to courts_crawl)
 uv run python scripts/export_case.py 1229 --output-dir exports/my_cases
 
 # Export from a different state's tables, e.g. Florida (schema/prefix are params)
@@ -122,6 +125,20 @@ Export specific cases by providing comma-separated IDs:
 ```bash
 uv run python scripts/export_cases.py --case-ids "273,51,70,350"
 ```
+
+For a large list (thousands of IDs), use `--case-ids-file` instead - `--case-ids` can hit the
+shell's argument-length limit:
+
+```bash
+uv run python scripts/export_cases.py \
+  --case-ids-file ny_case_ids.txt \
+  --output-dir data/cases/ny_after_search \
+  --table-prefix ny_
+```
+
+Both flags skip random sampling. The export is resumable: re-running the same command skips any
+case whose JSON already exists and any PDF already downloaded, so it's safe to stop (`Ctrl+C`) and
+resume, including after a network/DB failure or hitting a GCS rate limit.
 
 ## Output Structure
 
@@ -251,7 +268,7 @@ engine = create_engine(url)
 exporter = CaseExporter(
     engine=engine,
     output_dir=Path("data/my_exports"),
-    gcs_bucket_name="court-docs",  # Default bucket
+    gcs_bucket_name="courts_crawl",  # Default bucket
     schema="courts_final",  # Default schema
     table_prefix="ny_",  # Default prefix; use e.g. "fl_" for Florida tables
     extract_text=False,  # Set True to also run Docling and save .txt files
@@ -307,28 +324,33 @@ with engine.connect() as conn:
 engine.dispose()
 ```
 
+## PDF Metadata
+
+Every downloaded PDF is also probed with the `pdfinfo` command (from `poppler-utils` - install via
+`apt-get install poppler-utils` / `brew install poppler`; extraction is silently skipped if it's
+missing) and the result is stored per-document as `pdf_metadata` (and `confirmation_pdf_metadata`
+for the matching confirmation notice): `Author`, `CreationDate`, `ModDate`, `Creator`, `Producer`,
+`Pages`, PDF version, file size, encryption/tagging flags.
+
+This is worth reading even when you don't need it for anything specific: the PDF `Author` is often
+a different person than the database's `filed_by` (the filing attorney) - it's frequently the
+paralegal/assistant who actually prepared the document - and `CreationDate`/`ModDate` carry a full
+timestamp with timezone versus the database's date-only fields, which can reveal same-day revision
+cycles between drafting and filing.
+
 ## Troubleshooting
 
 ### GCS Bucket Not Found
 
-If you see errors like "The specified bucket does not exist", you need to:
-
-1. Find the correct GCS bucket name
-2. Ensure you have read access to the bucket
-3. Specify the correct bucket name using the `--bucket` parameter
-
-Try common bucket names:
-- `nyscef-documents`
-- `nyscef-files`
-- `court-documents`
-- `scrapping-documents`
+If you see "The specified bucket does not exist", check `--bucket` - the default is `courts_crawl`
+(see `CaseExporter.__init__`'s docstring for the current default if this doc drifts).
 
 ### No Documents Exported
 
 Some cases may not have associated documents in the database. This happens when:
 - The case's `case_id` is "Not Assigned"
 - Documents haven't been scraped yet (`documents_scrapped_at` is NULL)
-- The `case_id` in `court_cases` doesn't match any `case_id` in `court_documents`
+- The case's `docket_id` doesn't match any document row's `docket_id`
 
 The JSON file will still be created with an empty `documents` array.
 

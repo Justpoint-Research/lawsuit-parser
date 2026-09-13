@@ -1,117 +1,58 @@
 # Event Extraction Pipeline
 
-A modular, extensible pipeline for extracting legal events and timelines from parsed Docling documents.
+A modular, stage-based pipeline that extracts legal events and timelines from parsed Docling
+documents. For what each stage produces and which tools/regexes/models do the work, see the
+[Pipeline Outputs Reference](pipeline_outputs.md) - this doc covers installation, config, and how
+to run it.
 
-## Overview
+## Stages
 
-This pipeline processes legal case documents to extract:
-- **Parties** (plaintiffs, defendants, attorneys, etc.)
-- **Events** (filings, motions, hearings, rulings, etc.)
-- **Timelines** (chronological sequence of events)
-- **Entities** (dates, locations, monetary amounts, case citations, etc.)
-
-## Architecture
-
-The pipeline uses a **stage-based architecture** that is designed for extensibility:
-
-### Stage 1: Metadata Extraction
-**Purpose:** Extract ground truth metadata from all available sources
-
-**Inputs:**
-- Database records (PostgreSQL)
-- PDF file metadata
-- Docling parsed documents (`.docling.json`, `.json`)
-- Document headers (CM/ECF information)
-
-**Outputs:**
-- `files_scan.json` - Complete metadata scan with dates extracted
-- `gliner_config.json` - GLiNER configuration with dynamic actor labels
-
-### Stage 2: GLiNER Entity Detection
-**Purpose:** Extract all entity mentions using zero-shot NER
-
-**Inputs:**
-- `gliner_config.json` from Stage 1
-- Canonical text from documents
-
-**Outputs:**
-- `entities.json` - All detected entities with locations and scores
-
-### Future Stages (Extensible)
-
-The pipeline is designed to support additional stages:
-- **Stage 3:** Event extraction from entities
-- **Stage 4:** Timeline construction
-- **Stage 5:** Event relationship extraction
-- **Stage 6:** Temporal ordering and resolution
+1. **Metadata** - actor roster, document catalog, dates (DB + PDF metadata + Docling + regex + LLM)
+2. **GLiNER Entity Detection** - zero-shot NER over canonical text using Stage 1's dynamic labels
+3. **Document Summary** - 1-3 sentence LLM summary per document
+4. **Date Clustering** - parses/groups dates by paragraph, links co-occurring actors
+5. **Event Synthesis** - turns date clusters into timeline events (deterministic quote-extraction
+   by default; `use_llm = true` for LLM-synthesized type/description/outcome/curated actors)
+6. **Relationship Extraction** - regex-based lawyer-client representation links
 
 ## Installation
 
-The event extraction pipeline is part of the `lawsuit-parser` package. Ensure you have:
-
-```bash
-# Install dependencies
-pip install -e .
-
-# Required packages:
-# - PyPDF2 (for PDF metadata)
-# - gliner (for entity extraction)
-# - pydantic (for data validation)
-# - sqlalchemy (for database queries)
-```
+Part of the `lawsuit-parser` package (`uv pip install -e .`); no separate setup.
 
 ## Configuration
 
-Configuration is managed via `config/event_extraction.toml`:
+`config/event_extraction.toml`, one `[stage_N]` section per stage:
 
 ```toml
 [paths]
-data_root = "data/cases"      # source case data: documents/, confirmations/, docling/
-output_root = "data/extraction"  # pipeline-generated artifacts, wipeable independently
+data_root = "data/cases"          # source: documents/, confirmations/, docling/
+output_root = "data/extraction"   # generated artifacts, safe to wipe independently
 events_dir = "events"
 
 [stage_1]
-extract_from_pdfs = true
-extract_from_docling = true
-extract_from_confirmations = true  # filer/judge/timestamp from confirmations/ notices
-date_patterns = [
-    "\\d{1,2}/\\d{1,2}/\\d{4}",
-    "\\d{4}-\\d{2}-\\d{2}",
-    # ... more patterns
-]
+llm_backend = "ollama"            # or "nuextract"
+llm_model = "qwen3:30b-a3b"
+llm_base_url = "http://localhost:11434"
+validate_actors_with_llm = true
+date_patterns = ["\\d{1,2}/\\d{1,2}/\\d{4}", "\\d{4}-\\d{2}-\\d{2}", "..."]
 
 [stage_2]
 model = "urchade/gliner_multi-v2.1"
 threshold = 0.5
 batch_size = 8
 use_gpu = true
-static_labels = [
-    "temporal expression",
-    "legal action or event",
-    "court",
-    # ... more labels
-]
 ```
 
 ## Usage
 
-### Command Line Interface
+### CLI
 
 ```bash
-# Run all stages for a case
-python scripts/run_event_extraction.py case_67
-
-# Run specific stages
-python scripts/run_event_extraction.py case_67 --stages 1 2
-
-# Check pipeline status
-python scripts/run_event_extraction.py case_67 --status
-
-# Force re-run (overwrite existing outputs)
-python scripts/run_event_extraction.py case_67 --force
-
-# Use custom config
-python scripts/run_event_extraction.py case_67 --config my_config.toml
+uv run python scripts/run_event_extraction.py case_67              # run all stages
+uv run python scripts/run_event_extraction.py case_67 --stages 1 2 # specific stages
+uv run python scripts/run_event_extraction.py case_67 --status     # show what's done/pending
+uv run python scripts/run_event_extraction.py case_67 --force      # overwrite existing outputs
+uv run python scripts/run_event_extraction.py case_67 --config my_config.toml
 ```
 
 ### Python API
@@ -119,203 +60,57 @@ python scripts/run_event_extraction.py case_67 --config my_config.toml
 ```python
 from lawsuit_parser.event_extraction import EventExtractionPipeline
 
-# Initialize pipeline
 pipeline = EventExtractionPipeline()
-
-# Run all stages
 pipeline.run_all_stages("case_67")
-
-# Run specific stages
 pipeline.run_stages("case_67", stages=[1, 2])
-
-# Check status
 pipeline.print_status("case_67")
+status = pipeline.get_stage_status("case_67")
 ```
 
 ## Data Directory Structure
 
-Source case data and pipeline outputs live under separate roots
-(`data_root` and `output_root`), so an iteration's generated artifacts can
-be deleted and regenerated without touching source data:
+Source data and generated outputs live under separate roots so a run's artifacts can be wiped and
+regenerated without touching source data - see [Pipeline Outputs Reference](pipeline_outputs.md)
+for the full layout under both `data/cases/<case_id>/` and `data/extraction/<case_id>/events/`.
 
-```
-data/cases/<case_id>/                       # data_root - source data
-├── documents/                              # the actual filed documents
-│   ├── document_<id>.pdf
-│   └── document_<id>.json                  # Docling-simplified parse
-├── confirmations/                          # e-filing acknowledgement notices
-│   ├── document_<id>.pdf                   # same id/name as its documents/ counterpart
-│   └── document_<id>.json                  # metadata source only - filer, judge,
-│                                            # timestamp; Stage 2 never runs on these
-└── docling/
-    ├── documents/document_<id>.docling.json
-    └── confirmations/document_<id>.docling.json
-
-data/extraction/<case_id>/                  # output_root - generated, safe to wipe
-├── events/
-│   ├── files_scan.json                     # Stage 1: Metadata scan
-│   ├── gliner_config.json                  # Stage 1: GLiNER configuration
-│   └── entities.json                       # Stage 2: Detected entities
-└── stages/
-```
-
-## Output Format
-
-### files_scan.json
-
-```json
-{
-  "case_id": "case_67",
-  "scan_timestamp": "2026-08-20T10:00:00Z",
-  "documents": [
-    {
-      "doc_id": "doc_000",
-      "file_name": "complaint.pdf",
-      "document_title": "Complaint",
-      "filing_date": "2024-01-15",
-      "extracted_dates": [...]
-    }
-  ],
-  "parties_discovered": [
-    {
-      "name": "Jane Doe",
-      "role": "plaintiff",
-      "source": "database",
-      "aliases": ["Doe", "Ms. Doe"]
-    }
-  ]
-}
-```
-
-### gliner_config.json
-
-```json
-{
-  "model": "urchade/gliner_multi-v2.1",
-  "threshold": 0.5,
-  "batch_size": 8,
-  "labels": {
-    "static": ["temporal expression", "legal action or event", ...],
-    "dynamic": ["plaintiff (Jane Doe)", "defendant (ACME Inc.)", ...]
-  },
-  "actors": [
-    {
-      "canonical_name": "Jane Doe",
-      "role": "plaintiff",
-      "aliases": ["Doe", "Ms. Doe"],
-      "gliner_label": "plaintiff (Jane Doe)"
-    }
-  ]
-}
-```
-
-### entities.json
-
-```json
-{
-  "case_id": "case_67",
-  "extraction_timestamp": "2026-08-20T10:15:00Z",
-  "model_config": {
-    "model": "urchade/gliner_multi-v2.1",
-    "threshold": 0.5
-  },
-  "entities": [
-    {
-      "entity_id": "ent_001",
-      "text": "Jane Doe",
-      "label": "plaintiff (Jane Doe)",
-      "score": 0.95,
-      "doc_id": "doc_000",
-      "char_start": 1234,
-      "char_end": 1242,
-      "linked_actor": "Jane Doe",
-      "context": "This action was filed by **Jane Doe** against ACME Inc. on January 15, 2024. The complaint alleges breach of contract. ACME disputes the claim in its entirety. A hearing has been scheduled for March 2024."
-    }
-  ],
-  "entity_counts": {
-    "temporal expression": 45,
-    "plaintiff (Jane Doe)": 23,
-    "defendant (ACME Inc.)": 31
-  }
-}
-```
-
-## Extending the Pipeline
-
-To add a new stage:
-
-1. **Create stage class** in `lawsuit_parser/event_extraction/stages/`:
+## Extending: Adding a New Stage
 
 ```python
-# stage_3_timeline.py
+# lawsuit_parser/event_extraction/stages/stage_7_whatever.py
 from ..base import BaseStage
-from ..models import EventTimeline
+from ..models import SomeArtifact
 
-class Stage3Timeline(BaseStage):
-    stage_number = 3
-    stage_name = "timeline"
+class Stage7Whatever(BaseStage):
+    stage_number = 7
+    stage_name = "whatever"
 
     def run(self, case_id: str, config: dict) -> None:
-        # Load entities from Stage 2
-        entities = self.load_artifact(case_id, "entities.json", EntitiesArtifact)
-
-        # Build timeline
-        timeline = self.build_timeline(entities)
-
-        # Save output
-        self.save_artifact(case_id, "events.json", timeline)
+        relations = self.load_artifact(case_id, "relations.json", RelationsArtifact)
+        result = ...  # build the new artifact
+        self.save_artifact(case_id, "whatever.json", result)
 
     def validate_inputs(self, case_id: str) -> bool:
-        return self.artifact_exists(case_id, "entities.json")
+        return self.artifact_exists(case_id, "relations.json")
 
     def get_outputs(self, case_id: str) -> list[Path]:
-        return [self.get_events_dir(case_id) / "events.json"]
+        return [self.get_events_dir(case_id) / "whatever.json"]
 ```
 
-2. **Register stage** in `stages/__init__.py`:
-
-```python
-from .stage_3_timeline import Stage3Timeline
-
-STAGES = [
-    Stage1Metadata,
-    Stage2GLiNER,
-    Stage3Timeline,  # Add new stage
-]
-```
-
-3. **Add configuration** (optional) in `config/event_extraction.toml`:
-
-```toml
-[stage_3]
-# Stage 3 specific configuration
-```
-
-That's it! The pipeline orchestrator will automatically discover and run the new stage.
+Register it in `stages/__init__.py`'s `STAGES` list and add an optional `[stage_7]` config
+section - the pipeline orchestrator discovers and runs it automatically.
 
 ## Design Principles
 
-1. **Immutability** - Once a stage completes, its outputs are immutable
-2. **Idempotency** - Running a stage twice produces identical results
-3. **Provenance** - All extracted data includes source references and offsets
-4. **Extensibility** - New stages can be added without modifying existing ones
-5. **Validation** - Each stage validates its inputs before execution
-6. **Error Handling** - Failures are logged but don't prevent other stages
+Stage outputs are immutable once written and idempotent (re-running produces the same result);
+every extracted field carries source references/character offsets for provenance; each stage
+validates its inputs before running; failures are logged, not fatal to other stages.
 
 ## Troubleshooting
 
-### Case directory not found
-Ensure the case exists in `data/cases/<case_id>/` with at least some PDF or parsed files.
-
-### Database connection errors
-If database is not configured, Stage 1 will skip database extraction gracefully. This is OK if you're only using file-based metadata.
-
-### GLiNER GPU errors
-If you encounter GPU errors, set `use_gpu = false` in config or ensure CUDA is properly installed.
-
-### Missing dependencies
-Install PyPDF2: `pip install PyPDF2`
-
-## License
-
-Part of the lawsuit-parser project.
+- **Case directory not found** - needs `data/cases/<case_id>/` with at least some PDF or parsed
+  files.
+- **Database connection errors** - Stage 1 skips DB extraction gracefully; fine if you're only
+  using file-based metadata (caption/confirmation parsing still runs).
+- **GLiNER GPU errors** - set `use_gpu = false` in `[stage_2]`, or check CUDA install.
+- **LLM stages (validate_actors_with_llm, Stage 3, Stage 5 with use_llm=true)** - need Ollama
+  running (`ollama serve`) with the configured model pulled, or a reachable NuExtract server.

@@ -720,5 +720,4 @@ normalize_party_name("Bonnie Darling, et al.") → "bonnie darling"
 ## See Also
 
 - [Pipeline Outputs Reference](pipeline_outputs.md) - What each stage produces
-- [Event Extraction Usage Guide](event_extraction_usage.md) - How to run the pipeline
-- [Pipeline Design](event_extraction_pipeline_design.md) - Architecture overview
+- [Event Extraction Usage Guide](event_extraction_usage.md) - How to run the pipeline, architecture overview
