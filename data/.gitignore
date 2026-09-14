@@ -1,4 +1,5 @@
 /classification
+/classification_bootstrap_models
 /classification_labels.json
 /classification_sample_doc_selection.json
 /classification_sample_ids.json

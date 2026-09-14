@@ -50,6 +50,7 @@ dependencies = [
     "watchdog>=6.0.0",
     # Train/eval split and multilabel metrics for scripts/train_bert_classifier.py
     "scikit-learn>=1.4.0",
+    "xgboost>=3.4.1",
 ]
 
 [project.optional-dependencies]

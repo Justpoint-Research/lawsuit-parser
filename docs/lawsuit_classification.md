@@ -39,23 +39,41 @@ Prompts are in `config/llm_prompts.toml` under `[lawsuit_classification]` /
 ## Building a scoped sample (recommended over classifying a whole source)
 
 `case_sources` directories can hold tens of thousands of cases; classifying all of them wastes
-LLM calls. `scripts/build_classification_sample.py` reads `data/cases/ny_after_search` (metadata
-only, no DB/network needed) and picks a stratified sample - positive: product-liability/personal-
-injury case types + caption class-action matches; negative: spread across other `case_type`
-buckets - writing `data/classification_sample_ids.json` (`positive_ids`/`negative_ids`).
+LLM calls. `scripts/build_classification_sample.py` and `scripts/export_classification_sample.py`
+**always query the live scrapping DB** (`courts_final.ny_cases_after_search` joined to
+`courts_final.ny_docket_documents` on `docket_id` - requires `make run-proxy`) rather than reading
+the `data/cases/ny_after_search` snapshot: the crawler backfills `document_bucket_link` well after
+a case is first listed, so a point-in-time snapshot goes stale - verified 2026-09-13 that ~12% of
+cases a week-old snapshot called "nothing downloadable" already had real documents live, including
+cases already sitting in an existing sample.
 
-`scripts/export_classification_sample.py` then downloads (earliest N docs per case, per
-`data/classification_sample_doc_selection.json`) and Docling-parses exactly that sample:
+`build_classification_sample.py` picks a stratified sample - positive: product-liability/personal-
+injury case types + caption class-action matches; negative: spread across other `case_type`
+buckets, drawing new picks only from cases that currently have ≥1 downloadable document - writing
+`data/classification_sample_ids.json` (`positive_ids`/`negative_ids`) and
+`data/classification_empty_cases.txt` (every case with nothing downloadable right now).
+
+`scripts/export_classification_sample.py` then, for each sampled case, re-fetches its metadata
+live (`CaseExporter.export_case_by_id(..., skip_if_exists=False)`), recomputes its earliest-N
+downloadable documents from that fresh data, and downloads + Docling-parses exactly those:
 
 ```bash
 uv run python scripts/export_classification_sample.py --no-gpu --workers 8
 
-# Already downloaded, e.g. from a bulk export - just (re-)parse:
+# Already downloaded, e.g. from a prior run - just (re-)parse, no DB/GCS needed:
 uv run python scripts/export_classification_sample.py --skip-download --no-gpu --workers 8
 ```
 
-It writes `data/classification_labels.json` (a simple binary label per case, from the sampling
-heuristic - not an LLM judgment) and Docling output under `data/extraction/<source>/case_<id>/`.
+It overwrites `data/classification_sample_doc_selection.json` (the earliest-N downloadable
+`document_doc_index` values actually used, recomputed fresh every run - not merged with any
+previous content) and `data/classification_labels.json` (a simple binary label per case, from the
+sampling heuristic - not an LLM judgment), and writes Docling output under
+`data/extraction/<source>/case_<id>/`.
+
+Both DVC-tracked data dirs these two scripts write to must be unprotected first:
+`uv run dvc unprotect data/classification_sample_ids.json data/classification_sample_doc_selection.json
+data/classification_labels.json data/classification data/cases/ny_classification
+data/extraction/ny_classification` - or just run `make classification`, which does this for you.
 
 **Gotcha:** once a sample is built, restrict every downstream step to its case IDs explicitly
 (positional args, e.g. `case_<id> case_<id> ...`) rather than relying on `case_sources` scoping -

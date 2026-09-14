@@ -272,6 +272,10 @@ bert_batch_size = 8
 training_data_path = "data/classification/training_data.json"
 reconciled_training_data_path = "data/classification/reconciled_training_data.json"
 model_save_path = "data/classification/bert_classifier"
+# Kept as its own top-level DVC-tracked dir (not nested under
+# data/classification/, which is already tracked as a single blob) since a
+# bootstrap ensemble run saves one model checkpoint per --bootstrap-iterations.
+bootstrap_models_path = "data/classification_bootstrap_models"
 
 # LLM case summaries used as the BERT classifier's input text
 # (scripts/summarize_cases_for_classification.py). The summary is generated

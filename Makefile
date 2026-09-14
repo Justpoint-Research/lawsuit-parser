@@ -1,7 +1,8 @@
 .PHONY: help install test test-cov clean format lint ensure-uv ensure-venv \
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
-        download-sample-cases download-wayback-files parse-pdfs classification-review
+        download-sample-cases download-wayback-files parse-pdfs classification-review \
+        classification
 
 # The default shell for make
 SHELL := /bin/bash
@@ -36,6 +37,8 @@ help:
 	@echo "  make case-browser      - Start Case Browser Streamlit app"
 	@echo "  make event-browser     - Start Event Browser Streamlit app (extracted events, actor filtering)"
 	@echo "  make classification-review - Start Classification Review Streamlit app (model votes + reasoning)"
+	@echo "  make classification     - Sample+download+classify+reconcile new lawsuit cases end-to-end"
+	@echo "                           (override with e.g. CLASSIFICATION_TARGET_POS=500 CLASSIFICATION_TARGET_NEG=1300)"
 	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
 	@echo "  make download_sample_cases - Export sample cases (95, 227, 309, 377, 2303) to data/cases"
 	@echo "  make download-wayback-files - Download archived MDL files from Wayback Machine"
@@ -131,6 +134,40 @@ classification-review: ensure-venv
 	@echo "Starting Classification Review app..."
 	@echo "Opening app at http://localhost:8501"
 	uv run streamlit run apps/classification_review.py
+
+# Grows the lawsuit classifier's labelled sample end-to-end: sample -> download
+# +parse -> LLM-classify new cases -> reconcile. Re-runnable: sampling keeps
+# existing IDs as-is (see build_classification_sample.py) and classification
+# only runs on cases not yet in training_data.json (list_unclassified_cases.py),
+# so a second run with higher targets only pays for what's new.
+CLASSIFICATION_TARGET_POS ?= 350
+CLASSIFICATION_TARGET_NEG ?= 800
+
+classification: ensure-venv
+	@echo "=== classification: target $(CLASSIFICATION_TARGET_POS) positive / $(CLASSIFICATION_TARGET_NEG) negative ==="
+	@echo "Make sure the Cloud SQL Proxy is running: make run-proxy"
+	uv run dvc unprotect \
+		data/classification_sample_ids.json \
+		data/classification_sample_doc_selection.json \
+		data/classification_labels.json \
+		data/classification \
+		data/cases/ny_classification \
+		data/extraction/ny_classification
+	@echo "--- Step 1/4: sampling case IDs ---"
+	$(PYTHON) scripts/build_classification_sample.py \
+		--target-pos $(CLASSIFICATION_TARGET_POS) --target-neg $(CLASSIFICATION_TARGET_NEG)
+	@echo "--- Step 2/4: downloading + Docling-parsing new cases ---"
+	$(PYTHON) scripts/export_classification_sample.py --no-gpu --workers 8
+	@echo "--- Step 3/4: LLM-classifying newly-added cases (Ollama) ---"
+	$(PYTHON) scripts/zero_shot_classifier.py $$($(PYTHON) scripts/list_unclassified_cases.py) --providers ollama --limit 0
+	@echo "--- Step 3b/4: generating case summaries for BERT input ---"
+	$(PYTHON) scripts/summarize_cases_for_classification.py
+	@echo "--- Step 4/4: reconciling multi-provider labels ---"
+	$(PYTHON) scripts/reconcile_classifications.py --require-all-providers
+	@echo ""
+	@echo "Done. Review data/classification_empty_cases.txt for cases with nothing"
+	@echo "downloadable, then retrain with:"
+	@echo "  uv run python scripts/train_bert_classifier.py --input-field summary"
 
 test-pdf-parser: ensure-venv
 	@echo "Testing PDF parser on sample document..."

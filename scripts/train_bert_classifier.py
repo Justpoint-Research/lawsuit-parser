@@ -20,6 +20,13 @@ Usage:
 
     # Evaluate on test set
     python scripts/train_bert_classifier.py --evaluate
+
+    # Calibrate probabilities against a held-out calibration split
+    python scripts/train_bert_classifier.py --calibration-split 0.1
+
+    # Bootstrap ensemble: train 100 models on bootstrap draws of the
+    # training set, for bagged predictions + per-category uncertainty
+    python scripts/train_bert_classifier.py --bootstrap-iterations 100
 """
 
 import argparse
@@ -27,6 +34,7 @@ import json
 import logging
 import re
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -82,6 +90,7 @@ def build_bert_input_text(result: dict[str, Any], input_field: str = "auto") -> 
 
 import numpy as np
 import torch
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, hamming_loss, f1_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
@@ -147,6 +156,7 @@ def load_training_data(
     data_path: Path,
     drop_empty: bool = False,
     input_field: str = "auto",
+    exclude_categories: list[str] | None = None,
 ) -> tuple[list[str], list[list[int]], list[str]]:
     """Load and prepare training data from JSON file.
 
@@ -163,6 +173,10 @@ def load_training_data(
             examples (needed for calibration and for rare categories).
         input_field: "summary", "excerpt" or "auto" - see
             build_bert_input_text. "summary" skips cases with no summary.
+        exclude_categories: Category names to drop from the label space
+            entirely (e.g. a category with too few positive examples to
+            train on yet). The trained model simply has no head for them;
+            the source data is untouched.
 
     Returns:
         texts: List of input texts (case metadata + summary/excerpt)
@@ -172,7 +186,10 @@ def load_training_data(
     with open(data_path) as f:
         data = json.load(f)
 
-    categories = data["metadata"]["categories"]
+    exclude_categories = set(exclude_categories or [])
+    categories = [c for c in data["metadata"]["categories"] if c not in exclude_categories]
+    if exclude_categories:
+        logger.info(f"Excluding categories from training: {sorted(exclude_categories)}")
     category_to_idx = {cat: idx for idx, cat in enumerate(categories)}
 
     texts = []
@@ -210,13 +227,38 @@ def load_training_data(
         + (f", {n_no_summary_skipped} skipped (no summary)" if n_no_summary_skipped else "")
     )
     logger.info(f"Categories: {categories}")
-
-    # Print label distribution
-    label_counts = np.array(labels).sum(axis=0)
-    for cat, count in zip(categories, label_counts):
-        logger.info(f"  {cat}: {int(count)} examples ({count/len(texts)*100:.1f}%)")
+    log_label_distribution(labels, categories)
 
     return texts, labels, categories
+
+
+def log_label_distribution(labels: list[list[int]], categories: list[str]) -> None:
+    """Log per-category positive-example counts and share of the set."""
+    label_counts = np.array(labels).sum(axis=0)
+    total = len(labels)
+    for cat, count in zip(categories, label_counts):
+        logger.info(f"  {cat}: {int(count)} examples ({count/total*100:.1f}%)")
+
+
+def bootstrap_resample(
+    texts: list[str],
+    labels: list[list[int]],
+    factor: float,
+    seed: int = 42,
+) -> tuple[list[str], list[list[int]]]:
+    """Enlarge a training set via bootstrap sampling (with replacement).
+
+    factor=2.0 draws a training set twice the original size, each example
+    picked independently and uniformly at random with replacement. Apply
+    this only to the training split - bootstrapping test or calibration
+    data would duplicate examples across the eval set and bias metrics.
+    """
+    if factor <= 0:
+        raise ValueError(f"bootstrap factor must be > 0, got {factor}")
+    rng = np.random.default_rng(seed)
+    target_size = round(len(texts) * factor)
+    indices = rng.integers(0, len(texts), size=target_size)
+    return [texts[i] for i in indices], [labels[i] for i in indices]
 
 
 def train_epoch(
@@ -257,42 +299,102 @@ def train_epoch(
     return total_loss / len(dataloader)
 
 
-def evaluate(
+def run_inference(
     model,
     dataloader,
     device,
-    categories: list[str],
-    threshold: float = 0.5,
-) -> dict[str, float]:
-    """Evaluate model on validation/test set."""
+    desc: str = "Evaluating",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run the model over a dataloader, returning raw logits and true labels."""
     model.eval()
-    all_predictions = []
+    all_logits = []
     all_labels = []
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch in tqdm(dataloader, desc=desc):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+            all_logits.append(outputs.logits.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+
+    return np.concatenate(all_logits), np.concatenate(all_labels)
+
+
+def fit_platt_scaling(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    categories: list[str],
+) -> dict[str, dict[str, float]]:
+    """Fit per-category Platt scaling on raw logits and true labels.
+
+    Raw BERT sigmoid outputs tend to be overconfident. This fits a 1D
+    logistic regression per category mapping raw logit -> calibrated
+    probability (sigmoid(a * logit + b)), so thresholds and reported
+    confidences are meaningful. A category with only one class present in
+    the calibration set (common for rare categories on a small dataset)
+    can't be fit and is left uncalibrated (a=1, b=0).
+
+    logits/labels: arrays shaped (n_examples, n_categories) - either from
+    a single model (run_inference) or the mean logit across a bootstrap
+    ensemble (see summarize_bootstrap_ensemble).
+    """
+    calibrators = {}
+    for idx, category in enumerate(categories):
+        y = labels[:, idx]
+        x = logits[:, idx].reshape(-1, 1)
+        if len(np.unique(y)) < 2:
+            logger.warning(
+                f"Calibration: '{category}' has only one class in the "
+                "calibration set, leaving uncalibrated"
             )
+            calibrators[category] = {"a": 1.0, "b": 0.0}
+            continue
+        lr = LogisticRegression()
+        lr.fit(x, y)
+        calibrators[category] = {"a": float(lr.coef_[0][0]), "b": float(lr.intercept_[0])}
 
-            # Apply sigmoid to get probabilities
-            probs = torch.sigmoid(outputs.logits)
+    return calibrators
 
-            # Apply threshold
-            predictions = (probs > threshold).float()
 
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+def calibrate_probabilities(
+    model,
+    dataloader,
+    device,
+    categories: list[str],
+) -> dict[str, dict[str, float]]:
+    """Fit per-category Platt scaling on a held-out calibration set."""
+    logits, labels = run_inference(model, dataloader, device, desc="Calibrating")
+    return fit_platt_scaling(logits, labels, categories)
 
-    all_predictions = np.array(all_predictions)
-    all_labels = np.array(all_labels)
 
-    # Calculate metrics
+def apply_calibration(
+    logits: np.ndarray,
+    categories: list[str],
+    calibrators: dict[str, dict[str, float]] | None,
+) -> np.ndarray:
+    """Convert raw logits to probabilities, applying Platt scaling if given."""
+    if not calibrators:
+        return 1 / (1 + np.exp(-logits))
+    scaled = np.empty_like(logits)
+    for idx, category in enumerate(categories):
+        params = calibrators[category]
+        scaled[:, idx] = params["a"] * logits[:, idx] + params["b"]
+    return 1 / (1 + np.exp(-scaled))
+
+
+def metrics_from_probs(
+    probs: np.ndarray,
+    all_labels: np.ndarray,
+    categories: list[str],
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """Compute the standard metric set from probabilities and true labels."""
+    all_predictions = (probs > threshold).astype(float)
+
     metrics = {
         "hamming_loss": hamming_loss(all_labels, all_predictions),
         "f1_micro": f1_score(all_labels, all_predictions, average="micro", zero_division=0),
@@ -300,13 +402,193 @@ def evaluate(
         "f1_samples": f1_score(all_labels, all_predictions, average="samples", zero_division=0),
     }
 
-    # Per-category metrics
     for idx, category in enumerate(categories):
         cat_labels = all_labels[:, idx]
         cat_preds = all_predictions[:, idx]
         metrics[f"f1_{category}"] = f1_score(cat_labels, cat_preds, zero_division=0)
 
     return metrics
+
+
+def evaluate(
+    model,
+    dataloader,
+    device,
+    categories: list[str],
+    threshold: float = 0.5,
+    calibrators: dict[str, dict[str, float]] | None = None,
+) -> dict[str, float]:
+    """Evaluate model on validation/test set.
+
+    calibrators: optional per-category Platt-scaling params from
+        calibrate_probabilities(); when given, probabilities are
+        sigmoid(a * logit + b) instead of the raw sigmoid(logit).
+    """
+    logits, all_labels = run_inference(model, dataloader, device)
+    probs = apply_calibration(logits, categories, calibrators)
+    return metrics_from_probs(probs, all_labels, categories, threshold)
+
+
+def run_bootstrap_ensemble(
+    train_texts: list[str],
+    train_labels: list[list[int]],
+    test_loader,
+    calib_loader,
+    tokenizer,
+    model_name: str,
+    categories: list[str],
+    max_length: int,
+    batch_size: int,
+    device,
+    epochs: int,
+    learning_rate: float,
+    n_iterations: int,
+    models_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Train n_iterations models on independent bootstrap draws of the
+    training set, evaluating each on test_loader (and calib_loader, if
+    given) as it finishes.
+
+    Each iteration's model is saved to models_dir/bootstrap_XXXX/ and
+    marked with a DONE file once its predictions are cached to disk - a
+    rerun skips any iteration whose DONE file already exists, so an
+    interrupted run (this can take days at high iteration counts) resumes
+    instead of restarting.
+
+    Returns (test_logits, test_labels, calib_logits) where test_logits has
+    shape (n_iterations, n_test_examples, n_categories) - one row of raw
+    logits per bootstrap model - and calib_logits is the analogous stack
+    for calib_loader, or None if no calibration split was requested.
+    """
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    all_test_logits = []
+    all_calib_logits = [] if calib_loader is not None else None
+    test_labels = None
+    iter_times = []
+
+    for b in range(n_iterations):
+        run_dir = models_dir / f"bootstrap_{b:04d}"
+        done_marker = run_dir / "DONE"
+
+        if done_marker.exists():
+            logger.info(f"Bootstrap {b + 1}/{n_iterations}: already trained, loading cached logits")
+            all_test_logits.append(np.load(run_dir / "test_logits.npy"))
+            if test_labels is None:
+                test_labels = np.load(run_dir / "test_labels.npy")
+            if calib_loader is not None:
+                all_calib_logits.append(np.load(run_dir / "calib_logits.npy"))
+            continue
+
+        start = time.time()
+        logger.info(f"Bootstrap {b + 1}/{n_iterations}: training")
+
+        bt_texts, bt_labels = bootstrap_resample(train_texts, train_labels, factor=1.0, seed=b)
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=len(categories),
+            problem_type="multi_label_classification",
+        )
+        model.to(device)
+
+        bt_dataset = LawsuitDataset(bt_texts, bt_labels, tokenizer, max_length)
+        bt_loader = DataLoader(bt_dataset, batch_size=batch_size, shuffle=True)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        total_steps = len(bt_loader) * epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.1 * total_steps),
+            num_training_steps=total_steps,
+        )
+
+        for epoch in range(epochs):
+            train_loss = train_epoch(model, bt_loader, optimizer, scheduler, device)
+            logger.info(f"  epoch {epoch + 1}/{epochs}: loss {train_loss:.4f}")
+
+        test_logits, test_labels_out = run_inference(
+            model, test_loader, device, desc=f"Bootstrap {b + 1} test eval"
+        )
+        if test_labels is None:
+            test_labels = test_labels_out
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(run_dir)
+        tokenizer.save_pretrained(run_dir)
+        np.save(run_dir / "test_logits.npy", test_logits)
+        np.save(run_dir / "test_labels.npy", test_labels_out)
+
+        if calib_loader is not None:
+            calib_logits, _ = run_inference(
+                model, calib_loader, device, desc=f"Bootstrap {b + 1} calib eval"
+            )
+            np.save(run_dir / "calib_logits.npy", calib_logits)
+            all_calib_logits.append(calib_logits)
+
+        done_marker.touch()
+        all_test_logits.append(test_logits)
+
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        elapsed = time.time() - start
+        iter_times.append(elapsed)
+        avg = sum(iter_times) / len(iter_times)
+        remaining = n_iterations - (b + 1)
+        logger.info(
+            f"Bootstrap {b + 1}/{n_iterations} done in {elapsed:.1f}s "
+            f"(avg {avg:.1f}s/iter, ETA {avg * remaining / 60:.1f} min for "
+            f"{remaining} remaining)"
+        )
+
+    calib_stack = np.stack(all_calib_logits) if all_calib_logits else None
+    return np.stack(all_test_logits), test_labels, calib_stack
+
+
+def summarize_bootstrap_ensemble(
+    test_logits_stack: np.ndarray,
+    test_labels: np.ndarray,
+    categories: list[str],
+    calib_logits_stack: np.ndarray | None = None,
+    calib_labels: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Aggregate a bootstrap ensemble into a bagged prediction + uncertainty report.
+
+    The bagged probability per case/category is the mean of each bootstrap
+    model's sigmoid output; the standard deviation across models is the
+    uncertainty estimate. When a calibration set is given, Platt scaling is
+    fit once on the mean (bagged) calibration logits/labels and applied to
+    the bagged test probabilities.
+    """
+    test_probs_stack = 1 / (1 + np.exp(-test_logits_stack))  # (B, N, C)
+    mean_probs = test_probs_stack.mean(axis=0)
+    std_probs = test_probs_stack.std(axis=0)
+
+    calibrators = None
+    if calib_logits_stack is not None and calib_labels is not None:
+        mean_calib_logits = calib_logits_stack.mean(axis=0)
+        calibrators = fit_platt_scaling(mean_calib_logits, calib_labels, categories)
+        mean_test_logits = test_logits_stack.mean(axis=0)
+        calibrated_probs = apply_calibration(mean_test_logits, categories, calibrators)
+    else:
+        calibrated_probs = None
+
+    report = {
+        "n_iterations": int(test_logits_stack.shape[0]),
+        "raw_metrics": metrics_from_probs(mean_probs, test_labels, categories),
+        "uncertainty_mean_std": {
+            category: float(std_probs[:, idx].mean())
+            for idx, category in enumerate(categories)
+        },
+    }
+    if calibrators is not None:
+        report["calibration"] = calibrators
+        report["calibrated_metrics"] = metrics_from_probs(
+            calibrated_probs, test_labels, categories
+        )
+    return report
 
 
 def main():
@@ -384,6 +666,40 @@ def main():
         "'excerpt', or 'auto' (summary when present, else excerpt)",
     )
     parser.add_argument(
+        "--exclude-categories",
+        nargs="+",
+        default=[],
+        metavar="CATEGORY",
+        help="Category name(s) to drop from the label space entirely "
+        "(e.g. --exclude-categories class_action) - use for categories "
+        "with too few positive examples to train on yet",
+    )
+    parser.add_argument(
+        "--bootstrap-iterations",
+        type=int,
+        default=0,
+        help="Train an ensemble of this many models, each on an "
+        "independent bootstrap draw of the training set, and aggregate "
+        "them into a bagged prediction + per-category uncertainty report "
+        "(mean/std across the ensemble). When > 0, this replaces the "
+        "normal single-model train/evaluate flow. 0 (default) disables it.",
+    )
+    parser.add_argument(
+        "--bootstrap-models-dir",
+        type=Path,
+        help="Directory to save each bootstrap-ensemble model to (default: "
+        "from config, kept separate from --output so the single-model "
+        "checkpoint isn't mixed in with the ensemble)",
+    )
+    parser.add_argument(
+        "--calibration-split",
+        type=float,
+        default=0.0,
+        help="Fraction of the training set to hold out for per-category "
+        "probability calibration (Platt scaling), refit whenever a new "
+        "best model is saved. 0 (default) disables calibration.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -425,14 +741,27 @@ def main():
     # Load training data
     logger.info(f"Loading training data from {data_path}")
     texts, labels, categories = load_training_data(
-        data_path, drop_empty=args.drop_empty, input_field=args.input_field
+        data_path,
+        drop_empty=args.drop_empty,
+        input_field=args.input_field,
+        exclude_categories=args.exclude_categories,
     )
 
     # Split data
     train_texts, test_texts, train_labels, test_labels = train_test_split(
         texts, labels, test_size=args.test_split, random_state=42
     )
-    logger.info(f"Train: {len(train_texts)}, Test: {len(test_texts)}")
+
+    calib_texts, calib_labels = [], []
+    if args.calibration_split > 0:
+        train_texts, calib_texts, train_labels, calib_labels = train_test_split(
+            train_texts, train_labels, test_size=args.calibration_split, random_state=42
+        )
+
+    logger.info(
+        f"Train: {len(train_texts)}, Test: {len(test_texts)}, "
+        f"Calibration: {len(calib_texts)}"
+    )
 
     # Load tokenizer and model
     logger.info(f"Loading model: {model_name}")
@@ -472,6 +801,71 @@ def main():
         test_dataset, batch_size=batch_size
     )
 
+    calib_loader = None
+    if calib_texts:
+        calib_dataset = LawsuitDataset(calib_texts, calib_labels, tokenizer, max_length)
+        calib_loader = DataLoader(calib_dataset, batch_size=batch_size)
+
+    if args.bootstrap_iterations > 0:
+        bootstrap_models_dir = args.bootstrap_models_dir or Path(config.get(
+            "bootstrap_models_path",
+            "data/classification_bootstrap_models"
+        ))
+        # Each ensemble iteration builds its own model; the single model
+        # loaded above isn't used in this branch.
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        logger.info(
+            f"Bootstrap ensemble: {args.bootstrap_iterations} iterations -> "
+            f"{bootstrap_models_dir}"
+        )
+        calib_labels_arr = np.array(calib_labels) if calib_labels else None
+        test_logits_stack, test_labels_arr, calib_logits_stack = run_bootstrap_ensemble(
+            train_texts,
+            train_labels,
+            test_loader,
+            calib_loader,
+            tokenizer,
+            model_name,
+            categories,
+            max_length,
+            batch_size,
+            device,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            n_iterations=args.bootstrap_iterations,
+            models_dir=bootstrap_models_dir,
+        )
+        report = summarize_bootstrap_ensemble(
+            test_logits_stack,
+            test_labels_arr,
+            categories,
+            calib_logits_stack=calib_logits_stack,
+            calib_labels=calib_labels_arr,
+        )
+        report["categories"] = categories
+        report["model_name"] = model_name
+
+        report_path = bootstrap_models_dir / "ensemble_report.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2)
+
+        print("\n=== Bootstrap Ensemble Results (bagged, raw) ===")
+        for metric, value in report["raw_metrics"].items():
+            print(f"{metric}: {value:.4f}")
+        print("\nPer-category uncertainty (mean std across ensemble):")
+        for cat, std in report["uncertainty_mean_std"].items():
+            print(f"  {cat}: {std:.4f}")
+        if "calibrated_metrics" in report:
+            print("\n=== Bootstrap Ensemble Results (bagged, calibrated) ===")
+            for metric, value in report["calibrated_metrics"].items():
+                print(f"{metric}: {value:.4f}")
+
+        logger.info(f"Ensemble report saved to: {report_path}")
+        return
+
     if args.evaluate:
         # Evaluate only
         logger.info("Evaluating model...")
@@ -480,6 +874,15 @@ def main():
         print("\n=== Evaluation Results ===")
         for metric, value in metrics.items():
             print(f"{metric}: {value:.4f}")
+
+        if calib_loader is not None:
+            calibrators = calibrate_probabilities(model, calib_loader, device, categories)
+            calibrated_metrics = evaluate(
+                model, test_loader, device, categories, calibrators=calibrators
+            )
+            print("\n=== Evaluation Results (calibrated) ===")
+            for metric, value in calibrated_metrics.items():
+                print(f"{metric}: {value:.4f}")
         return
 
     # Setup training
@@ -529,6 +932,10 @@ def main():
                 "input_field": args.input_field,
                 "best_f1_macro": best_f1,
             }
+            if calib_loader is not None:
+                config_data["calibration"] = calibrate_probabilities(
+                    model, calib_loader, device, categories
+                )
             with open(output_dir / "classifier_meta.json", "w") as f:
                 json.dump(config_data, f, indent=2)
 
@@ -539,6 +946,15 @@ def main():
     metrics = evaluate(model, test_loader, device, categories)
     for metric, value in metrics.items():
         print(f"{metric}: {value:.4f}")
+
+    if calib_loader is not None:
+        calibrators = calibrate_probabilities(model, calib_loader, device, categories)
+        calibrated_metrics = evaluate(
+            model, test_loader, device, categories, calibrators=calibrators
+        )
+        print("\n=== Final Test Results (calibrated) ===")
+        for metric, value in calibrated_metrics.items():
+            print(f"{metric}: {value:.4f}")
 
 
 if __name__ == "__main__":
