@@ -2,7 +2,7 @@
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
         download-sample-cases download-wayback-files parse-pdfs classification-review \
-        classification
+        classification retrain-classifier-bootstrap
 
 # The default shell for make
 SHELL := /bin/bash
@@ -167,7 +167,19 @@ classification: ensure-venv
 	@echo ""
 	@echo "Done. Review data/classification_empty_cases.txt for cases with nothing"
 	@echo "downloadable, then retrain with:"
-	@echo "  uv run python scripts/train_bert_classifier.py --input-field summary"
+	@echo "  uv run python scripts/train_bert_classifier.py --input-field summary --exclude-categories class_action"
+	@echo "or, for the bootstrap ensemble:"
+	@echo "  make retrain-classifier-bootstrap"
+
+# Bootstrap training resumes by default, skipping any bootstrap_XXXX model
+# already marked DONE. Pass FORCE=1 to wipe the ensemble dir first and
+# retrain every model from scratch.
+retrain-classifier-bootstrap: ensure-venv
+ifeq ($(FORCE),1)
+	rm -rf data/classification_bootstrap_models
+endif
+	$(PYTHON) scripts/train_bert_classifier.py --input-field summary \
+		--exclude-categories class_action --bootstrap-iterations 100
 
 test-pdf-parser: ensure-venv
 	@echo "Testing PDF parser on sample document..."
