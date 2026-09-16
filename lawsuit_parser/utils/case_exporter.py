@@ -306,8 +306,12 @@ class CaseExporter:
             case_data, documents, case_history, transcriptions_by_doc, text_paths_by_doc, pdf_metadata_by_doc
         )
 
-        # Save JSON
+        # Save JSON. DVC checks out cached files read-only (0444) to protect
+        # its cache; truncate-writing into one raises PermissionError even
+        # for the owner, so unlink first when overwriting.
         json_path = case_dir / f"case_{case_id}.json"
+        if json_path.exists():
+            json_path.unlink()
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(denormalized_case, f, indent=2, default=str)
 
@@ -317,6 +321,7 @@ class CaseExporter:
         self,
         case_ids: list[int] | None = None,
         skip_if_exists: bool = True,
+        force_refresh: bool = False,
     ) -> dict[str, int]:
         """Export many cases using bulk queries instead of one round-trip per case.
 
@@ -336,6 +341,12 @@ class CaseExporter:
                 downloading files for an entire table is rarely intended.
             skip_if_exists: If True, skip a case whose JSON file already
                 exists (allows resuming an interrupted batch). Default True.
+            force_refresh: If True, bypass fetch_from_postgres's query-hash
+                cache (data/cache/*.parquet) and re-query the DB instead of
+                reusing a prior run's result. Without this, re-running with
+                the same case_ids (e.g. to refresh a stale export via
+                skip_if_exists=False) silently serves the same old cached
+                rows - the JSON gets rewritten, but with unchanged data.
 
         Returns:
             Dict of counts: total, successful, skipped, failed, no_documents.
@@ -349,8 +360,10 @@ class CaseExporter:
             FROM {self.cases_table}
             {"WHERE id = ANY(" + _pg_bigint_array(case_ids) + ")" if case_ids is not None else ""}
         """
-        print(f"Fetching {len(case_ids) if case_ids is not None else 'all'} case rows (cached)...")
-        cases_df = fetch_from_postgres(cases_query, port=SCRAPPING_DB_PORT)
+        print(f"Fetching {len(case_ids) if case_ids is not None else 'all'} case rows...")
+        cases_df = fetch_from_postgres(
+            cases_query, port=SCRAPPING_DB_PORT, force_refresh=force_refresh
+        )
 
         stats = {"total": len(cases_df), "successful": 0, "skipped": 0, "failed": 0, "no_documents": 0}
         if cases_df.empty:
@@ -382,12 +395,18 @@ class CaseExporter:
             WHERE case_id = ANY({_pg_bigint_array(all_case_ids)})
             ORDER BY case_file_id, page
         """
-        print(f"Fetched {len(cases_df)} cases. Fetching documents for {len(docket_ids)} dockets (cached)...")
-        docs_df = fetch_from_postgres(docs_query, port=SCRAPPING_DB_PORT)
-        print(f"Fetched {len(docs_df)} documents. Fetching case history (cached)...")
-        history_df = fetch_from_postgres(history_query, port=SCRAPPING_DB_PORT)
-        print(f"Fetched {len(history_df)} history rows. Fetching transcriptions (cached)...")
-        transcriptions_df = fetch_from_postgres(transcriptions_query, port=SCRAPPING_DB_PORT)
+        print(f"Fetched {len(cases_df)} cases. Fetching documents for {len(docket_ids)} dockets...")
+        docs_df = fetch_from_postgres(
+            docs_query, port=SCRAPPING_DB_PORT, force_refresh=force_refresh
+        )
+        print(f"Fetched {len(docs_df)} documents. Fetching case history...")
+        history_df = fetch_from_postgres(
+            history_query, port=SCRAPPING_DB_PORT, force_refresh=force_refresh
+        )
+        print(f"Fetched {len(history_df)} history rows. Fetching transcriptions...")
+        transcriptions_df = fetch_from_postgres(
+            transcriptions_query, port=SCRAPPING_DB_PORT, force_refresh=force_refresh
+        )
         print(f"Fetched {len(transcriptions_df)} transcription rows. Building per-case JSON...")
 
         docs_by_docket = {k: v for k, v in docs_df.groupby("docket_id")}
@@ -436,6 +455,11 @@ class CaseExporter:
                     case_row, documents, case_history, transcriptions_by_doc,
                     text_paths_by_doc, pdf_metadata_by_doc,
                 )
+                # DVC checks out cached files read-only (0444) to protect its
+                # cache; truncate-writing into one raises PermissionError even
+                # for the owner, so unlink first when overwriting.
+                if json_path.exists():
+                    json_path.unlink()
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(denormalized_case, f, indent=2, default=str)
                 stats["successful"] += 1

@@ -2,6 +2,7 @@
 
 import glob
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass, field, asdict
@@ -20,8 +21,8 @@ from docling.datamodel.object_detection_engine_options import (
     OnnxRuntimeObjectDetectionEngineOptions,
 )
 from docling.models.inference_engines.object_detection.base import ObjectDetectionEngineType
-from docling_core.types.doc import DocItemLabel
-from docling_core.types.doc.base import ImageRefMode
+from docling_core.types.doc import DocItemLabel, ProvenanceItem
+from docling_core.types.doc.base import BoundingBox, CoordOrigin, ImageRefMode
 
 
 @dataclass
@@ -160,6 +161,78 @@ def _build_converter(use_gpu: bool, num_threads: int = 4) -> DocumentConverter:
     )
 
 
+def _fill_textless_pages_from_native_layer(doc: Any, pdf_path: Path) -> list[int]:
+    """Recover pages Docling's layout+OCR routing left with zero text.
+
+    _find_pdf_aware_layout_ocr_rects (docling's base_ocr_model.py) sends a
+    layout cluster to OCR whenever it finds no overlapping *programmatic*
+    PDF text cell there - the intent being "this must be a scanned/bitmap
+    region". Verified empirically (2026-09-16, classification sample) that
+    this occasionally misfires on pages that do have a native PDF text
+    layer - small, sparse clusters (e.g. a lightly-populated table) whose
+    layout-detected bbox doesn't spatially line up with the PDF's own text
+    cell positions. When that happens AND the fallback RapidOCR pass on the
+    resulting crop also comes back empty ("RapidOCR returned empty
+    result!"), the page ends up with no extracted text at all even though
+    `pdftotext`/pypdfium2 can read it fine directly.
+
+    This is a targeted safety net, not a general OCR replacement: it only
+    acts on pages Docling produced zero text items for, and only uses
+    pypdfium2 (already a docling dependency) to pull that page's native
+    text layer as-is. Pages that are genuinely scanned images with no text
+    layer stay empty, unchanged from today's behavior.
+
+    Returns the list of page numbers (1-based) that were patched.
+    """
+    per_page_chars: dict[int, int] = {}
+    for item, _level in doc.iterate_items():
+        text = getattr(item, "text", None)
+        if not text:
+            continue
+        for prov in getattr(item, "prov", []) or []:
+            per_page_chars[prov.page_no] = per_page_chars.get(prov.page_no, 0) + len(text)
+
+    textless_pages = sorted(pg for pg in doc.pages if per_page_chars.get(pg, 0) == 0)
+    if not textless_pages:
+        return []
+
+    import pypdfium2 as pdfium
+
+    patched = []
+    pdfium_doc = pdfium.PdfDocument(str(pdf_path))
+    try:
+        for page_no in textless_pages:
+            if page_no - 1 >= len(pdfium_doc):
+                continue
+            native_text = pdfium_doc[page_no - 1].get_textpage().get_text_range().strip()
+            if not native_text:
+                continue
+
+            page_size = doc.pages[page_no].size
+            doc.add_text(
+                label=DocItemLabel.TEXT,
+                text=native_text,
+                prov=ProvenanceItem(
+                    page_no=page_no,
+                    bbox=BoundingBox(
+                        l=0, t=0, r=page_size.width, b=page_size.height,
+                        coord_origin=CoordOrigin.TOPLEFT,
+                    ),
+                    charspan=(0, len(native_text)),
+                ),
+            )
+            patched.append(page_no)
+    finally:
+        pdfium_doc.close()
+
+    if patched:
+        logging.getLogger(__name__).warning(
+            "%s: recovered native text on %d page(s) Docling left empty: %s",
+            pdf_path.name, len(patched), patched,
+        )
+    return patched
+
+
 def parse_pdf_document(
     pdf_path: str | Path,
     use_gpu: bool = True,
@@ -233,7 +306,6 @@ def parse_pdf_document(
     converter = _build_converter(use_gpu, num_threads)
 
     # Debug: log GPU usage setting
-    import logging
     logger = logging.getLogger(__name__)
     logger.info(f"Parsing {pdf_path.name} with ONNX runtime layout model (GPU-enabled), use_gpu={use_gpu}")
 
@@ -243,6 +315,10 @@ def parse_pdf_document(
 
         # Extract structured content
         doc = result.document
+
+        # Recover pages Docling's OCR routing left textless despite a
+        # native PDF text layer being present (see docstring).
+        _fill_textless_pages_from_native_layer(doc, pdf_path)
 
         image_mode = ImageRefMode.EMBEDDED if extract_images else ImageRefMode.PLACEHOLDER
 

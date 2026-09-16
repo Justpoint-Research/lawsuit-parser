@@ -40,10 +40,15 @@ SCRAPPING_DB_PORT = 5433
 SCHEMA = "courts_final"
 
 
-def export_il_cases(output_dir: Path, require_documents: bool = True, skip_if_exists: bool = True) -> dict[str, int]:
+def export_il_cases(
+    output_dir: Path,
+    require_documents: bool = True,
+    skip_if_exists: bool = True,
+    force_refresh: bool = False,
+) -> dict[str, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Fetching il_cases rows (cached)...")
+    print("Fetching il_cases rows...")
     cases_df = fetch_from_postgres(
         f"""
         SELECT id, case_key, case_number, case_url, title, nature, filed_date,
@@ -52,6 +57,7 @@ def export_il_cases(output_dir: Path, require_documents: bool = True, skip_if_ex
         FROM {SCHEMA}.il_cases
         """,
         port=SCRAPPING_DB_PORT,
+        force_refresh=force_refresh,
     )
 
     stats = {"total": len(cases_df), "successful": 0, "skipped": 0, "failed": 0, "no_documents": 0}
@@ -60,7 +66,7 @@ def export_il_cases(output_dir: Path, require_documents: bool = True, skip_if_ex
 
     case_keys = cases_df["case_key"].dropna().unique().tolist()
 
-    print(f"Fetched {len(cases_df)} cases. Fetching documents for {len(case_keys)} case_keys (cached)...")
+    print(f"Fetched {len(cases_df)} cases. Fetching documents for {len(case_keys)} case_keys...")
     docs_df = fetch_from_postgres(
         f"""
         SELECT id, document_id, case_key, case_number, document_type,
@@ -71,11 +77,12 @@ def export_il_cases(output_dir: Path, require_documents: bool = True, skip_if_ex
         ORDER BY id
         """,
         port=SCRAPPING_DB_PORT,
+        force_refresh=force_refresh,
     )
     docs_df = docs_df[docs_df["case_key"].isin(case_keys)]
 
     document_ids = docs_df["document_id"].dropna().unique().tolist()
-    print(f"Fetched {len(docs_df)} documents. Fetching files for {len(document_ids)} documents (cached)...")
+    print(f"Fetched {len(docs_df)} documents. Fetching files for {len(document_ids)} documents...")
     files_df = fetch_from_postgres(
         f"""
         SELECT id, file_id, document_id, case_key, title, file_url,
@@ -85,6 +92,7 @@ def export_il_cases(output_dir: Path, require_documents: bool = True, skip_if_ex
         ORDER BY id
         """,
         port=SCRAPPING_DB_PORT,
+        force_refresh=force_refresh,
     )
     files_df = files_df[files_df["document_id"].isin(document_ids)]
     print(f"Fetched {len(files_df)} files. Building per-case JSON...")
@@ -128,6 +136,10 @@ def export_il_cases(output_dir: Path, require_documents: bool = True, skip_if_ex
                     "exported_at": datetime.now().isoformat(),
                 },
             }
+            # DVC checks out cached files read-only (0444); truncate-writing
+            # into one raises PermissionError even for the owner.
+            if json_path.exists():
+                json_path.unlink()
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(denormalized_case, f, indent=2, default=str)
             stats["successful"] += 1
@@ -147,13 +159,25 @@ def main():
         action="store_false",
         help="also export cases with zero documents (skipped by default, matching the NY export)",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-fetch and overwrite cases whose JSON already exists instead "
+        "of skipping them, and bypass fetch_from_postgres's query cache "
+        "(default: skip + reuse cache). Use this to refresh a stale export.",
+    )
     args = parser.parse_args()
 
     print("=" * 80)
     print("Illinois Case Exporter")
     print("=" * 80)
 
-    stats = export_il_cases(args.output_dir, require_documents=args.require_documents)
+    stats = export_il_cases(
+        args.output_dir,
+        require_documents=args.require_documents,
+        skip_if_exists=not args.overwrite,
+        force_refresh=args.overwrite,
+    )
 
     print("\n" + "=" * 80)
     print("Export complete!")

@@ -97,6 +97,7 @@ def export_cases(
     use_gpu: bool = True,
     download_files: bool = False,
     extraction_dir: Path = Path("data/extraction"),
+    overwrite: bool = False,
 ):
     """Export multiple cases via bulk queries (4 queries total, not 4 per case).
 
@@ -118,6 +119,10 @@ def export_cases(
             extract_text=True (default: data/extraction). Keep this
             parallel to output_dir - e.g. output_dir=data/cases/ny_sample
             should pair with extraction_dir=data/extraction/ny_sample.
+        overwrite: If True, re-fetch and overwrite cases whose JSON already
+            exists instead of skipping them - use this to refresh a stale
+            export against the DB's current state (e.g. document_bucket_link
+            values backfilled after the original export ran).
     """
     engine = create_scrapping_engine()
 
@@ -135,7 +140,9 @@ def export_cases(
         )
 
         print(f"Exporting {len(case_ids)} cases (download_files={download_files})...")
-        stats = exporter.export_cases_bulk(case_ids, skip_if_exists=True)
+        stats = exporter.export_cases_bulk(
+            case_ids, skip_if_exists=not overwrite, force_refresh=overwrite
+        )
 
         print("\n" + "=" * 80)
         print(f"Export complete!")
@@ -229,6 +236,13 @@ def main():
         "e.g. --output-dir data/cases/ny_sample should pair with "
         "--extraction-dir data/extraction/ny_sample.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-fetch and overwrite cases whose JSON already exists instead "
+        "of skipping them (default: skip). Use this to refresh a stale "
+        "export against the DB's current state.",
+    )
 
     args = parser.parse_args()
 
@@ -277,6 +291,7 @@ def main():
         use_gpu=not args.no_gpu,
         download_files=args.download_files,
         extraction_dir=args.extraction_dir,
+        overwrite=args.overwrite,
     )
 
 

@@ -1,5 +1,5 @@
 outs:
-- md5: 4b78f67f7a6d33aa1fd7cd81ad33391a
-  size: 192311
+- md5: 0aa6834b04ab71984533824affe53ee8
+  size: 171442
   hash: md5
   path: classification_sample_doc_selection.json

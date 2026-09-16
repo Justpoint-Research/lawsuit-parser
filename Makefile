@@ -2,7 +2,7 @@
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
         download-sample-cases download-wayback-files parse-pdfs classification-review \
-        classification retrain-classifier-bootstrap
+        classification retrain-classifier-bootstrap after-search-zip
 
 # The default shell for make
 SHELL := /bin/bash
@@ -42,6 +42,7 @@ help:
 	@echo "  make test-pdf-parser   - Test PDF parser on sample document"
 	@echo "  make download_sample_cases - Export sample cases (95, 227, 309, 377, 2303) to data/cases"
 	@echo "  make download-wayback-files - Download archived MDL files from Wayback Machine"
+	@echo "  make after-search-zip  - Zip every data/cases/*_after_search export into data/cases/after_search.zip"
 	@echo ""
 	@echo "Database commands:"
 	@echo "  make sql-proxy-setup   - Download Cloud SQL proxy binary"
@@ -216,6 +217,18 @@ download-wayback-files: ensure-venv
 		-f medical-research-data/MDL_summaries.txt \
 		-d medical-research-data/archived_files \
 		--delay 1.0
+
+after-search-zip:
+	@cd data/cases && STATE_DIRS=$$(ls -d *_after_search 2>/dev/null); \
+	if [ -z "$$STATE_DIRS" ]; then \
+		echo "No *_after_search directories found under data/cases - nothing to zip."; \
+		exit 1; \
+	fi; \
+	echo "Zipping: $$STATE_DIRS"; \
+	rm -f after_search.zip; \
+	zip -rq after_search.zip $$STATE_DIRS -x '*.DS_Store'; \
+	echo "Wrote data/cases/after_search.zip"; \
+	echo "Run 'uv run dvc add data/cases/after_search.zip' to update the tracked pointer."
 
 # ---------------------------------------------------------------------------
 # Database / Cloud SQL Proxy
