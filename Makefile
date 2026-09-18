@@ -172,13 +172,11 @@ classification: ensure-venv
 	@echo "or, for the bootstrap ensemble:"
 	@echo "  make retrain-classifier-bootstrap"
 
-# Bootstrap training resumes by default, skipping any bootstrap_XXXX model
-# already marked DONE. Pass FORCE=1 to wipe the ensemble dir first and
-# retrain every model from scratch.
+# Always a full retrain: wipes the ensemble dir first so every bootstrap
+# model (and its DONE marker/cached logits) is retrained from scratch,
+# rather than resuming a prior run.
 retrain-classifier-bootstrap: ensure-venv
-ifeq ($(FORCE),1)
 	rm -rf data/classification_bootstrap_models
-endif
 	$(PYTHON) scripts/train_bert_classifier.py --input-field summary \
 		--exclude-categories class_action --bootstrap-iterations 100
 
