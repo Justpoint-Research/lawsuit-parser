@@ -1,0 +1,6 @@
+outs:
+- md5: 89f72dacfbcdd7381de2cb4ade4fea5f.dir
+  size: 4041300
+  nfiles: 2727
+  hash: md5
+  path: tx_after_search

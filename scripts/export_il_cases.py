@@ -69,7 +69,7 @@ def export_il_cases(
     print(f"Fetched {len(cases_df)} cases. Fetching documents for {len(case_keys)} case_keys...")
     docs_df = fetch_from_postgres(
         f"""
-        SELECT id, document_id, case_key, case_number, document_type,
+        SELECT id, document_id, case_key, case_number, case_url, document_type,
                description, filed_by, party, posted_date, document_url,
                search_year, filed_for, means_received, date_filed,
                file_count, storage_paths, created_at, updated_at
@@ -126,6 +126,23 @@ def export_il_cases(
                 "case_info": case_row,
                 "documents": documents,
                 "case_history": [],
+                # Same field names/shape as CaseExporter's "normalized" block
+                # (lawsuit_parser/utils/case_exporter.py) and export_fl_cases.py/
+                # export_tx_cases.py's own - a consistent cross-state view
+                # alongside the untouched, state-specific case_info above.
+                "normalized": {
+                    "state": "il",
+                    "internal_id": case_id,
+                    "case_number": case_row.get("case_number"),
+                    "unique_key": case_key,
+                    "caption": case_row.get("title"),
+                    "court": None,
+                    "case_status": case_row.get("case_status"),
+                    "case_type": case_row.get("case_type"),
+                    "filed_date": case_row.get("filed_date"),
+                    "total_documents": len(documents),
+                    "total_history_entries": 0,
+                },
                 "summary": {
                     "total_documents": len(documents),
                     "case_key": case_key,

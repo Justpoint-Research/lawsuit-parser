@@ -192,6 +192,7 @@ class CaseExporter:
                 court_id,
                 case_type,
                 documents_scrapped_at,
+                summary_file_storage_location,
                 created_at,
                 updated_at
             FROM {self.cases_table}
@@ -356,6 +357,7 @@ class CaseExporter:
                 id, docket_id, query_link, case_id, case_link,
                 case_received_date, efiling_status, case_status, caption,
                 court, court_id, case_type, documents_scrapped_at,
+                summary_file_storage_location,
                 created_at, updated_at
             FROM {self.cases_table}
             {"WHERE id = ANY(" + _pg_bigint_array(case_ids) + ")" if case_ids is not None else ""}
@@ -543,6 +545,25 @@ class CaseExporter:
             "case_info": case_data,
             "documents": processed_docs,
             "case_history": case_history,
+            # Cross-state consistent view: same field names/shape as the
+            # "normalized" block in export_fl_cases.py/export_il_cases.py/
+            # export_tx_cases.py, so a consumer that wants to work across
+            # states doesn't need to know each state's raw column names.
+            # case_info above is untouched and still carries every raw
+            # DB column for state-specific consumers.
+            "normalized": {
+                "state": self.state_code or None,
+                "internal_id": case_data.get("id"),
+                "case_number": case_data.get("case_id"),
+                "unique_key": case_data.get("docket_id"),
+                "caption": case_data.get("caption"),
+                "court": case_data.get("court"),
+                "case_status": case_data.get("case_status"),
+                "case_type": case_data.get("case_type"),
+                "filed_date": case_data.get("case_received_date"),
+                "total_documents": len(documents),
+                "total_history_entries": len(case_history),
+            },
             "summary": {
                 "total_documents": len(documents),
                 "case_id": case_data.get("case_id"),

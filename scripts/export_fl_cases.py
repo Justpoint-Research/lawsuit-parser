@@ -4,11 +4,27 @@
 Florida's after_search table (courts_final.fl_cases_after_search - cases
 matched to the mass-tort defendant search terms, same concept as NY's
 ny_cases_after_search) has a different column set than NY and joins to its
-documents table on an integer case_id rather than a docket_id, so it can't go
+documents table on case_instance_uuid rather than a docket_id, so it can't go
 through scripts/export_cases.py / CaseExporter. This mirrors that script's
 shape (bulk-fetch the tables once, group in memory, write one denormalized
 case_<id>.json per case) but targets fl_cases_after_search / fl_docket_documents
 instead.
+
+Also pulls in two tables the original version of this script never touched:
+- fl_cases: a fuller per-case row (case_caption, location, group/panel flags)
+  than fl_cases_after_search carries - merged into case_info.
+- fl_docket_entries: the actual docket/timeline entries for each case -
+  fills case_history (previously always []), mirroring how NY's case_history
+  comes from ny_cases.
+
+case_instance_uuid is the only key shared consistently across all of FL's
+tables. fl_cases_after_search.id and fl_docket_entries.case_id / fl_cases.id
+are independent id sequences (confirmed by joining a sample: matching ids
+pointed at unrelated case_numbers) - NEVER join FL tables on the bare
+integer id/case_id across tables. Joining fl_docket_documents by case_id
+(the previous behavior) undercounted documents by more than half compared to
+joining by case_instance_uuid (1,243 vs 2,827 matched documents in a
+same-day check) - that join has been fixed here.
 
 Metadata-only by design (no GCS downloads) - fl_docket_documents.storage_path /
 document_url point at the underlying files if a download pass is added later.
@@ -40,6 +56,30 @@ logger = logging.getLogger(__name__)
 SCRAPPING_DB_PORT = 5433
 SCHEMA = "courts_final"
 
+# Substantive extra fields fl_cases carries beyond fl_cases_after_search
+# (excludes fl_cases' own scrape-bookkeeping columns: details_status,
+# details_attempts, details_claimed_at, details_claimed_by, details_fetched_at,
+# details_error - and the columns already present on fl_cases_after_search).
+FL_CASES_EXTRA_FIELDS = [
+    "case_caption",
+    "case_class_group_type",
+    "case_class_group_type_id",
+    "location",
+    "location_id",
+    "case_group_flag",
+    "panel_flag",
+]
+
+
+def _pg_text_array(values: list[str]) -> str:
+    """Render strings as a Postgres ``ARRAY[...]::text[]`` literal.
+
+    Mirrors lawsuit_parser.utils.case_exporter._pg_text_array - embedding the
+    id list in the query text (rather than a bound parameter) is what lets
+    fetch_from_postgres's query-hash cache reuse a prior run's result.
+    """
+    return "ARRAY[" + ",".join("'" + str(v).replace("'", "''") + "'" for v in values) + "]::text[]"
+
 
 def export_fl_cases(
     output_dir: Path,
@@ -66,9 +106,21 @@ def export_fl_cases(
     if cases_df.empty:
         return stats
 
-    case_ids = cases_df["id"].tolist()
+    case_uuids = cases_df["case_instance_uuid"].dropna().unique().tolist()
 
-    print(f"Fetched {len(cases_df)} cases. Fetching documents for {len(case_ids)} cases...")
+    print(f"Fetched {len(cases_df)} cases. Fetching fuller fl_cases rows for {len(case_uuids)} cases...")
+    full_cases_df = fetch_from_postgres(
+        f"""
+        SELECT case_instance_uuid, {", ".join(FL_CASES_EXTRA_FIELDS)}
+        FROM {SCHEMA}.fl_cases
+        WHERE case_instance_uuid = ANY({_pg_text_array(case_uuids)})
+        """,
+        port=SCRAPPING_DB_PORT,
+        force_refresh=force_refresh,
+    )
+    full_case_by_uuid = full_cases_df.set_index("case_instance_uuid").to_dict("index")
+
+    print(f"Fetched {len(full_cases_df)} fl_cases rows. Fetching documents for {len(case_uuids)} cases...")
     docs_df = fetch_from_postgres(
         f"""
         SELECT id, case_id, case_instance_uuid, docket_entry_uuid,
@@ -77,18 +129,38 @@ def export_fl_cases(
                document_url, download_status, downloaded_at, downloaded_size,
                storage_path, created_at, updated_at
         FROM {SCHEMA}.fl_docket_documents
+        WHERE case_instance_uuid = ANY({_pg_text_array(case_uuids)})
         ORDER BY id
         """,
         port=SCRAPPING_DB_PORT,
         force_refresh=force_refresh,
     )
-    docs_df = docs_df[docs_df["case_id"].isin(case_ids)]
-    print(f"Fetched {len(docs_df)} documents. Building per-case JSON...")
+    print(f"Fetched {len(docs_df)} documents. Fetching docket entries for {len(case_uuids)} cases...")
+    entries_df = fetch_from_postgres(
+        f"""
+        SELECT id, case_id, case_instance_uuid, docket_entry_uuid, filed_date,
+               submitted_date, docket_entry_type, docket_entry_type_id,
+               docket_entry_sub_type, docket_entry_sub_type_id,
+               docket_entry_name, docket_entry_status, docket_entry_status_id,
+               docket_entry_description, official, document_count,
+               secured_document, security1, security2, security3, security4,
+               security5, composite_security, submitted_by, created_at,
+               updated_at
+        FROM {SCHEMA}.fl_docket_entries
+        WHERE case_instance_uuid = ANY({_pg_text_array(case_uuids)})
+        ORDER BY case_instance_uuid, filed_date
+        """,
+        port=SCRAPPING_DB_PORT,
+        force_refresh=force_refresh,
+    )
+    print(f"Fetched {len(entries_df)} docket entries. Building per-case JSON...")
 
-    docs_by_case = {k: v for k, v in docs_df.groupby("case_id")}
+    docs_by_case = {k: v for k, v in docs_df.groupby("case_instance_uuid")}
+    entries_by_case = {k: v for k, v in entries_df.groupby("case_instance_uuid")}
 
     for case_row in tqdm(cases_df.to_dict("records"), desc="Exporting FL cases", unit="case"):
         case_id = case_row["id"]
+        case_uuid = case_row["case_instance_uuid"]
 
         case_dir = output_dir / f"case_{case_id}"
         json_path = case_dir / f"case_{case_id}.json"
@@ -96,23 +168,48 @@ def export_fl_cases(
             stats["skipped"] += 1
             continue
 
-        doc_group = docs_by_case.get(case_id)
+        doc_group = docs_by_case.get(case_uuid)
         documents = doc_group.to_dict("records") if doc_group is not None else []
         if not documents and require_documents:
             stats["no_documents"] += 1
             continue
 
+        entry_group = entries_by_case.get(case_uuid)
+        case_history = entry_group.to_dict("records") if entry_group is not None else []
+
+        case_info = dict(case_row)
+        case_info.update(full_case_by_uuid.get(case_uuid, {}))
+
         try:
             case_dir.mkdir(parents=True, exist_ok=True)
             denormalized_case = {
-                "case_info": case_row,
+                "case_info": case_info,
                 "documents": documents,
-                "case_history": [],
+                "case_history": case_history,
+                # Same field names/shape as CaseExporter._create_denormalized_json's
+                # "normalized" block (lawsuit_parser/utils/case_exporter.py) and
+                # export_il_cases.py/export_tx_cases.py's own - a consistent
+                # cross-state view alongside the untouched, state-specific
+                # case_info above. FL has no single case_status string; a
+                # case is "closed" once closed_flag is set, "open" otherwise.
+                "normalized": {
+                    "state": "fl",
+                    "internal_id": case_id,
+                    "case_number": case_info.get("case_number"),
+                    "unique_key": case_uuid,
+                    "caption": case_info.get("case_caption") or case_info.get("case_title"),
+                    "court": case_info.get("court_id"),
+                    "case_status": "closed" if case_info.get("closed_flag") else "open",
+                    "case_type": case_info.get("case_classification"),
+                    "filed_date": case_info.get("filed_date"),
+                    "total_documents": len(documents),
+                    "total_history_entries": len(case_history),
+                },
                 "summary": {
                     "total_documents": len(documents),
-                    "case_number": case_row.get("case_number"),
-                    "case_title": case_row.get("case_title"),
-                    "case_classification": case_row.get("case_classification"),
+                    "case_number": case_info.get("case_number"),
+                    "case_title": case_info.get("case_title"),
+                    "case_classification": case_info.get("case_classification"),
                     "files_downloaded": False,
                     "text_extraction_enabled": False,
                     "exported_at": datetime.now().isoformat(),

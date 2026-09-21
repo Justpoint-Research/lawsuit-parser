@@ -2,7 +2,8 @@
         sql-proxy-setup auth run-proxy ensure-proxy-bin ensure-auth test-pdf-parser \
         install-vllm download-nuextract run-vllm check-vllm check-gpu \
         download-sample-cases download-wayback-files parse-pdfs classification-review \
-        classification retrain-classifier-bootstrap after-search-zip
+        classification retrain-classifier-bootstrap after-search-zip \
+        after-search-refresh-all
 
 # The default shell for make
 SHELL := /bin/bash
@@ -20,6 +21,19 @@ LOCAL_BIN := $(HOME)/.local/bin
 INSTANCE ?= data-382711:us-central1:hidden-danger
 QUOTA_PROJECT ?= data-382711
 DB_PORT ?= 5432
+
+# States exported via the generic scripts/export_cases.py / CaseExporter
+# (docket_id-keyed cases/documents tables, same shape as NY). fl, il and tx
+# are NOT in this list even though they have their own after_search exports -
+# each uses a different schema (fl joins documents on case_instance_uuid, no
+# docket_id at all; il has no "after_search" split and joins case_key ->
+# document_id -> file_id across three tables, and its crawler hit the wrong
+# source entirely - ICC utility dockets, not lawsuits, see data/cases/il_cases;
+# tx has no per-document table at all, only raw HTML captures - see
+# scripts/export_tx_cases.py) so they go through their own dedicated
+# scripts/export_{fl,il,tx}_cases.py in after-search-refresh-all below
+# instead of this generic loop.
+AFTER_SEARCH_STATES ?= ny
 
 # ---------------------------------------------------------------------------
 # Help
@@ -43,6 +57,9 @@ help:
 	@echo "  make download_sample_cases - Export sample cases (95, 227, 309, 377, 2303) to data/cases"
 	@echo "  make download-wayback-files - Download archived MDL files from Wayback Machine"
 	@echo "  make after-search-zip  - Zip every data/cases/*_after_search export into data/cases/after_search.zip"
+	@echo "  make after-search-refresh-all - Re-fetch+overwrite the after_search metadata export for ny"
+	@echo "                           ($(AFTER_SEARCH_STATES)) via export_cases.py, plus fl, il and tx via their own"
+	@echo "                           dedicated exporters, then zip the result (chains after-search-zip)"
 	@echo ""
 	@echo "Database commands:"
 	@echo "  make sql-proxy-setup   - Download Cloud SQL proxy binary"
@@ -227,6 +244,40 @@ after-search-zip:
 	zip -rq after_search.zip $$STATE_DIRS -x '*.DS_Store'; \
 	echo "Wrote data/cases/after_search.zip"; \
 	echo "Run 'uv run dvc add data/cases/after_search.zip' to update the tracked pointer."
+
+# Force-refreshes the metadata-only after_search export for every state in
+# AFTER_SEARCH_STATES against the DB's current contents, then zips the result.
+# --overwrite re-fetches cases whose JSON already exists (instead of skipping
+# them) since document_bucket_link and similar fields are async-backfilled
+# after the initial docket scrape and a stale export can look incomplete -
+# see memory ny_document_bucket_link_gaps. Re-dumps each state's case-id file
+# first so newly-scraped cases are picked up too, not just refreshed ones.
+after-search-refresh-all: ensure-venv
+	@echo "Make sure the Cloud SQL Proxy is running: make run-proxy"
+	@for state in $(AFTER_SEARCH_STATES); do \
+		echo "=== $$state: refreshing case ID list ==="; \
+		$(PYTHON) scripts/get_all_case_ids.py --table-prefix $${state}_ --output $${state}_case_ids.txt || exit 1; \
+		echo "=== $$state: force-overwriting after_search metadata export ==="; \
+		$(PYTHON) scripts/export_cases.py \
+			--case-ids-file $${state}_case_ids.txt \
+			--output-dir data/cases/$${state}_after_search \
+			--table-prefix $${state}_ \
+			--overwrite || exit 1; \
+	done
+	@echo "=== fl: force-overwriting after_search export via export_fl_cases.py (different schema than ny) ==="
+	@$(PYTHON) scripts/export_fl_cases.py \
+		--output-dir data/cases/fl_after_search \
+		--overwrite || exit 1
+	@echo "=== il: force-overwriting full case dump via export_il_cases.py (no after_search schema exists for il) ==="
+	@$(PYTHON) scripts/export_il_cases.py \
+		--output-dir data/cases/il_after_search \
+		--overwrite \
+		--no-require-documents || exit 1
+	@echo "=== tx: force-overwriting case-metadata-only export via export_tx_cases.py (no parsed document table exists for tx) ==="
+	@$(PYTHON) scripts/export_tx_cases.py \
+		--output-dir data/cases/tx_after_search \
+		--overwrite || exit 1
+	$(MAKE) after-search-zip
 
 # ---------------------------------------------------------------------------
 # Database / Cloud SQL Proxy
