@@ -29,11 +29,17 @@ DB_PORT ?= 5432
 # docket_id at all; il has no "after_search" split and joins case_key ->
 # document_id -> file_id across three tables, and its crawler hit the wrong
 # source entirely - ICC utility dockets, not lawsuits, see data/cases/il_cases;
-# tx has no per-document table at all, only raw HTML captures - see
-# scripts/export_tx_cases.py) so they go through their own dedicated
+# tx documents live in tx_documents keyed on (coa, case_number), not a
+# docket_id - see scripts/export_tx_cases.py) so they go through their own dedicated
 # scripts/export_{fl,il,tx}_cases.py in after-search-refresh-all below
 # instead of this generic loop.
 AFTER_SEARCH_STATES ?= ny
+
+# States exported via scripts/export_state_cases.py (one script, per-state
+# config): each has its own schema (mn/ok: after_search table + separate
+# detail/party/event/document tables; ca: a single ca_cases table plus
+# ca_opinions), so none fit the generic export_cases.py loop above.
+STATE_EXPORT_STATES ?= mn ok ca
 
 # ---------------------------------------------------------------------------
 # Help
@@ -59,7 +65,8 @@ help:
 	@echo "  make after-search-zip  - Zip every data/cases/*_after_search export into data/cases/after_search.zip"
 	@echo "  make after-search-refresh-all - Re-fetch+overwrite the after_search metadata export for ny"
 	@echo "                           ($(AFTER_SEARCH_STATES)) via export_cases.py, plus fl, il and tx via their own"
-	@echo "                           dedicated exporters, then zip the result (chains after-search-zip)"
+	@echo "                           dedicated exporters and $(STATE_EXPORT_STATES) via export_state_cases.py,"
+	@echo "                           then zip the result (chains after-search-zip)"
 	@echo ""
 	@echo "Database commands:"
 	@echo "  make sql-proxy-setup   - Download Cloud SQL proxy binary"
@@ -268,15 +275,20 @@ after-search-refresh-all: ensure-venv
 	@$(PYTHON) scripts/export_fl_cases.py \
 		--output-dir data/cases/fl_after_search \
 		--overwrite || exit 1
-	@echo "=== il: force-overwriting full case dump via export_il_cases.py (no after_search schema exists for il) ==="
+	@echo "=== il: force-overwriting export via export_il_cases.py (no after_search schema exists for il) ==="
 	@$(PYTHON) scripts/export_il_cases.py \
 		--output-dir data/cases/il_after_search \
-		--overwrite \
-		--no-require-documents || exit 1
-	@echo "=== tx: force-overwriting case-metadata-only export via export_tx_cases.py (no parsed document table exists for tx) ==="
+		--overwrite || exit 1
+	@echo "=== tx: force-overwriting export via export_tx_cases.py (documents joined from tx_documents on coa+case_number) ==="
 	@$(PYTHON) scripts/export_tx_cases.py \
 		--output-dir data/cases/tx_after_search \
 		--overwrite || exit 1
+	@for state in $(STATE_EXPORT_STATES); do \
+		echo "=== $$state: force-overwriting metadata export via export_state_cases.py ==="; \
+		$(PYTHON) scripts/export_state_cases.py --state $$state \
+			--output-dir data/cases/$${state}_after_search \
+			--overwrite || exit 1; \
+	done
 	$(MAKE) after-search-zip
 
 # ---------------------------------------------------------------------------

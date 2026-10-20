@@ -4,13 +4,25 @@
 Texas's after_search table (courts_final.tx_cases_after_search - cases
 matched to the mass-tort defendant search terms, same concept as NY's
 ny_cases_after_search / FL's fl_cases_after_search) uses a job-queue scraper
-(tx_jobs / tx_job_results / tx_workers) instead of per-document child tables.
-Document-level data isn't parsed into rows anywhere yet - tx_job_results
-stores raw unparsed HTML in its ``captures`` jsonb column (the "tx_files"
-flow) rather than a structured tx_documents table like FL's
-fl_docket_documents or IL's il_documents/il_document_files. So, unlike those
-two, this export is case-metadata-only: ``documents`` is always ``[]`` until
-someone builds an HTML-parsing pass over tx_job_results.captures.
+(tx_jobs / tx_job_results / tx_workers). Parsed document rows live in
+courts_final.tx_documents, keyed on (coa, case_number) - the same business key
+tx_cases_after_search is unique on (its integer ids are independent of
+tx_documents', so never join on them). Every tx_documents row is one
+downloadable file (file_url is always set) under a docket event identified by
+(section, row_seq), with section 'event' (docket entries) or 'brief'; one
+event can carry several files (doc_seq). So:
+
+- ``documents`` = every tx_documents row for the case, ordered by
+  (section, row_seq, doc_seq), each keeping its event fields.
+- ``case_history`` = one entry per distinct (section, row_seq) event, derived
+  from those rows (event_date/event_type/disposition/description, plus how
+  many documents the event carries). There is no separate docket-entry table.
+
+Only ~half of tx_cases_after_search has documents; cases never reached by the
+files flow are skipped by default (--no-require-documents exports them with
+``documents: []``, like the other states). And tx_documents is dominated by
+cases outside after_search, so the query joins in SQL rather than pulling the
+whole 2.8M-row table.
 
 courts_final.tx_cases is not used as a case_history source here: despite the
 name, it isn't a per-case snapshot history table (compare NY's ny_cases,
@@ -18,8 +30,12 @@ which is exactly that) - it's a separate, larger case population that
 overlaps with tx_cases_after_search only on the (coa, case_number) business
 key (its own ``id`` column is an independent sequence - a same-id join
 matches unrelated cases), and it carries no columns that
-tx_cases_after_search doesn't already have. So there is nothing here for it
-to usefully contribute; case_history is always [].
+tx_cases_after_search doesn't already have. History comes from tx_documents
+events instead (see above).
+
+Metadata-only (no GCS downloads); tx_documents.storage_path / file_url point at
+the underlying files. Scrape-queue bookkeeping (attempts, claims, priority) is
+left out.
 
 Usage:
     python scripts/export_tx_cases.py --output-dir data/cases/tx_after_search
@@ -29,9 +45,11 @@ import argparse
 import json
 import logging
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -49,8 +67,16 @@ SCRAPPING_DB_PORT = 5433
 SCHEMA = "courts_final"
 
 
+def _clean(value):
+    """NaN/NaT -> None so the JSON is valid (json.dump would emit bare NaN)."""
+    if value is pd.NaT or (isinstance(value, float) and value != value):
+        return None
+    return value
+
+
 def export_tx_cases(
     output_dir: Path,
+    require_documents: bool = True,
     skip_if_exists: bool = True,
     force_refresh: bool = False,
 ) -> dict[str, int]:
@@ -63,7 +89,8 @@ def export_tx_cases(
                case_type, coa_case_number, coa_case_url,
                trial_court_case_number, trial_court_county, trial_court,
                appellate_court, query, query_kind, term_id, job_id,
-               files_count, created_at, updated_at
+               files_status, files_fetched_at, files_error, files_count,
+               created_at, updated_at
         FROM {SCHEMA}.tx_cases_after_search
         """,
         port=SCRAPPING_DB_PORT,
@@ -74,9 +101,36 @@ def export_tx_cases(
     if cases_df.empty:
         return stats
 
-    print(f"Fetched {len(cases_df)} cases. Building per-case JSON...")
+    print(f"Fetched {len(cases_df)} cases. Fetching documents...")
+    docs_df = fetch_from_postgres(
+        f"""
+        SELECT d.id, d.coa, d.case_number, d.section, d.row_seq, d.doc_seq,
+               d.event_date, d.event_type, d.disposition, d.description,
+               d.remarks, d.doc_label, d.media_version_id, d.media_id,
+               d.doc_type, d.file_url, d.size_label, d.size_estimate,
+               d.job_id, d.download_status, d.downloaded_at,
+               d.downloaded_size, d.storage_path, d.content_type,
+               d.download_error, d.created_at, d.updated_at
+        FROM {SCHEMA}.tx_documents d
+        JOIN {SCHEMA}.tx_cases_after_search a
+          ON a.coa = d.coa AND a.case_number = d.case_number
+        ORDER BY d.coa, d.case_number, d.section, d.row_seq, d.doc_seq
+        """,
+        port=SCRAPPING_DB_PORT,
+        force_refresh=force_refresh,
+    )
+    docs_by_case = defaultdict(list)
+    for row in docs_df.to_dict("records"):
+        docs_by_case[(row["coa"], row["case_number"])].append(
+            {k: _clean(v) for k, v in row.items()}
+        )
+    print(f"Fetched {len(docs_df)} documents. Building per-case JSON...")
 
-    for case_row in tqdm(cases_df.to_dict("records"), desc="Exporting TX cases", unit="case"):
+    for case_row in tqdm(
+        [{k: _clean(v) for k, v in row.items()} for row in cases_df.to_dict("records")],
+        desc="Exporting TX cases",
+        unit="case",
+    ):
         case_id = case_row["id"]
 
         case_dir = output_dir / f"case_{case_id}"
@@ -85,14 +139,36 @@ def export_tx_cases(
             stats["skipped"] += 1
             continue
 
+        documents = docs_by_case.get((case_row["coa"], case_row["case_number"]), [])
+        if not documents and require_documents:
+            stats["no_documents"] += 1
+            continue
+
         try:
             case_dir.mkdir(parents=True, exist_ok=True)
+            # One history entry per distinct docket event (section, row_seq);
+            # documents are already ordered by (section, row_seq, doc_seq), so
+            # the first document of each event supplies its event fields.
+            events: dict[tuple, dict] = {}
+            for doc in documents:
+                key = (doc["section"], doc["row_seq"])
+                if key not in events:
+                    events[key] = {
+                        "section": doc["section"],
+                        "row_seq": doc["row_seq"],
+                        "event_date": doc["event_date"],
+                        "event_type": doc["event_type"],
+                        "disposition": doc["disposition"],
+                        "description": doc["description"],
+                        "remarks": doc["remarks"],
+                        "documents_count": 0,
+                    }
+                events[key]["documents_count"] += 1
+            case_history = list(events.values())
             denormalized_case = {
                 "case_info": case_row,
-                # Always empty - see module docstring: TX has no parsed
-                # per-document table yet, only raw HTML captures.
-                "documents": [],
-                "case_history": [],
+                "documents": documents,
+                "case_history": case_history,
                 # Same field names/shape as CaseExporter's "normalized" block
                 # (lawsuit_parser/utils/case_exporter.py) and export_fl_cases.py/
                 # export_il_cases.py's own - a consistent cross-state view
@@ -109,11 +185,11 @@ def export_tx_cases(
                     "case_status": None,
                     "case_type": case_row.get("case_type"),
                     "filed_date": case_row.get("date_filed"),
-                    "total_documents": 0,
-                    "total_history_entries": 0,
+                    "total_documents": len(documents),
+                    "total_history_entries": len(case_history),
                 },
                 "summary": {
-                    "total_documents": 0,
+                    "total_documents": len(documents),
                     "case_number": case_row.get("case_number"),
                     "style": case_row.get("style"),
                     "case_type": case_row.get("case_type"),
@@ -140,6 +216,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, default=Path("data/cases/tx_after_search"))
     parser.add_argument(
+        "--no-require-documents",
+        dest="require_documents",
+        action="store_false",
+        help="also export cases with zero documents (skipped by default, matching the other states)",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Re-fetch and overwrite cases whose JSON already exists instead "
@@ -154,6 +236,7 @@ def main():
 
     stats = export_tx_cases(
         args.output_dir,
+        require_documents=args.require_documents,
         skip_if_exists=not args.overwrite,
         force_refresh=args.overwrite,
     )
@@ -162,6 +245,7 @@ def main():
     print("Export complete!")
     print(f"  Successful: {stats['successful']}/{stats['total']}")
     print(f"  Skipped: {stats['skipped']}/{stats['total']} (already exported)")
+    print(f"  No documents: {stats['no_documents']}/{stats['total']}")
     print(f"  Failed: {stats['failed']}/{stats['total']}")
     print(f"  Output directory: {args.output_dir}")
     print("=" * 80)

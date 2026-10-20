@@ -192,7 +192,12 @@ class CaseExporter:
                 court_id,
                 case_type,
                 documents_scrapped_at,
+                documents_listed_at,
+                documents_listed_count,
+                documents_list_error,
+                documents_scrap_error,
                 summary_file_storage_location,
+                summary_error,
                 created_at,
                 updated_at
             FROM {self.cases_table}
@@ -236,6 +241,7 @@ class CaseExporter:
                 document_confirmation_link_id,
                 ocr_created,
                 ocr_transcription_id,
+                download_error,
                 created_at,
                 updated_at
             FROM {self.documents_table}
@@ -357,7 +363,9 @@ class CaseExporter:
                 id, docket_id, query_link, case_id, case_link,
                 case_received_date, efiling_status, case_status, caption,
                 court, court_id, case_type, documents_scrapped_at,
-                summary_file_storage_location,
+                documents_listed_at, documents_listed_count,
+                documents_list_error, documents_scrap_error,
+                summary_file_storage_location, summary_error,
                 created_at, updated_at
             FROM {self.cases_table}
             {"WHERE id = ANY(" + _pg_bigint_array(case_ids) + ")" if case_ids is not None else ""}
@@ -382,7 +390,7 @@ class CaseExporter:
                 document_status, document_confirmation_title,
                 document_confirmation_link, document_confirmation_bucket_link,
                 document_confirmation_link_id, ocr_created,
-                ocr_transcription_id, created_at, updated_at
+                ocr_transcription_id, download_error, created_at, updated_at
             FROM {self.documents_table}
             WHERE docket_id = ANY({_pg_text_array(docket_ids)})
             ORDER BY id
